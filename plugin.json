@@ -1,0 +1,26 @@
+{
+  "name": "downshift",
+  "displayName": "Downshift — Smart Agent Model Router",
+  "version": "0.1.0",
+  "description": "Zero-dependency lifecycle hook plugin that routes read-only subagent research and test/lint execution to fast lightweight models (Flash / Flash Lite / Haiku / Sonnet) while preserving frontier models (Argon / Gemini Pro / Claude Opus) for architecture, concurrency, migrations, and code mutations.",
+  "author": {
+    "name": "P1e2003",
+    "email": "baop@truestack.ai"
+  },
+  "license": "MIT",
+  "keywords": [
+    "model-router",
+    "subagent",
+    "hooks",
+    "cost-optimization",
+    "latency",
+    "antigravity",
+    "claude-code",
+    "codex"
+  ],
+  "suggestedPrompts": [
+    "Show my Downshift model routing stats and estimated token savings",
+    "How does Downshift classify subagent calls and what @tags are supported?"
+  ]
+}
+

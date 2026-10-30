@@ -1,0 +1,90 @@
+"""Multi-host PreToolUse lifecycle hook entrypoint for Downshift."""
+
+from __future__ import annotations
+
+import json
+import sys
+from typing import Any
+
+from downshift_core import classify_subagent_call, detect_host
+
+CLAUDE_SUBAGENT_TOOLS = frozenset({"task", "agent"})
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
+    host = detect_host(payload)
+
+    if host == "antigravity":
+        tool_call = _as_dict(payload.get("toolCall"))
+        tool_name = str(tool_call.get("name") or "")
+        if tool_name != "invoke_subagent":
+            return {"decision": "allow"}
+
+        args = _as_dict(tool_call.get("args"))
+        decision = classify_subagent_call(
+            type_name=str(args.get("TypeName") or ""),
+            role=str(args.get("Role") or ""),
+            prompt=str(args.get("Prompt") or ""),
+            current_model=str(args.get("Model") or "inherit"),
+            host="antigravity",
+        )
+        if decision.should_overwrite:
+            return {
+                "decision": "allow",
+                "overwrite": {
+                    "Model": decision.target_model,
+                },
+            }
+        return {"decision": "allow"}
+
+    # Claude Code / OpenAI Codex PreToolUse contract
+    tool_name = str(payload.get("tool_name") or "")
+    if tool_name.lower() not in CLAUDE_SUBAGENT_TOOLS:
+        return {}
+
+    tool_input = dict(_as_dict(payload.get("tool_input")))
+    decision = classify_subagent_call(
+        type_name=str(tool_input.get("subagent_type") or "general-purpose"),
+        role=str(tool_input.get("description") or ""),
+        prompt=str(tool_input.get("prompt") or ""),
+        current_model=str(tool_input.get("model") or ""),
+        host=host,
+    )
+    if decision.should_overwrite:
+        updated_input = dict(tool_input)
+        updated_input["model"] = decision.target_model
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "updatedInput": updated_input,
+            }
+        }
+    return {}
+
+
+def main() -> int:
+    try:
+        raw = sys.stdin.read()
+        if not raw or not raw.strip():
+            sys.stdout.write(json.dumps({"decision": "allow"}) + "\n")
+            return 0
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            sys.stdout.write(json.dumps({"decision": "allow"}) + "\n")
+            return 0
+        response = handle_pre_tool_use(payload)
+        sys.stdout.write(json.dumps(response) + "\n")
+        return 0
+    except (ValueError, TypeError, KeyError, AttributeError, OSError):
+        # Fail open so the host agent loop is never blocked
+        sys.stdout.write(json.dumps({"decision": "allow"}) + "\n")
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
