@@ -1,0 +1,305 @@
+"""Core deterministic subagent model routing engine & safety guardrails for Downshift."""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import asdict, dataclass
+from typing import Any
+
+READ_ONLY_SUBAGENTS = frozenset({"research", "explore"})
+GENERAL_SUBAGENTS = frozenset(
+    {"self", "general-purpose", "default", "agent", "task", ""}
+)
+
+HIGH_RISK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "alembic_or_migration",
+        re.compile(r"\b(alembic|migrations?|schema\s+change|ddl)\b", re.IGNORECASE),
+    ),
+    (
+        "concurrency_or_locking",
+        re.compile(
+            r"\b(deadlocks?|race\s+conditions?|advisory[_\s]+locks?|for\s+update|savepoints?|rollbacks?)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "security_or_auth",
+        re.compile(
+            r"\b(security|auth(?:entication|orization)?|permissions?|idor|cryptograph(?:y|ic)|jwt|csrf|xss|secrets?)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "production_incident",
+        re.compile(
+            r"\b(production\s+incident|outage|data\s+corruption|billing\s+account)\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+FRONTIER_TAG_RE = re.compile(r"(?:^|\s)@(pro|opus|frontier|inherit)\b", re.IGNORECASE)
+LITE_TAG_RE = re.compile(r"(?:^|\s)@(flash_lite|lite|haiku)\b", re.IGNORECASE)
+FAST_TAG_RE = re.compile(r"(?:^|\s)@(flash|sonnet|fast|downshift)\b", re.IGNORECASE)
+
+SIMPLE_LOOKUP_RE = re.compile(
+    r"\b(find\s+file|locate|where\s+is|git\s+status|git\s+branch|list\s+files|count\s+lines)\b",
+    re.IGNORECASE,
+)
+COMPLEX_RESEARCH_RE = re.compile(
+    r"\b(survey|trace\s+all|analyze|architecture|summarize\s+how|compare|audit|across\s+the\s+backend)\b",
+    re.IGNORECASE,
+)
+
+VERIFICATION_RUNNER_RE = re.compile(
+    r"\b(pytest|vitest|ruff|eslint|npm\s+run\s+(?:test|lint|build)|uv\s+run\s+(?:pytest|ruff)|run\s+tests?)\b",
+    re.IGNORECASE,
+)
+CODE_MUTATION_RE = re.compile(
+    r"\b(implement|refactor|fix\s+bug|edit\s+file|write\s+code|create\s+endpoint|modify|patch)\b",
+    re.IGNORECASE,
+)
+
+ROUTINE_PROMPT_NUDGE_RE = re.compile(
+    r"\b(search\s+the\s+(?:logs?|codebase)|find\s+all\s+(?:files|occurrences|callers)|list\s+all\s+callers|scan\s+logs?)\b",
+    re.IGNORECASE,
+)
+
+HOST_MODEL_MAP: dict[str, dict[str, str]] = {
+    "antigravity": {
+        "lite": "flash_lite",
+        "fast": "flash",
+        "frontier": "inherit",
+    },
+    "claude": {
+        "lite": "haiku",
+        "fast": "sonnet",
+        "frontier": "inherit",
+    },
+    "codex": {
+        "lite": "flash_lite",
+        "fast": "flash",
+        "frontier": "inherit",
+    },
+}
+
+
+@dataclass(frozen=True)
+class RoutingDecision:
+    host: str
+    tier: str
+    target_model: str
+    should_overwrite: bool
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class PromptAdvisory:
+    host: str
+    should_inject: bool
+    message: str
+    reason: str
+
+
+def detect_host(payload: dict[str, Any], env: dict[str, str] | None = None) -> str:
+    """Identify the calling agent host ('antigravity', 'claude', or 'codex')."""
+    env_map = env if env is not None else os.environ
+    if (
+        "toolCall" in payload
+        or "lastUserInput" in payload
+        or "invocationNum" in payload
+    ):
+        return "antigravity"
+    if env_map.get("CODEX_CI") or env_map.get("CODEX_HOME"):
+        return "codex"
+    if (
+        "tool_name" in payload
+        or "tool_input" in payload
+        or "hook_event_name" in payload
+    ):
+        return "claude"
+    if env_map.get("CLAUDE_PLUGIN_ROOT") or env_map.get("CLAUDE_PROJECT_DIR"):
+        return "claude"
+    return "antigravity"
+
+
+def _resolve_target_model(host: str, tier: str) -> str:
+    normalized_host = host if host in HOST_MODEL_MAP else "antigravity"
+    return HOST_MODEL_MAP[normalized_host].get(tier, "inherit")
+
+
+def _match_high_risk(combined_text: str) -> str | None:
+    for label, pattern in HIGH_RISK_PATTERNS:
+        if pattern.search(combined_text):
+            return label
+    return None
+
+
+def classify_subagent_call(
+    type_name: str,
+    role: str,
+    prompt: str,
+    current_model: str = "inherit",
+    host: str = "antigravity",
+) -> RoutingDecision:
+    """Classify a subagent tool call into lite, fast, or frontier with safety guardrails."""
+    combined = f"{role or ''}\n{prompt or ''}".strip()
+    norm_type = (type_name or "").strip().lower()
+    norm_model = (current_model or "").strip()
+
+    # 1. Explicit inline @tag overrides take highest precedence
+    if FRONTIER_TAG_RE.search(combined):
+        return RoutingDecision(
+            host=host,
+            tier="frontier",
+            target_model="inherit",
+            should_overwrite=False,
+            reason="inline_override:frontier",
+        )
+    if LITE_TAG_RE.search(combined):
+        target = _resolve_target_model(host, "lite")
+        return RoutingDecision(
+            host=host,
+            tier="lite",
+            target_model=target,
+            should_overwrite=(norm_model != target),
+            reason="inline_override:lite",
+        )
+    if FAST_TAG_RE.search(combined):
+        target = _resolve_target_model(host, "fast")
+        return RoutingDecision(
+            host=host,
+            tier="fast",
+            target_model=target,
+            should_overwrite=(norm_model != target),
+            reason="inline_override:fast",
+        )
+
+    # 2. Preserve caller's explicit non-default model when no inline @tag is present
+    if norm_model and norm_model.lower() != "inherit":
+        return RoutingDecision(
+            host=host,
+            tier="frontier",
+            target_model=norm_model,
+            should_overwrite=False,
+            reason="caller_explicit_model_preserved",
+        )
+
+    # 3. Hard safety guardrail blocklist — never downgrade high-risk engineering tasks
+    risk_match = _match_high_risk(combined)
+    if risk_match is not None:
+        return RoutingDecision(
+            host=host,
+            tier="frontier",
+            target_model="inherit",
+            should_overwrite=False,
+            reason=f"safety_guardrail:{risk_match}",
+        )
+
+    # 4. Read-only subagents (research / Explore)
+    if norm_type in READ_ONLY_SUBAGENTS:
+        if SIMPLE_LOOKUP_RE.search(combined) and not COMPLEX_RESEARCH_RE.search(
+            combined
+        ):
+            target = _resolve_target_model(host, "lite")
+            return RoutingDecision(
+                host=host,
+                tier="lite",
+                target_model=target,
+                should_overwrite=True,
+                reason="read_only_simple_lookup",
+            )
+        target = _resolve_target_model(host, "fast")
+        return RoutingDecision(
+            host=host,
+            tier="fast",
+            target_model=target,
+            should_overwrite=True,
+            reason="read_only_research_survey",
+        )
+
+    # 5. General / self subagents running pure test/lint/build verification without code mutation
+    if (
+        norm_type in GENERAL_SUBAGENTS
+        and VERIFICATION_RUNNER_RE.search(combined)
+        and not CODE_MUTATION_RE.search(combined)
+    ):
+        target = _resolve_target_model(host, "fast")
+        return RoutingDecision(
+            host=host,
+            tier="fast",
+            target_model=target,
+            should_overwrite=True,
+            reason="verification_test_or_lint_runner",
+        )
+
+    # 6. Default: keep frontier model for stateful code mutation & general engineering
+    return RoutingDecision(
+        host=host,
+        tier="frontier",
+        target_model="inherit",
+        should_overwrite=False,
+        reason="frontier_default_stateful_work",
+    )
+
+
+def classify_user_prompt(
+    last_user_input: str,
+    invocation_num: int = 1,
+    host: str = "antigravity",
+) -> PromptAdvisory:
+    """Return an ephemeral delegation reminder on the first turn of routine search/log prompts."""
+    text = (last_user_input or "").strip()
+    if invocation_num > 1 or not text:
+        return PromptAdvisory(
+            host=host, should_inject=False, message="", reason="not_first_turn_or_empty"
+        )
+
+    if FRONTIER_TAG_RE.search(text) or _match_high_risk(text) is not None:
+        return PromptAdvisory(
+            host=host,
+            should_inject=False,
+            message="",
+            reason="high_risk_or_frontier_tag",
+        )
+
+    if ROUTINE_PROMPT_NUDGE_RE.search(text):
+        if host in ("claude", "codex"):
+            msg = (
+                "[Downshift] Routine multi-step search/log/verification task detected. "
+                "Prefer delegating mechanical exploration via Task/subagent (which Downshift routes to Haiku/Sonnet) "
+                "rather than looping on the frontier model."
+            )
+        else:
+            msg = (
+                "[Downshift] Routine multi-step search/log/verification task detected. "
+                "Prefer delegating mechanical exploration via subagent (which Downshift routes to Flash/Haiku) "
+                "rather than looping on the frontier model."
+            )
+        return PromptAdvisory(
+            host=host,
+            should_inject=True,
+            message=msg,
+            reason="routine_search_or_log_task",
+        )
+
+    return PromptAdvisory(
+        host=host, should_inject=False, message="", reason="no_nudge_needed"
+    )
+
+
+def should_nudge_pre_invocation(
+    last_user_input: str,
+    invocation_num: int = 1,
+    host: str = "antigravity",
+) -> str | None:
+    """Convenience wrapper returning the nudge string or None."""
+    advisory = classify_user_prompt(
+        last_user_input=last_user_input, invocation_num=invocation_num, host=host
+    )
+    return advisory.message if advisory.should_inject else None
