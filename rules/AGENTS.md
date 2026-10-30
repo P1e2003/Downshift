@@ -22,3 +22,4 @@ Include any of these inline tags in a prompt or subagent `Role`/`Prompt` to over
 - `@pro`, `@opus`, `@frontier`, `@inherit` — Force **Tier 3 (`frontier`)**; never downshift.
 - `@flash`, `@sonnet`, `@fast`, `@downshift` — Force **Tier 2 (`fast`)**.
 - `@flash_lite`, `@lite`, `@haiku` — Force **Tier 1 (`lite`)**.
+
