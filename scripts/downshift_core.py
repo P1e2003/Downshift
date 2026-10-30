@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 READ_ONLY_SUBAGENTS = frozenset({"research", "explore"})
@@ -303,3 +306,46 @@ def should_nudge_pre_invocation(
         last_user_input=last_user_input, invocation_num=invocation_num, host=host
     )
     return advisory.message if advisory.should_inject else None
+
+
+def get_ledger_path(override: str | Path | None = None) -> Path:
+    """Resolve the local JSONL telemetry ledger path."""
+    if override is not None:
+        return Path(override).expanduser()
+    env_path = os.environ.get("DOWNSHIFT_LEDGER_PATH", "").strip()
+    if env_path:
+        return Path(env_path).expanduser()
+    return Path.home() / ".gemini" / "downshift_ledger.jsonl"
+
+
+def record_routing_event(
+    decision: RoutingDecision,
+    conversation_id: str,
+    subagent_type: str,
+    role: str,
+    original_model: str = "inherit",
+    ledger_path: str | Path | None = None,
+) -> bool:
+    """Append a privacy-safe routing event (never storing raw Prompt text) to the JSONL ledger."""
+    try:
+        path = get_ledger_path(ledger_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "timestamp": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "conversation_id": str(conversation_id or ""),
+            "host": decision.host,
+            "subagent_type": str(subagent_type or ""),
+            "role": str(role or "")[:80],
+            "original_model": str(original_model or "inherit"),
+            "target_model": decision.target_model,
+            "tier": decision.tier,
+            "reason": decision.reason,
+            "overwritten": decision.should_overwrite,
+        }
+        line = json.dumps(entry, separators=(",", ":")) + "\n"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+        return True
+    except OSError:
+        # Non-blocking fail-open if disk or directory is unwritable
+        return False

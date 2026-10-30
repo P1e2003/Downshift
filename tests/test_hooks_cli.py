@@ -154,3 +154,59 @@ def test_pre_invocation_cli_supports_antigravity_and_claude_codex() -> None:
     assert code_claude == 0
     assert data_claude["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
     assert "[Downshift]" in data_claude["hookSpecificOutput"]["additionalContext"]
+
+
+def test_pre_tool_use_populates_ledger_and_stats_cli_reads_it(tmp_path: Path) -> None:
+    ledger = tmp_path / "e2e_ledger.jsonl"
+    stats_cli = ROOT / "scripts" / "stats_cli.py"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+
+    # 1. Lite research call
+    _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-1",
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Role": "Locator",
+                    "Prompt": "Find file where resolve_contact is defined",
+                    "Model": "inherit",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    # 2. Frontier high-risk call
+    _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-2",
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Role": "Auditor",
+                    "Prompt": "Audit alembic migration and savepoint deadlock",
+                    "Model": "inherit",
+                },
+            },
+        },
+        extra_env=env,
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(stats_cli), "--ledger", str(ledger), "--json"],
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    assert proc.returncode == 0
+    summary = json.loads(proc.stdout)
+    assert summary["total"] == 2
+    assert summary["saved"] == 1
+    assert summary["saved_pct"] == 50.0
+    assert summary["tiers"]["lite"] == 1
+    assert summary["tiers"]["frontier"] == 1
