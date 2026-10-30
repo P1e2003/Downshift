@@ -1,0 +1,7 @@
+{
+  "name": "downshift",
+  "version": "0.1.0",
+  "description": "Deterministic lifecycle-hook plugin that routes read-only subagent research and test loops to lightweight models (Flash / Flash-Lite) while keeping frontier models for architecture and stateful code changes.",
+  "contextFileName": "rules/AGENTS.md"
+}
+

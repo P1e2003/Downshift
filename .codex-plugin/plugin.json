@@ -1,0 +1,13 @@
+{
+  "name": "downshift",
+  "version": "0.1.0",
+  "description": "Deterministic lifecycle-hook plugin that routes read-only subagent research and test loops to lightweight models while keeping frontier models for architecture and stateful code changes.",
+  "author": {
+    "name": "P1e2003",
+    "email": "baop@truestack.ai"
+  },
+  "license": "MIT",
+  "skills": "./skills/",
+  "hooks": "./hooks/claude-codex-hooks.json"
+}
+
