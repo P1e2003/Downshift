@@ -11,16 +11,20 @@ from downshift_core import classify_subagent_call, detect_host, record_routing_e
 CLAUDE_SUBAGENT_TOOLS = frozenset({"task", "agent"})
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
     host = detect_host(payload)
 
     if host == "antigravity":
-        tool_call = payload.get("toolCall") or {}
+        tool_call = _as_dict(payload.get("toolCall"))
         tool_name = str(tool_call.get("name") or "")
         if tool_name != "invoke_subagent":
             return {"decision": "allow"}
 
-        args = tool_call.get("args") or {}
+        args = _as_dict(tool_call.get("args"))
         type_name = str(args.get("TypeName") or "")
         role = str(args.get("Role") or "")
         orig_model = str(args.get("Model") or "inherit")
@@ -52,7 +56,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
     if tool_name.lower() not in CLAUDE_SUBAGENT_TOOLS:
         return {}
 
-    tool_input = dict(payload.get("tool_input") or {})
+    tool_input = dict(_as_dict(payload.get("tool_input")))
     type_name = str(tool_input.get("subagent_type") or "general-purpose")
     role = str(tool_input.get("description") or "")
     orig_model = str(tool_input.get("model") or "")
@@ -96,7 +100,7 @@ def main() -> int:
         response = handle_pre_tool_use(payload)
         sys.stdout.write(json.dumps(response) + "\n")
         return 0
-    except (ValueError, TypeError, KeyError, OSError):
+    except (ValueError, TypeError, KeyError, AttributeError, OSError):
         # Fail open so the host agent loop is never blocked
         sys.stdout.write(json.dumps({"decision": "allow"}) + "\n")
         return 0

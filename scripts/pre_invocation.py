@@ -9,11 +9,18 @@ from typing import Any
 from downshift_core import classify_user_prompt, detect_host
 
 
+def _safe_int(value: Any, default: int = 1) -> int:
+    try:
+        return int(value) if value is not None else default
+    except (ValueError, TypeError):
+        return default
+
+
 def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
     host = detect_host(payload)
 
     if host == "antigravity":
-        invocation_num = int(payload.get("invocationNum") or 1)
+        invocation_num = _safe_int(payload.get("invocationNum"), default=1)
         last_user_input = str(payload.get("lastUserInput") or "")
         advisory = classify_user_prompt(
             last_user_input=last_user_input,
@@ -60,7 +67,7 @@ def main() -> int:
         response = handle_pre_invocation(payload)
         sys.stdout.write(json.dumps(response) + "\n")
         return 0
-    except (ValueError, TypeError, KeyError, OSError):
+    except (ValueError, TypeError, KeyError, AttributeError, OSError):
         sys.stdout.write("{}\n")
         return 0
 

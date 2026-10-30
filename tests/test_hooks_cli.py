@@ -122,6 +122,16 @@ def test_pre_tool_use_cli_fails_open_on_invalid_json() -> None:
     assert code == 0
     assert data == {"decision": "allow"}
 
+    # Non-dict truthy nested fields must also fail open with exit code 0
+    for malformed in (
+        {"toolCall": "not-a-dict"},
+        {"toolCall": {"name": "invoke_subagent", "args": [1, 2, 3]}},
+        {"tool_name": "Task", "tool_input": 42},
+    ):
+        m_code, m_data = _run_hook(PRE_TOOL_USE, malformed)
+        assert m_code == 0
+        assert isinstance(m_data, dict)
+
 
 def test_pre_invocation_cli_supports_antigravity_and_claude_codex() -> None:
     agy_payload = {

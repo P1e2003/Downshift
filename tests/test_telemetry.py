@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -136,3 +137,32 @@ def test_stats_cli_reset_clears_ledger(tmp_path: Path) -> None:
     )
     assert proc.returncode == 0
     assert ledger.read_text(encoding="utf-8") == ""
+
+
+def test_concurrent_appends_preserve_all_events_without_corruption(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "concurrent.jsonl"
+
+    def _write_one(idx: int) -> bool:
+        return record_routing_event(
+            decision=RoutingDecision(
+                host="antigravity",
+                tier="lite",
+                target_model="flash_lite",
+                should_overwrite=True,
+                reason="read_only_simple_lookup",
+            ),
+            conversation_id=f"conv-{idx}",
+            subagent_type="research",
+            role=f"Worker {idx}",
+            original_model="inherit",
+            ledger_path=ledger,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(_write_one, range(40)))
+
+    assert all(results)
+    events = load_events(ledger)
+    assert len(events) == 40

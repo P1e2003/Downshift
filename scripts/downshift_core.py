@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import time
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -318,6 +320,45 @@ def get_ledger_path(override: str | Path | None = None) -> Path:
     return Path.home() / ".gemini" / "downshift_ledger.jsonl"
 
 
+def _append_line_locked(path: Path, line_bytes: bytes) -> None:
+    """Append a line to path with a cross-process file lock on Windows and POSIX."""
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
+    locked = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            for _ in range(250):
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    time.sleep(0.002)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            locked = True
+
+        os.lseek(fd, 0, os.SEEK_END)
+        os.write(fd, line_bytes)
+    finally:
+        if locked:
+            with contextlib.suppress(OSError):
+                if os.name == "nt":
+                    import msvcrt
+
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def record_routing_event(
     decision: RoutingDecision,
     conversation_id: str,
@@ -342,9 +383,8 @@ def record_routing_event(
             "reason": decision.reason,
             "overwritten": decision.should_overwrite,
         }
-        line = json.dumps(entry, separators=(",", ":")) + "\n"
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(line)
+        line_bytes = (json.dumps(entry, separators=(",", ":")) + "\n").encode("utf-8")
+        _append_line_locked(path, line_bytes)
         return True
     except OSError:
         # Non-blocking fail-open if disk or directory is unwritable
