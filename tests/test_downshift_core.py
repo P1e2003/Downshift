@@ -9,9 +9,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from downshift_core import (
+    DownshiftConfig,
     classify_subagent_call,
     classify_user_prompt,
     detect_host,
+    extract_workspace_dir,
+    load_config,
     should_nudge_pre_invocation,
 )
 
@@ -262,3 +265,161 @@ def test_pre_invocation_nudges_only_on_first_turn_routine_task() -> None:
     )
     assert advisory.should_inject is True
     assert "Haiku/Sonnet" in advisory.message
+
+
+def test_load_config_reads_valid_downshift_json_and_env_override(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    workspace_root = tmp_path / "repo"
+    nested_dir = workspace_root / "backend" / "app"
+    nested_dir.mkdir(parents=True)
+    cfg_file = workspace_root / ".downshift.json"
+    cfg_file.write_text(
+        json.dumps(
+            {
+                "mode": "shadow",
+                "hints": False,
+                "high_risk_keywords": ["vietmoney", "zalo_oa", "clerk"],
+                "pinned_roles": {
+                    "Security Auditor": "frontier",
+                    "Log Locator": "lite",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # 1. Upward walk from nested_dir finds workspace_root/.downshift.json (FR-008)
+    cfg = load_config(workspace_dir=nested_dir, env={})
+    assert cfg.mode == "shadow"
+    assert cfg.hints is False
+    assert cfg.high_risk_keywords == ("vietmoney", "zalo_oa", "clerk")
+    assert cfg.pinned_roles == {
+        "Security Auditor": "frontier",
+        "Log Locator": "lite",
+    }
+
+    # 2. DOWNSHIFT_MODE env var overrides .downshift.json mode (FR-005)
+    cfg_active = load_config(
+        workspace_dir=nested_dir,
+        env={"DOWNSHIFT_MODE": "active", "DOWNSHIFT_HINTS": "1"},
+    )
+    assert cfg_active.mode == "active"
+    assert cfg_active.hints is True
+
+    # 3. DOWNSHIFT_ENABLED=0 forces mode="off" (FR-005)
+    cfg_off = load_config(
+        workspace_dir=nested_dir,
+        env={"DOWNSHIFT_ENABLED": "0", "DOWNSHIFT_MODE": "active"},
+    )
+    assert cfg_off.mode == "off"
+
+    # 4. DOWNSHIFT_CONFIG_PATH explicit file override
+    explicit_file = tmp_path / "custom_config.json"
+    explicit_file.write_text(
+        json.dumps({"mode": "active", "high_risk_keywords": ["weaviate"]}),
+        encoding="utf-8",
+    )
+    cfg_explicit = load_config(
+        workspace_dir=nested_dir,
+        env={"DOWNSHIFT_CONFIG_PATH": str(explicit_file)},
+    )
+    assert cfg_explicit.mode == "active"
+    assert cfg_explicit.high_risk_keywords == ("weaviate",)
+
+
+def test_load_config_fails_open_on_corrupted_json(tmp_path: Path) -> None:
+    corrupt_dir = tmp_path / "corrupt"
+    corrupt_dir.mkdir()
+    (corrupt_dir / ".downshift.json").write_text("{not-valid-json", encoding="utf-8")
+
+    cfg = load_config(workspace_dir=corrupt_dir, env={})
+    assert cfg == DownshiftConfig()
+
+    mistyped_dir = tmp_path / "mistyped"
+    mistyped_dir.mkdir()
+    (mistyped_dir / ".downshift.json").write_text(
+        '{"mode": "invalid_mode", "hints": "yes", "high_risk_keywords": 123, "pinned_roles": {"A": "unknown_tier", "B": "fast"}}',
+        encoding="utf-8",
+    )
+    cfg_mistyped = load_config(workspace_dir=mistyped_dir, env={})
+    assert cfg_mistyped.mode == "active"
+    assert cfg_mistyped.hints is True
+    assert cfg_mistyped.high_risk_keywords == ()
+    assert cfg_mistyped.pinned_roles == {"B": "fast"}
+
+
+def test_custom_high_risk_keywords_and_pinned_roles() -> None:
+    cfg = DownshiftConfig(
+        mode="active",
+        hints=True,
+        high_risk_keywords=("vietmoney", "zalo_oa", "clerk"),
+        pinned_roles={
+            "Security Auditor": "frontier",
+            "Log Locator": "lite",
+            "Codebase Researcher": "fast",
+        },
+    )
+
+    # 1. Pinned role -> lite when prompt has no high-risk keywords
+    pinned_lite = classify_subagent_call(
+        type_name="self",
+        role="Log Locator Helper",
+        prompt="Summarize recent status entries in output.txt",
+        current_model="inherit",
+        host="antigravity",
+        config=cfg,
+    )
+    assert pinned_lite.tier == "lite"
+    assert pinned_lite.target_model == "flash_lite"
+    assert pinned_lite.should_overwrite is True
+    assert pinned_lite.reason == "workspace_config:pinned_role"
+
+    # 2. Pinned role -> frontier
+    pinned_frontier = classify_subagent_call(
+        type_name="research",
+        role="Security Auditor",
+        prompt="Find file where constants are defined",
+        current_model="inherit",
+        host="antigravity",
+        config=cfg,
+    )
+    assert pinned_frontier.tier == "frontier"
+    assert pinned_frontier.target_model == "inherit"
+    assert pinned_frontier.should_overwrite is False
+    assert pinned_frontier.reason == "workspace_config:pinned_role"
+
+    # 3. FR-010 Clarification Q1: workspace high_risk_keyword overrides lower-tier pinned_role
+    high_risk_override = classify_subagent_call(
+        type_name="research",
+        role="Codebase Researcher",
+        prompt="Survey all vietmoney CRM integration handlers",
+        current_model="inherit",
+        host="antigravity",
+        config=cfg,
+    )
+    assert high_risk_override.tier == "frontier"
+    assert high_risk_override.target_model == "inherit"
+    assert high_risk_override.should_overwrite is False
+    assert high_risk_override.reason == "workspace_config:high_risk_keyword"
+
+    # 4. FR-010 Clarification Q1: built-in high-risk pattern also overrides lower-tier pinned_role
+    builtin_override = classify_subagent_call(
+        type_name="research",
+        role="Log Locator",
+        prompt="Check alembic migration logs",
+        current_model="inherit",
+        host="antigravity",
+        config=cfg,
+    )
+    assert builtin_override.tier == "frontier"
+    assert builtin_override.target_model == "inherit"
+    assert builtin_override.should_overwrite is False
+    assert builtin_override.reason == "safety_guardrail:alembic_or_migration"
+
+    # 5. extract_workspace_dir helper extracts workspacePaths[0] or cwd
+    assert extract_workspace_dir({"workspacePaths": ["/repo/chaxy"]}) == "/repo/chaxy"
+    assert extract_workspace_dir({"cwd": "/repo/claude"}) == "/repo/claude"
+    assert extract_workspace_dir({}) is None

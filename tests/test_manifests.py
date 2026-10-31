@@ -32,11 +32,17 @@ def test_all_manifests_parse_and_share_name_and_version() -> None:
 
 
 def test_hooks_json_references_existing_scripts() -> None:
+    launcher_cmd = ROOT / "scripts" / "run_hook.cmd"
+    launcher_sh = ROOT / "scripts" / "run_hook.sh"
+    assert launcher_cmd.exists(), f"Missing Windows/polyglot launcher: {launcher_cmd}"
+    assert launcher_sh.exists(), f"Missing POSIX launcher: {launcher_sh}"
+
     agy_hooks = json.loads((ROOT / "hooks.json").read_text(encoding="utf-8"))
     for event_list in agy_hooks["hooks"].values():
         for matcher_group in event_list:
             for hook in matcher_group["hooks"]:
                 cmd = hook["command"]
+                assert "run_hook.cmd" in cmd, f"Expected run_hook.cmd in: {cmd}"
                 match = re.search(r"\./(scripts/[a-zA-Z0-9_]+\.py)", cmd)
                 assert match is not None, f"Could not parse script path from: {cmd}"
                 assert (ROOT / match.group(1)).exists()
@@ -48,6 +54,7 @@ def test_hooks_json_references_existing_scripts() -> None:
         for matcher_group in event_list:
             for hook in matcher_group["hooks"]:
                 cmd = hook["command"]
+                assert "run_hook.cmd" in cmd, f"Expected run_hook.cmd in: {cmd}"
                 match = re.search(
                     r"\$\{CLAUDE_PLUGIN_ROOT\}/(scripts/[a-zA-Z0-9_]+\.py)", cmd
                 )

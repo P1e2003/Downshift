@@ -28,6 +28,12 @@ Display this compact reference card in a fenced `text` block:
     @flash / @sonnet / @fast / @downshift Force Tier 2 (fast)
     @flash_lite / @lite / @haiku          Force Tier 1 (lite)
 
+  Modes & Workspace Config (.downshift.json / DOWNSHIFT_MODE)
+    active (default)   Enforce model routing + record telemetry
+    shadow             Dry-run: record telemetry without overwriting models
+    off                Disable routing, telemetry, and hints
+    .downshift.json    mode, hints, high_risk_keywords, pinned_roles
+
   Commands
     /downshift-stats   Show live routing scoreboard from ~/.gemini/downshift_ledger.jsonl
     /downshift-help    Show this reference card

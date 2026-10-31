@@ -220,3 +220,239 @@ def test_pre_tool_use_populates_ledger_and_stats_cli_reads_it(tmp_path: Path) ->
     assert summary["saved_pct"] == 50.0
     assert summary["tiers"]["lite"] == 1
     assert summary["tiers"]["frontier"] == 1
+
+
+def test_shadow_mode_logs_event_without_overwriting_model(tmp_path: Path) -> None:
+    ledger = tmp_path / "shadow_ledger.jsonl"
+    env = {
+        "DOWNSHIFT_MODE": "shadow",
+        "DOWNSHIFT_LEDGER_PATH": str(ledger),
+    }
+
+    # 1. Antigravity PreToolUse in shadow mode -> pass-through without "overwrite", logs mode="shadow"
+    agy_payload = {
+        "conversationId": "conv-shadow-agy",
+        "toolCall": {
+            "name": "invoke_subagent",
+            "args": {
+                "TypeName": "research",
+                "Role": "Codebase Researcher",
+                "Prompt": "Survey all services across backend/app/services",
+                "Model": "inherit",
+            },
+        },
+    }
+    code_agy, data_agy = _run_hook(PRE_TOOL_USE, agy_payload, extra_env=env)
+    assert code_agy == 0
+    assert data_agy == {"decision": "allow"}
+    assert "overwrite" not in data_agy
+
+    # 2. Claude Code PreToolUse in shadow mode -> pass-through {}, logs mode="shadow"
+    claude_payload = {
+        "session_id": "sess-shadow-claude",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Task",
+        "tool_input": {
+            "subagent_type": "Explore",
+            "description": "Locate file",
+            "prompt": "Find file where resolve_contact is defined",
+        },
+    }
+    code_claude, data_claude = _run_hook(PRE_TOOL_USE, claude_payload, extra_env=env)
+    assert code_claude == 0
+    assert data_claude == {}
+
+    lines = [
+        json.loads(line)
+        for line in ledger.read_text(encoding="utf-8").strip().splitlines()
+    ]
+    assert len(lines) == 2
+    assert lines[0]["mode"] == "shadow"
+    assert lines[0]["target_model"] == "flash"
+    assert lines[0]["overwritten"] is True
+    assert lines[1]["mode"] == "shadow"
+    assert lines[1]["target_model"] == "haiku"
+    assert lines[1]["overwritten"] is True
+
+    # 3. PreInvocation in shadow mode -> suppresses hints (FR-006, FR-012)
+    inv_code, inv_data = _run_hook(
+        PRE_INVOCATION,
+        {
+            "conversationId": "conv-shadow-inv",
+            "invocationNum": 1,
+            "lastUserInput": "Search the logs and find all files referencing GlobalSearchDialog",
+        },
+        extra_env=env,
+    )
+    assert inv_code == 0
+    assert inv_data == {}
+
+    # 4. Off mode -> pass-through and zero ledger writes (FR-007)
+    off_ledger = tmp_path / "off_ledger.jsonl"
+    off_code, off_data = _run_hook(
+        PRE_TOOL_USE,
+        agy_payload,
+        extra_env={
+            "DOWNSHIFT_MODE": "off",
+            "DOWNSHIFT_LEDGER_PATH": str(off_ledger),
+        },
+    )
+    assert off_code == 0
+    assert off_data == {"decision": "allow"}
+    assert not off_ledger.exists()
+
+
+def test_workspace_downshift_json_respected_by_hooks(tmp_path: Path) -> None:
+    workspace = tmp_path / "chaxy_repo"
+    sub_dir = workspace / "backend"
+    sub_dir.mkdir(parents=True)
+    (workspace / ".downshift.json").write_text(
+        json.dumps(
+            {
+                "mode": "active",
+                "hints": False,
+                "high_risk_keywords": ["vietmoney"],
+                "pinned_roles": {"Log Locator": "lite"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    ledger = tmp_path / "ws_ledger.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+
+    # 1. Custom high_risk_keyword ("vietmoney") blocks downgrade even on research call
+    code_hr, data_hr = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-ws-1",
+            "workspacePaths": [str(sub_dir)],
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Role": "Log Locator",
+                    "Prompt": "Inspect vietmoney webhook logs",
+                    "Model": "inherit",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert code_hr == 0
+    assert data_hr == {"decision": "allow"}
+
+    # 2. Pinned role ("Log Locator": "lite") routes general self call to flash_lite when safe
+    code_pin, data_pin = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-ws-2",
+            "workspacePaths": [str(sub_dir)],
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "self",
+                    "Role": "Log Locator",
+                    "Prompt": "Read recent worker output lines",
+                    "Model": "inherit",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert code_pin == 0
+    assert data_pin == {"decision": "allow", "overwrite": {"Model": "flash_lite"}}
+
+    # 3. hints: false in .downshift.json suppresses PreInvocation hint
+    code_inv, data_inv = _run_hook(
+        PRE_INVOCATION,
+        {
+            "conversationId": "conv-ws-3",
+            "workspacePaths": [str(sub_dir)],
+            "invocationNum": 1,
+            "lastUserInput": "Search the logs and find all files referencing GlobalSearchDialog",
+        },
+        extra_env=env,
+    )
+    assert code_inv == 0
+    assert data_inv == {}
+
+
+def test_portable_hook_launcher_resolves_from_any_cwd(tmp_path: Path) -> None:
+    launcher_cmd = ROOT / "scripts" / "run_hook.cmd"
+    assert launcher_cmd.exists()
+
+    external_cwd = tmp_path / "external_dir"
+    external_cwd.mkdir()
+    ledger = tmp_path / "launcher_ledger.jsonl"
+
+    payload = json.dumps(
+        {
+            "conversationId": "conv-launcher-1",
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Role": "File Locator",
+                    "Prompt": "Find file where resolve_contact is defined",
+                    "Model": "inherit",
+                },
+            },
+        }
+    )
+    env = os.environ.copy()
+    env["DOWNSHIFT_LEDGER_PATH"] = str(ledger)
+
+    if os.name == "nt":
+        cmd = [str(launcher_cmd), "./scripts/pre_tool_use.py"]
+    else:
+        cmd = ["sh", str(launcher_cmd), "./scripts/pre_tool_use.py"]
+
+    proc = subprocess.run(
+        cmd,
+        input=payload,
+        text=True,
+        capture_output=True,
+        cwd=external_cwd,
+        env=env,
+        timeout=10,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout.strip())
+    assert data == {"decision": "allow", "overwrite": {"Model": "flash_lite"}}
+
+
+def test_portable_hook_launcher_fails_open_when_target_or_runtime_missing(
+    tmp_path: Path,
+) -> None:
+    launcher_cmd = ROOT / "scripts" / "run_hook.cmd"
+    if os.name == "nt":
+        cmd_pre_tool = [str(launcher_cmd), "./scripts/missing_pre_tool_use.py"]
+        cmd_pre_inv = [str(launcher_cmd), "./scripts/missing_pre_invocation.py"]
+    else:
+        cmd_pre_tool = ["sh", str(launcher_cmd), "./scripts/missing_pre_tool_use.py"]
+        cmd_pre_inv = ["sh", str(launcher_cmd), "./scripts/missing_pre_invocation.py"]
+
+    proc_tool = subprocess.run(
+        cmd_pre_tool,
+        input="{}",
+        text=True,
+        capture_output=True,
+        cwd=tmp_path,
+        timeout=10,
+        check=False,
+    )
+    assert proc_tool.returncode == 0
+    assert json.loads(proc_tool.stdout.strip()) == {"decision": "allow"}
+
+    proc_inv = subprocess.run(
+        cmd_pre_inv,
+        input="{}",
+        text=True,
+        capture_output=True,
+        cwd=tmp_path,
+        timeout=10,
+        check=False,
+    )
+    assert proc_inv.returncode == 0
+    assert json.loads(proc_inv.stdout.strip()) == {}

@@ -6,7 +6,12 @@ import json
 import sys
 from typing import Any
 
-from downshift_core import classify_user_prompt, detect_host
+from downshift_core import (
+    classify_user_prompt,
+    detect_host,
+    extract_workspace_dir,
+    load_config,
+)
 
 
 def _safe_int(value: Any, default: int = 1) -> int:
@@ -18,6 +23,9 @@ def _safe_int(value: Any, default: int = 1) -> int:
 
 def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
     host = detect_host(payload)
+    config = load_config(workspace_dir=extract_workspace_dir(payload))
+    if config.mode != "active" or not config.hints:
+        return {}
 
     if host == "antigravity":
         invocation_num = _safe_int(payload.get("invocationNum"), default=1)
