@@ -55,6 +55,39 @@ Override Downshift's heuristics on any prompt or subagent call:
 
 ---
 
+## Operating Modes & Workspace Config (`.downshift.json`)
+
+Control Downshift globally via `DOWNSHIFT_MODE` (`active` | `shadow` | `off`) or per-repository via a root `.downshift.json` file:
+
+| Mode | Subagent Model Overwrite | Ledger Telemetry (`downshift_ledger.jsonl`) | `PreInvocation` Hints |
+| :--- | :--- | :--- | :--- |
+| `active` *(default)* | Enabled (`flash_lite` / `flash` / `haiku` / `sonnet`) | Recorded (`"mode": "active"`) | Enabled when `hints: true` |
+| `shadow` *(dry-run)* | **Disabled** (`{"decision": "allow"}` only) | Recorded (`"mode": "shadow"`) | Suppressed |
+| `off` | **Disabled** (`{"decision": "allow"}` only) | Not recorded | Suppressed |
+
+Example `.downshift.json` at the workspace root:
+
+```json
+{
+  "mode": "active",
+  "hints": true,
+  "high_risk_keywords": [
+    "pawn contract",
+    "interest calculation",
+    "vietmoney production"
+  ],
+  "pinned_roles": {
+    "Security Auditor": "frontier",
+    "Log Reader": "lite"
+  }
+}
+```
+
+- **Precedence:** Inline `@tag` > explicit non-`inherit` model > `pinned_roles` mapped to `"frontier"` > built-in & custom `high_risk_keywords` safety guardrail > `pinned_roles` mapped to `"lite"` / `"fast"` > heuristic classification.
+- **Portable Hook Launcher:** `hooks.json` and `hooks/claude-codex-hooks.json` invoke `./scripts/run_hook.cmd` (which delegates to `scripts/run_hook.sh` on POSIX), resolving the plugin's `scripts/` directory relative to the launcher location and automatically discovering `uv`, `python3`, `python`, or `py -3` with fail-open fallback.
+
+---
+
 ## Multi-Host Installation
 
 ### 1. Google Antigravity

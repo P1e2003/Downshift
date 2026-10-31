@@ -46,8 +46,33 @@ def test_record_routing_event_writes_valid_jsonl_without_prompt(tmp_path: Path) 
     assert entry["tier"] == "fast"
     assert entry["reason"] == "read_only_research_survey"
     assert entry["overwritten"] is True
+    assert entry["mode"] == "active"
     assert "prompt" not in entry
     assert "Prompt" not in entry
+
+
+def test_record_routing_event_supports_shadow_mode(tmp_path: Path) -> None:
+    ledger = tmp_path / "shadow_ledger.jsonl"
+    decision = RoutingDecision(
+        host="antigravity",
+        tier="lite",
+        target_model="flash_lite",
+        should_overwrite=True,
+        reason="read_only_simple_lookup",
+    )
+    record_routing_event(
+        decision=decision,
+        conversation_id="conv-shadow-1",
+        subagent_type="research",
+        role="Locator",
+        original_model="inherit",
+        ledger_path=ledger,
+        mode="shadow",
+    )
+    entry = json.loads(ledger.read_text(encoding="utf-8").strip())
+    assert entry["mode"] == "shadow"
+    assert entry["overwritten"] is True
+    assert entry["target_model"] == "flash_lite"
 
 
 def test_stats_cli_empty_ledger_renders_zero_state(tmp_path: Path) -> None:

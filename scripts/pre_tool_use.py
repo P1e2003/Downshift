@@ -6,7 +6,13 @@ import json
 import sys
 from typing import Any
 
-from downshift_core import classify_subagent_call, detect_host, record_routing_event
+from downshift_core import (
+    classify_subagent_call,
+    detect_host,
+    extract_workspace_dir,
+    load_config,
+    record_routing_event,
+)
 
 CLAUDE_SUBAGENT_TOOLS = frozenset({"task", "agent"})
 
@@ -17,6 +23,9 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
     host = detect_host(payload)
+    config = load_config(workspace_dir=extract_workspace_dir(payload))
+    if config.mode == "off":
+        return {"decision": "allow"} if host == "antigravity" else {}
 
     if host == "antigravity":
         tool_call = _as_dict(payload.get("toolCall"))
@@ -34,6 +43,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
             prompt=str(args.get("Prompt") or ""),
             current_model=orig_model,
             host="antigravity",
+            config=config,
         )
         record_routing_event(
             decision=decision,
@@ -41,8 +51,9 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
             subagent_type=type_name,
             role=role,
             original_model=orig_model,
+            mode=config.mode,
         )
-        if decision.should_overwrite:
+        if config.mode == "active" and decision.should_overwrite:
             return {
                 "decision": "allow",
                 "overwrite": {
@@ -66,6 +77,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         prompt=str(tool_input.get("prompt") or ""),
         current_model=orig_model,
         host=host,
+        config=config,
     )
     record_routing_event(
         decision=decision,
@@ -73,8 +85,9 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         subagent_type=type_name,
         role=role,
         original_model=orig_model or "inherit",
+        mode=config.mode,
     )
-    if decision.should_overwrite:
+    if config.mode == "active" and decision.should_overwrite:
         updated_input = dict(tool_input)
         updated_input["model"] = decision.target_model
         return {

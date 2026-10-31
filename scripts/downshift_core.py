@@ -7,10 +7,14 @@ import json
 import os
 import re
 import time
-from dataclasses import asdict, dataclass
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+VALID_MODES = frozenset({"active", "shadow", "off"})
+VALID_TIERS = frozenset({"lite", "fast", "frontier"})
 
 READ_ONLY_SUBAGENTS = frozenset({"research", "explore"})
 GENERAL_SUBAGENTS = frozenset(
@@ -92,6 +96,14 @@ HOST_MODEL_MAP: dict[str, dict[str, str]] = {
 
 
 @dataclass(frozen=True)
+class DownshiftConfig:
+    mode: str = "active"
+    hints: bool = True
+    high_risk_keywords: tuple[str, ...] = ()
+    pinned_roles: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class RoutingDecision:
     host: str
     tier: str
@@ -133,6 +145,135 @@ def detect_host(payload: dict[str, Any], env: dict[str, str] | None = None) -> s
     return "antigravity"
 
 
+def extract_workspace_dir(payload: dict[str, Any]) -> str | None:
+    """Extract the workspace directory from an Antigravity or Claude/Codex hook payload."""
+    if not isinstance(payload, dict):
+        return None
+    ws_paths = payload.get("workspacePaths")
+    if isinstance(ws_paths, list):
+        for item in ws_paths:
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+    cwd = payload.get("cwd")
+    if isinstance(cwd, str) and cwd.strip():
+        return cwd.strip()
+    return None
+
+
+def _find_config_file(
+    workspace_dir: str | Path | None, env_map: Mapping[str, str]
+) -> Path | None:
+    explicit = (env_map.get("DOWNSHIFT_CONFIG_PATH") or "").strip()
+    if explicit:
+        candidate = Path(explicit).expanduser()
+        return candidate if candidate.is_file() else None
+
+    roots_to_walk: list[Path] = []
+    if workspace_dir is not None:
+        with contextlib.suppress(OSError, ValueError, TypeError):
+            ws_path = Path(workspace_dir).expanduser().resolve()
+            roots_to_walk.append(ws_path if ws_path.is_dir() else ws_path.parent)
+    with contextlib.suppress(OSError):
+        cwd_path = Path.cwd().resolve()
+        if cwd_path not in roots_to_walk:
+            roots_to_walk.append(cwd_path)
+
+    for start in roots_to_walk:
+        for directory in (start, *start.parents):
+            candidate = directory / ".downshift.json"
+            with contextlib.suppress(OSError):
+                if candidate.is_file():
+                    return candidate
+    return None
+
+
+def load_config(
+    workspace_dir: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> DownshiftConfig:
+    """Load workspace .downshift.json and apply environment variable overrides (fail-open)."""
+    env_map: Mapping[str, str] = env if env is not None else os.environ
+    mode = "active"
+    hints = True
+    high_risk_keywords: tuple[str, ...] = ()
+    pinned_roles: dict[str, str] = {}
+
+    cfg_path = _find_config_file(workspace_dir, env_map)
+    if cfg_path is not None:
+        with contextlib.suppress(OSError, UnicodeDecodeError, ValueError, TypeError):
+            raw_data = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if isinstance(raw_data, dict):
+                raw_mode = raw_data.get("mode")
+                if (
+                    isinstance(raw_mode, str)
+                    and raw_mode.strip().lower() in VALID_MODES
+                ):
+                    mode = raw_mode.strip().lower()
+                raw_hints = raw_data.get("hints")
+                if isinstance(raw_hints, bool):
+                    hints = raw_hints
+                raw_keywords = raw_data.get("high_risk_keywords")
+                if isinstance(raw_keywords, list):
+                    high_risk_keywords = tuple(
+                        kw.strip()
+                        for kw in raw_keywords
+                        if isinstance(kw, str) and kw.strip()
+                    )
+                raw_pinned = raw_data.get("pinned_roles")
+                if isinstance(raw_pinned, dict):
+                    for k, v in raw_pinned.items():
+                        if (
+                            isinstance(k, str)
+                            and k.strip()
+                            and isinstance(v, str)
+                            and v.strip().lower() in VALID_TIERS
+                        ):
+                            pinned_roles[k.strip()] = v.strip().lower()
+
+    env_mode = (env_map.get("DOWNSHIFT_MODE") or "").strip().lower()
+    if env_mode in VALID_MODES:
+        mode = env_mode
+    env_enabled = (env_map.get("DOWNSHIFT_ENABLED") or "").strip().lower()
+    if env_enabled in ("0", "false", "no", "off"):
+        mode = "off"
+
+    env_hints = (env_map.get("DOWNSHIFT_HINTS") or "").strip().lower()
+    if env_hints in ("0", "false", "no", "off"):
+        hints = False
+    elif env_hints in ("1", "true", "yes", "on"):
+        hints = True
+
+    return DownshiftConfig(
+        mode=mode,
+        hints=hints,
+        high_risk_keywords=high_risk_keywords,
+        pinned_roles=pinned_roles,
+    )
+
+
+def _match_pinned_role(role: str, pinned_roles: Mapping[str, str]) -> str | None:
+    norm_role = (role or "").strip().lower()
+    if not norm_role or not pinned_roles:
+        return None
+    for pattern, tier in pinned_roles.items():
+        if pattern.lower() in norm_role and tier in VALID_TIERS:
+            return tier
+    return None
+
+
+def _match_custom_high_risk(
+    combined_text: str, keywords: tuple[str, ...]
+) -> str | None:
+    if not combined_text or not keywords:
+        return None
+    lower_text = combined_text.lower()
+    for kw in keywords:
+        norm_kw = kw.strip().lower()
+        if norm_kw and norm_kw in lower_text:
+            return norm_kw
+    return None
+
+
 def _resolve_target_model(host: str, tier: str) -> str:
     normalized_host = host if host in HOST_MODEL_MAP else "antigravity"
     return HOST_MODEL_MAP[normalized_host].get(tier, "inherit")
@@ -151,11 +292,13 @@ def classify_subagent_call(
     prompt: str,
     current_model: str = "inherit",
     host: str = "antigravity",
+    config: DownshiftConfig | None = None,
 ) -> RoutingDecision:
     """Classify a subagent tool call into lite, fast, or frontier with safety guardrails."""
     combined = f"{role or ''}\n{prompt or ''}".strip()
     norm_type = (type_name or "").strip().lower()
     norm_model = (current_model or "").strip()
+    cfg = config if config is not None else DownshiftConfig()
 
     # 1. Explicit inline @tag overrides take highest precedence
     if FRONTIER_TAG_RE.search(combined):
@@ -195,7 +338,28 @@ def classify_subagent_call(
             reason="caller_explicit_model_preserved",
         )
 
-    # 3. Hard safety guardrail blocklist — never downgrade high-risk engineering tasks
+    # 3. Workspace pinned_roles pinned to frontier (FR-010)
+    pinned_tier = _match_pinned_role(role, cfg.pinned_roles)
+    if pinned_tier == "frontier":
+        return RoutingDecision(
+            host=host,
+            tier="frontier",
+            target_model="inherit",
+            should_overwrite=False,
+            reason="workspace_config:pinned_role",
+        )
+
+    # 4. Workspace custom high_risk_keywords blocklist (FR-010)
+    if _match_custom_high_risk(combined, cfg.high_risk_keywords) is not None:
+        return RoutingDecision(
+            host=host,
+            tier="frontier",
+            target_model="inherit",
+            should_overwrite=False,
+            reason="workspace_config:high_risk_keyword",
+        )
+
+    # 5. Hard safety guardrail blocklist — never downgrade high-risk engineering tasks
     risk_match = _match_high_risk(combined)
     if risk_match is not None:
         return RoutingDecision(
@@ -206,7 +370,18 @@ def classify_subagent_call(
             reason=f"safety_guardrail:{risk_match}",
         )
 
-    # 4. Read-only subagents (research / Explore)
+    # 6. Lower-tier (lite / fast) workspace pinned_roles when prompt is safe (FR-010)
+    if pinned_tier in ("lite", "fast"):
+        target = _resolve_target_model(host, pinned_tier)
+        return RoutingDecision(
+            host=host,
+            tier=pinned_tier,
+            target_model=target,
+            should_overwrite=True,
+            reason="workspace_config:pinned_role",
+        )
+
+    # 7. Read-only subagents (research / Explore)
     if norm_type in READ_ONLY_SUBAGENTS:
         if SIMPLE_LOOKUP_RE.search(combined) and not COMPLEX_RESEARCH_RE.search(
             combined
@@ -366,6 +541,7 @@ def record_routing_event(
     role: str,
     original_model: str = "inherit",
     ledger_path: str | Path | None = None,
+    mode: str = "active",
 ) -> bool:
     """Append a privacy-safe routing event (never storing raw Prompt text) to the JSONL ledger."""
     try:
@@ -375,6 +551,7 @@ def record_routing_event(
             "timestamp": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "conversation_id": str(conversation_id or ""),
             "host": decision.host,
+            "mode": str(mode or "active"),
             "subagent_type": str(subagent_type or ""),
             "role": str(role or "")[:80],
             "original_model": str(original_model or "inherit"),
