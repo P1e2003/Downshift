@@ -1,0 +1,22 @@
+{
+  "name": "downshift",
+  "interface": {
+    "displayName": "Downshift"
+  },
+  "plugins": [
+    {
+      "name": "downshift",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/P1e2003/Downshift.git",
+        "ref": "main"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
+

@@ -1,19 +1,19 @@
 # Downshift — Smart Subagent Model Routing Rules
 
-Always follow these model-tier delegation rules when spawning subagents (`invoke_subagent` in Google Antigravity or `Task` / `Agent` in Claude Code & OpenAI Codex):
+Always follow these model-tier delegation rules when spawning subagents (`invoke_subagent` in Google Antigravity, `spawn_agent` in OpenAI Codex, or `Task` / `Agent` in Claude Code):
 
 ## 1. 3-Tier Subagent Routing Policy
 
-| Tier | Antigravity Model | Claude Code Model | When to Use |
-| :--- | :--- | :--- | :--- |
-| **Tier 1 (`lite`)** | `flash_lite` | `haiku` | Bounded read-only lookups: locating files, checking `git status` / `git branch`, listing directory contents, counting lines, or finding where a symbol is defined. |
-| **Tier 2 (`fast`)** | `flash` | `sonnet` | Broad read-only codebase surveys (`research` / `Explore`), tracing callers across modules, log scanning, and running pure test/lint/build verification (`pytest`, `vitest`, `ruff`, `eslint`, `npm run build`). |
-| **Tier 3 (`frontier`)** | `inherit` | `inherit` | Architecture design, multi-file stateful code mutations, database migrations (`alembic`), concurrency/locking (`FOR UPDATE`, `advisory lock`, `savepoint`, `deadlock`), and security/auth/permission logic. |
+| Tier | Antigravity Model | Claude Code Model | OpenAI Codex Model | When to Use |
+| :--- | :--- | :--- | :--- | :--- |
+| **Tier 1 (`lite`)** | `flash_lite` | `haiku` | `gpt-6-luna` (`low`) | Bounded read-only lookups: locating files, checking `git status` / `git branch`, listing directory contents, counting lines, or finding where a symbol is defined. |
+| **Tier 2 (`fast`)** | `flash` | `sonnet` | `gpt-6.1-sol` (`medium`) | Broad read-only codebase surveys (`research` / `Explore` / `spawn_agent`), tracing callers across modules, log scanning, and running pure test/lint/build verification (`pytest`, `vitest`, `ruff`, `eslint`, `npm run build`). |
+| **Tier 3 (`frontier`)** | `inherit` | `inherit` | `inherit` (`gpt-6-astra`) | Architecture design, multi-file stateful code mutations, database migrations (`alembic`), concurrency/locking (`FOR UPDATE`, `advisory lock`, `savepoint`, `deadlock`), and security/auth/permission logic. |
 
 ## 2. Delegate Mechanical Exploration Instead of Looping on the Frontier Model
 
-- When a task requires multi-step file discovery, log scanning, or running a test/lint suite to inspect failures, delegate that read-only or verification step to a subagent rather than burning multiple frontier-model turns.
-- Downshift's `PreToolUse` lifecycle hook automatically inspects subagent invocations and downshifts eligible calls to `flash_lite`/`flash` (Antigravity) or `haiku`/`sonnet` (Claude Code) while enforcing safety guardrails.
+- When a task requires multi-step file discovery, log scanning, or running a test/lint suite to inspect failures, delegate that read-only or verification step to a subagent (`invoke_subagent`, `spawn_agent`, or `Task` / `Agent`) rather than burning multiple frontier-model turns.
+- Downshift's `PreToolUse` lifecycle hook automatically inspects subagent invocations and downshifts eligible calls to `flash_lite`/`flash` (Antigravity), `haiku`/`sonnet` (Claude Code), or `gpt-6-luna`/`gpt-6.1-sol` (OpenAI Codex) while enforcing safety guardrails.
 
 ## 3. Inline `@tag` Overrides
 

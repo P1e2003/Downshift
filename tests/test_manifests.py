@@ -30,6 +30,14 @@ def test_all_manifests_parse_and_share_name_and_version() -> None:
     assert loaded[3]["contextFileName"] == "rules/AGENTS.md"
     assert (ROOT / loaded[3]["contextFileName"]).exists()
 
+    marketplace_path = ROOT / ".agents" / "plugins" / "marketplace.json"
+    assert marketplace_path.exists(), (
+        f"Missing Codex marketplace manifest: {marketplace_path}"
+    )
+    marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
+    assert marketplace["name"] == "downshift"
+    assert marketplace["plugins"][0]["name"] == "downshift"
+
 
 def test_hooks_json_references_existing_scripts() -> None:
     launcher_cmd = ROOT / "scripts" / "run_hook.cmd"
@@ -50,6 +58,9 @@ def test_hooks_json_references_existing_scripts() -> None:
     claude_hooks_path = ROOT / "hooks" / "claude-codex-hooks.json"
     assert claude_hooks_path.exists()
     claude_hooks = json.loads(claude_hooks_path.read_text(encoding="utf-8"))
+    pre_tool_matcher = claude_hooks["hooks"]["PreToolUse"][0]["matcher"]
+    assert "spawn_agent" in pre_tool_matcher
+    assert "multi_agent_v1__spawn_agent" in pre_tool_matcher
     for event_list in claude_hooks["hooks"].values():
         for matcher_group in event_list:
             for hook in matcher_group["hooks"]:

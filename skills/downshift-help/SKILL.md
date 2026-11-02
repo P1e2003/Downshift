@@ -15,9 +15,9 @@ Display this compact reference card in a fenced `text` block:
   downshift · multi-host subagent model router
 
   Tiers (English & Vietnamese EN/VI)
-    Tier 1 (lite · 0.04x)      flash_lite / haiku    file locate (incl. benign filenames), git status, tìm file/hàm
-    Tier 2 (fast · 0.20x)      flash / sonnet        codebase survey, >600-char/multi-file lookup, pytest/vitest/ruff
-    Tier 3 (frontier · 1.00x)  inherit (Pro / Opus)  architecture, code edits, migrations, locking, auth, bảo mật
+    Tier 1 (lite · 0.04x)      flash_lite / haiku / gpt-6-luna   file locate (incl. benign filenames), git status, tìm file/hàm
+    Tier 2 (fast · 0.20x)      flash / sonnet / gpt-6.1-sol      codebase survey, >600-char/multi-file lookup, pytest/vitest/ruff
+    Tier 3 (frontier · 1.00x)  inherit (Pro / Opus / Astra)      architecture, code edits, migrations, locking, auth, bảo mật
 
   Safety Guardrails (never downshifted)
     alembic · migration · deadlock · race condition · advisory lock · for update · savepoint

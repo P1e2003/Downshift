@@ -22,6 +22,8 @@ def _run_hook(
         else payload
     )
     env = os.environ.copy()
+    for codex_var in ("CODEX_CI", "CODEX_HOME", "PLUGIN_DATA"):
+        env.pop(codex_var, None)
     if extra_env:
         env.update(extra_env)
     proc = subprocess.run(
@@ -581,3 +583,114 @@ def test_bilingual_vietnamese_hooks_cli(tmp_path: Path) -> None:
     )
     assert code_vi_inv == 0
     assert "injectSteps" in data_vi_inv
+
+
+def test_codex_spawn_agent_and_pre_invocation_cli(tmp_path: Path) -> None:
+    ledger = tmp_path / "codex_ledger.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+
+    # 1. spawn_agent with message -> Tier 1 gpt-6-luna + reasoning_effort="low"
+    code_lite, data_lite = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-codex-1",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "message": "Locate backend/app/api/auth.py and count lines",
+            },
+        },
+        extra_env=env,
+    )
+    assert code_lite == 0
+    assert data_lite == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": {
+                "message": "Locate backend/app/api/auth.py and count lines",
+                "model": "gpt-6-luna",
+                "reasoning_effort": "low",
+            },
+        }
+    }
+
+    # 2. multi_agent_v1__spawn_agent with items list -> Tier 2 gpt-6.1-sol + reasoning_effort="medium"
+    code_fast, data_fast = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-codex-2",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "multi_agent_v1__spawn_agent",
+            "tool_input": {
+                "items": [
+                    {
+                        "type": "text",
+                        "text": "Survey all callers of NotificationService across the backend and summarize the flow",
+                    }
+                ],
+                "reasoning_effort": "high",
+            },
+        },
+        extra_env=env,
+    )
+    assert code_fast == 0
+    assert data_fast == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": {
+                "items": [
+                    {
+                        "type": "text",
+                        "text": "Survey all callers of NotificationService across the backend and summarize the flow",
+                    }
+                ],
+                "model": "gpt-6.1-sol",
+                "reasoning_effort": "medium",
+            },
+        }
+    }
+
+    # 3. High-risk spawn_agent call with explicit gpt-6-luna is upgraded to inherit + reasoning_effort="high"
+    code_hr, data_hr = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-codex-3",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "message": "Audit alembic migration and savepoint rollback contention",
+                "model": "gpt-6-luna",
+                "reasoning_effort": "low",
+            },
+        },
+        extra_env=env,
+    )
+    assert code_hr == 0
+    assert data_hr == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": {
+                "message": "Audit alembic migration and savepoint rollback contention",
+                "model": "inherit",
+                "reasoning_effort": "high",
+            },
+        }
+    }
+
+    # 4. Codex UserPromptSubmit via PLUGIN_DATA emits hookSpecificOutput.additionalContext
+    code_inv, data_inv = _run_hook(
+        PRE_INVOCATION,
+        {
+            "session_id": "sess-codex-4",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "Search the codebase and list all callers of NotificationService",
+        },
+        extra_env={**env, "PLUGIN_DATA": str(tmp_path)},
+    )
+    assert code_inv == 0
+    assert data_inv["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    assert "spawn_agent" in data_inv["hookSpecificOutput"]["additionalContext"]
+    assert "systemMessage" not in data_inv

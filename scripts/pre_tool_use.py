@@ -7,6 +7,7 @@ import sys
 from typing import Any
 
 from downshift_core import (
+    CODEX_TIER_REASONING_EFFORT,
     classify_subagent_call,
     detect_host,
     extract_workspace_dir,
@@ -14,11 +15,40 @@ from downshift_core import (
     record_routing_event,
 )
 
-CLAUDE_SUBAGENT_TOOLS = frozenset({"task", "agent"})
+CLAUDE_SUBAGENT_TOOLS = frozenset(
+    {"task", "agent", "spawn_agent", "multi_agent_v1__spawn_agent"}
+)
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
+
+
+def _extract_claude_or_codex_fields(
+    tool_name: str, tool_input: dict[str, Any]
+) -> tuple[str, str, str]:
+    norm_tool = tool_name.strip().lower()
+    if norm_tool in ("spawn_agent", "multi_agent_v1__spawn_agent"):
+        type_name = str(tool_input.get("subagent_type") or "spawn_agent")
+        role = str(
+            tool_input.get("description") or tool_input.get("role") or "spawn_agent"
+        )
+        msg = str(tool_input.get("message") or tool_input.get("prompt") or "")
+        items = tool_input.get("items")
+        if isinstance(items, list):
+            item_texts = [
+                str(item.get("text") or "")
+                for item in items
+                if isinstance(item, dict) and item.get("text")
+            ]
+            if item_texts:
+                joined = "\n".join(item_texts)
+                msg = f"{msg}\n{joined}" if msg else joined
+        return type_name, role, msg
+    type_name = str(tool_input.get("subagent_type") or "general-purpose")
+    role = str(tool_input.get("description") or "")
+    prompt_text = str(tool_input.get("prompt") or "")
+    return type_name, role, prompt_text
 
 
 def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
@@ -70,9 +100,9 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         return {}
 
     tool_input = dict(_as_dict(payload.get("tool_input")))
-    type_name = str(tool_input.get("subagent_type") or "general-purpose")
-    role = str(tool_input.get("description") or "")
-    prompt_text = str(tool_input.get("prompt") or "")
+    type_name, role, prompt_text = _extract_claude_or_codex_fields(
+        tool_name, tool_input
+    )
     orig_model = str(tool_input.get("model") or "")
     decision = classify_subagent_call(
         type_name=type_name,
@@ -94,6 +124,15 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
     if config.mode == "active" and decision.should_overwrite:
         updated_input = dict(tool_input)
         updated_input["model"] = decision.target_model
+        if host == "codex":
+            effort = CODEX_TIER_REASONING_EFFORT.get(decision.tier)
+            cur_effort = (
+                str(updated_input.get("reasoning_effort") or "").strip().lower()
+            )
+            if effort and cur_effort not in ("low", "medium"):
+                updated_input["reasoning_effort"] = effort
+            elif decision.tier == "frontier" and cur_effort in ("low", "medium"):
+                updated_input["reasoning_effort"] = "high"
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",

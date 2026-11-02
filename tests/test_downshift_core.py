@@ -680,3 +680,80 @@ def test_bilingual_vietnamese_routing_and_safety_guardrails() -> None:
     )
     assert vi_no_nudge_high_risk.should_inject is False
     assert vi_no_nudge_high_risk.reason == "high_risk_or_frontier_tag"
+
+
+def test_codex_tier_model_mapping_and_spawn_agent_routing() -> None:
+    # 1. Host detection for spawn_agent, multi_agent_v1__spawn_agent, and PLUGIN_DATA
+    assert detect_host({"tool_name": "spawn_agent", "tool_input": {}}) == "codex"
+    assert (
+        detect_host({"tool_name": "multi_agent_v1__spawn_agent", "tool_input": {}})
+        == "codex"
+    )
+    assert (
+        detect_host(
+            {"hook_event_name": "UserPromptSubmit", "prompt": "hi"},
+            env={"PLUGIN_DATA": "/tmp/codex-plugin"},
+        )
+        == "codex"
+    )
+
+    # 2. Codex Tier 1 (lite -> gpt-6-luna) on simple lookup via spawn_agent
+    lite_codex = classify_subagent_call(
+        type_name="spawn_agent",
+        role="spawn_agent",
+        prompt="Find the file where resolve_contact is defined",
+        current_model="",
+        host="codex",
+    )
+    assert lite_codex.tier == "lite"
+    assert lite_codex.target_model == "gpt-6-luna"
+    assert lite_codex.should_overwrite is True
+    assert lite_codex.reason == "read_only_simple_lookup"
+
+    # 3. Codex Tier 2 (fast -> gpt-6.1-sol) on codebase survey and verification runner
+    fast_survey_codex = classify_subagent_call(
+        type_name="spawn_agent",
+        role="spawn_agent",
+        prompt="Survey all callers of NotificationService across the backend and summarize the flow",
+        current_model="",
+        host="codex",
+    )
+    assert fast_survey_codex.tier == "fast"
+    assert fast_survey_codex.target_model == "gpt-6.1-sol"
+    assert fast_survey_codex.should_overwrite is True
+    assert fast_survey_codex.reason == "read_only_research_survey"
+
+    fast_test_codex = classify_subagent_call(
+        type_name="spawn_agent",
+        role="spawn_agent",
+        prompt="Run pytest tests/unit -v and ruff check backend/",
+        current_model="",
+        host="codex",
+    )
+    assert fast_test_codex.tier == "fast"
+    assert fast_test_codex.target_model == "gpt-6.1-sol"
+    assert fast_test_codex.should_overwrite is True
+    assert fast_test_codex.reason == "verification_test_or_lint_runner"
+
+    # 4. Codex Tier 3 (frontier -> inherit) on high-risk prompt even when caller requested gpt-6-luna
+    high_risk_codex = classify_subagent_call(
+        type_name="spawn_agent",
+        role="spawn_agent",
+        prompt="Audit alembic migration lock contention and savepoint rollback",
+        current_model="gpt-6-luna",
+        host="codex",
+    )
+    assert high_risk_codex.tier == "frontier"
+    assert high_risk_codex.target_model == "inherit"
+    assert high_risk_codex.should_overwrite is True
+    assert high_risk_codex.reason.startswith("safety_guardrail:")
+
+    # 5. Codex UserPromptSubmit advisory mentions spawn_agent and gpt-6-luna/gpt-6.1-sol
+    codex_advisory = classify_user_prompt(
+        "Search the codebase and list all callers of NotificationService",
+        invocation_num=1,
+        host="codex",
+    )
+    assert codex_advisory.should_inject is True
+    assert "spawn_agent" in codex_advisory.message
+    assert "gpt-6-luna/gpt-6.1-sol" in codex_advisory.message

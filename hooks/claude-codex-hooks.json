@@ -13,7 +13,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "Task|Agent",
+        "matcher": "Task|Agent|spawn_agent|multi_agent_v1__spawn_agent",
         "hooks": [
           {
             "type": "command",
