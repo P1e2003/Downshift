@@ -17,8 +17,27 @@ VALID_MODES = frozenset({"active", "shadow", "off"})
 VALID_TIERS = frozenset({"lite", "fast", "frontier"})
 
 READ_ONLY_SUBAGENTS = frozenset({"research", "explore"})
+LOWER_TIER_MODELS = frozenset(
+    {
+        "flash_lite",
+        "flash",
+        "haiku",
+        "sonnet",
+        "gpt-6-luna",
+        "gpt-6.1-sol",
+    }
+)
 GENERAL_SUBAGENTS = frozenset(
-    {"self", "general-purpose", "default", "agent", "task", ""}
+    {
+        "self",
+        "general-purpose",
+        "default",
+        "agent",
+        "task",
+        "spawn_agent",
+        "multi_agent_v1__spawn_agent",
+        "",
+    }
 )
 
 HIGH_RISK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -124,10 +143,15 @@ HOST_MODEL_MAP: dict[str, dict[str, str]] = {
         "frontier": "inherit",
     },
     "codex": {
-        "lite": "flash_lite",
-        "fast": "flash",
+        "lite": "gpt-6-luna",
+        "fast": "gpt-6.1-sol",
         "frontier": "inherit",
     },
+}
+
+CODEX_TIER_REASONING_EFFORT: dict[str, str] = {
+    "lite": "low",
+    "fast": "medium",
 }
 
 
@@ -168,7 +192,21 @@ def detect_host(payload: dict[str, Any], env: dict[str, str] | None = None) -> s
         or "invocationNum" in payload
     ):
         return "antigravity"
-    if env_map.get("CODEX_CI") or env_map.get("CODEX_HOME"):
+    tool_name = str(payload.get("tool_name") or "").strip().lower()
+    if tool_name in ("spawn_agent", "multi_agent_v1__spawn_agent"):
+        return "codex"
+    tool_input = payload.get("tool_input")
+    if (
+        tool_name in ("task", "agent")
+        and isinstance(tool_input, dict)
+        and "subagent_type" in tool_input
+    ):
+        return "claude"
+    if (
+        env_map.get("CODEX_CI")
+        or env_map.get("CODEX_HOME")
+        or env_map.get("PLUGIN_DATA")
+    ):
         return "codex"
     if (
         "tool_name" in payload
@@ -389,8 +427,14 @@ def classify_subagent_call(
             reason="inline_override:fast",
         )
 
-    # 2. Preserve caller's explicit non-default model when no inline @tag is present
-    if norm_model and norm_model.lower() != "inherit":
+    # 2. Preserve caller's explicit non-default model unless a safety guardrail upgrades a lower-tier model
+    is_explicit_non_default = bool(
+        norm_model and norm_model.lower() not in ("inherit", "default")
+    )
+    is_explicit_lower_tier = is_explicit_non_default and (
+        norm_model.lower() in LOWER_TIER_MODELS
+    )
+    if is_explicit_non_default and not is_explicit_lower_tier:
         return RoutingDecision(
             host=host,
             tier="frontier",
@@ -406,7 +450,7 @@ def classify_subagent_call(
             host=host,
             tier="frontier",
             target_model="inherit",
-            should_overwrite=False,
+            should_overwrite=is_explicit_lower_tier,
             reason="workspace_config:pinned_role",
         )
 
@@ -416,12 +460,19 @@ def classify_subagent_call(
             host=host,
             tier="frontier",
             target_model="inherit",
-            should_overwrite=False,
+            should_overwrite=is_explicit_lower_tier,
             reason="workspace_config:high_risk_keyword",
         )
 
     # 5. Hard safety guardrail blocklist (with benign identifier disambiguation on pure read-only lookups, FR-001/FR-002)
-    is_readonly = norm_type in READ_ONLY_SUBAGENTS
+    is_codex_spawn = norm_type in ("spawn_agent", "multi_agent_v1__spawn_agent")
+    is_readonly = norm_type in READ_ONLY_SUBAGENTS or (
+        is_codex_spawn
+        and not CODE_MUTATION_RE.search(combined)
+        and bool(
+            SIMPLE_LOOKUP_RE.search(combined) or COMPLEX_RESEARCH_RE.search(combined)
+        )
+    )
     simple_lookup_checked = False
     is_simple_lookup = False
     risk_match = _match_high_risk(combined)
@@ -441,8 +492,17 @@ def classify_subagent_call(
             host=host,
             tier="frontier",
             target_model="inherit",
-            should_overwrite=False,
+            should_overwrite=is_explicit_lower_tier,
             reason=f"safety_guardrail:{risk_match}",
+        )
+
+    if is_explicit_non_default:
+        return RoutingDecision(
+            host=host,
+            tier="frontier",
+            target_model=norm_model,
+            should_overwrite=False,
+            reason="caller_explicit_model_preserved",
         )
 
     # 6. Lower-tier (lite / fast) workspace pinned_roles when prompt is safe (FR-010)
@@ -541,7 +601,13 @@ def classify_user_prompt(
         )
 
     if ROUTINE_PROMPT_NUDGE_RE.search(text):
-        if host in ("claude", "codex"):
+        if host == "codex":
+            msg = (
+                "[Downshift] Routine multi-step search/log/verification task detected. "
+                "Prefer delegating mechanical exploration via spawn_agent (which Downshift routes to gpt-6-luna/gpt-6.1-sol) "
+                "rather than looping on the frontier model."
+            )
+        elif host == "claude":
             msg = (
                 "[Downshift] Routine multi-step search/log/verification task detected. "
                 "Prefer delegating mechanical exploration via Task/subagent (which Downshift routes to Haiku/Sonnet) "
