@@ -1,4 +1,4 @@
-"""Reproducible 20-scenario routing accuracy, safety guardrail, and latency benchmark suite."""
+"""Reproducible 30-scenario routing accuracy, safety guardrail, and latency benchmark suite."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from downshift_core import classify_subagent_call
+from downshift_core import DownshiftConfig, classify_subagent_call
 
 PRE_TOOL_USE = ROOT / "scripts" / "pre_tool_use.py"
 
@@ -245,6 +245,118 @@ SCENARIOS: list[dict[str, Any]] = [
         "expected_model": "inherit",
         "high_risk": True,
     },
+    # Category 5: v0.2.0 — Benign filename disambiguation, complexity promotion, Vietnamese EN/VI & workspace config (10 scenarios)
+    {
+        "id": "S21",
+        "category": "benign_filename_lookup",
+        "host": "antigravity",
+        "type_name": "research",
+        "role": "File Locator",
+        "prompt": "Find the file where auth_service.py is defined",
+        "expected_tier": "lite",
+        "expected_model": "flash_lite",
+        "high_risk": False,
+    },
+    {
+        "id": "S22",
+        "category": "benign_filename_lookup",
+        "host": "claude",
+        "type_name": "Explore",
+        "role": "File Locator",
+        "prompt": "Locate backend/alembic/versions/001_migration.py in the repository",
+        "expected_tier": "lite",
+        "expected_model": "haiku",
+        "high_risk": False,
+    },
+    {
+        "id": "S23",
+        "category": "complexity_promotion",
+        "host": "antigravity",
+        "type_name": "research",
+        "role": "Multi-File Locator",
+        "prompt": "Find file definitions across backend/app/main.py, backend/app/api/webhooks.py, and frontend/src/App.tsx",
+        "expected_tier": "fast",
+        "expected_model": "flash",
+        "high_risk": False,
+    },
+    {
+        "id": "S24",
+        "category": "complexity_promotion",
+        "host": "claude",
+        "type_name": "Explore",
+        "role": "Traceback Locator",
+        "prompt": 'Locate the line causing this error:\nTraceback (most recent call last):\n  File "backend/app/main.py", line 42, in startup',
+        "expected_tier": "fast",
+        "expected_model": "sonnet",
+        "high_risk": False,
+    },
+    {
+        "id": "S25",
+        "category": "bilingual_vietnamese",
+        "host": "antigravity",
+        "type_name": "research",
+        "role": "Tìm kiếm",
+        "prompt": "Tìm file định nghĩa hàm resolve_contact",
+        "expected_tier": "lite",
+        "expected_model": "flash_lite",
+        "high_risk": False,
+    },
+    {
+        "id": "S26",
+        "category": "bilingual_vietnamese",
+        "host": "claude",
+        "type_name": "Explore",
+        "role": "Khảo sát mã nguồn",
+        "prompt": "Tóm tắt luồng xử lý tin nhắn và kiểm tra toàn bộ các nơi gọi NotificationService",
+        "expected_tier": "fast",
+        "expected_model": "sonnet",
+        "high_risk": False,
+    },
+    {
+        "id": "S27",
+        "category": "bilingual_vietnamese",
+        "host": "antigravity",
+        "type_name": "self",
+        "role": "Kiểm thử",
+        "prompt": "Chạy pytest và kiểm tra lint trên thư mục scripts",
+        "expected_tier": "fast",
+        "expected_model": "flash",
+        "high_risk": False,
+    },
+    {
+        "id": "S28",
+        "category": "bilingual_high_risk",
+        "host": "antigravity",
+        "type_name": "research",
+        "role": "Kiểm toán bảo mật",
+        "prompt": "Kiểm tra phân quyền và xác thực người dùng trong tenants.py",
+        "expected_tier": "frontier",
+        "expected_model": "inherit",
+        "high_risk": True,
+    },
+    {
+        "id": "S29",
+        "category": "bilingual_high_risk",
+        "host": "claude",
+        "type_name": "Explore",
+        "role": "Điều tra đồng thời",
+        "prompt": "Phân tích lỗi khóa bảng và tranh chấp đồng thời trong webhook_service.py",
+        "expected_tier": "frontier",
+        "expected_model": "inherit",
+        "high_risk": True,
+    },
+    {
+        "id": "S30",
+        "category": "workspace_config_override",
+        "host": "antigravity",
+        "type_name": "research",
+        "role": "CRM Researcher",
+        "prompt": "Find file where vietmoney webhook payload is parsed",
+        "config": {"high_risk_keywords": ["vietmoney"]},
+        "expected_tier": "frontier",
+        "expected_model": "inherit",
+        "high_risk": True,
+    },
 ]
 
 
@@ -290,6 +402,27 @@ def run_benchmark() -> dict[str, Any]:
         env["DOWNSHIFT_LEDGER_PATH"] = str(ledger_path)
 
         for sc in SCENARIOS:
+            raw_cfg = sc.get("config")
+            cfg_obj = None
+            sc_env = dict(env)
+            if isinstance(raw_cfg, dict):
+                cfg_obj = DownshiftConfig(
+                    high_risk_keywords=tuple(raw_cfg.get("high_risk_keywords", ())),
+                    pinned_roles=dict(raw_cfg.get("pinned_roles", {})),
+                )
+                cfg_file = Path(tmp_dir) / f"cfg_{sc['id']}.json"
+                cfg_file.write_text(json.dumps(raw_cfg), encoding="utf-8")
+                sc_env["DOWNSHIFT_CONFIG_PATH"] = str(cfg_file)
+
+            # Warmup call so subprocess teardown does not skew in-memory microsecond timing
+            classify_subagent_call(
+                type_name=sc["type_name"],
+                role=sc["role"],
+                prompt=sc["prompt"],
+                current_model="inherit" if sc["host"] == "antigravity" else "",
+                host=sc["host"],
+                config=cfg_obj,
+            )
             t0_mem = time.perf_counter()
             decision = classify_subagent_call(
                 type_name=sc["type_name"],
@@ -297,6 +430,7 @@ def run_benchmark() -> dict[str, Any]:
                 prompt=sc["prompt"],
                 current_model="inherit" if sc["host"] == "antigravity" else "",
                 host=sc["host"],
+                config=cfg_obj,
             )
             in_memory_us.append((time.perf_counter() - t0_mem) * 1_000_000.0)
 
@@ -304,10 +438,11 @@ def run_benchmark() -> dict[str, Any]:
             t0_cli = time.perf_counter()
             proc = subprocess.run(
                 [sys.executable, str(PRE_TOOL_USE)],
-                input=json.dumps(payload),
+                input=json.dumps(payload, ensure_ascii=False),
                 text=True,
+                encoding="utf-8",
                 capture_output=True,
-                env=env,
+                env=sc_env,
                 timeout=5,
                 check=False,
             )
@@ -363,7 +498,7 @@ def run_benchmark() -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Run Downshift 20-scenario routing benchmark"
+        description="Run Downshift 30-scenario routing benchmark"
     )
     parser.add_argument("--json", action="store_true", help="Emit JSON report")
     args = parser.parse_args(argv)

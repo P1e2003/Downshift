@@ -23,7 +23,7 @@ def test_all_manifests_parse_and_share_name_and_version() -> None:
         assert path.exists(), f"Missing manifest: {path}"
         data = json.loads(path.read_text(encoding="utf-8"))
         assert data["name"] == "downshift"
-        assert data["version"] == "0.1.0"
+        assert data["version"] == "0.2.0"
         assert data.get("description")
         loaded.append(data)
 
@@ -89,7 +89,7 @@ def test_benchmark_suite_passes_100_percent_accuracy_and_zero_false_downgrades()
     )
     assert proc.returncode == 0, proc.stderr
     report = json.loads(proc.stdout)
-    assert report["total_scenarios"] == 20
+    assert report["total_scenarios"] == 30
     assert report["accuracy_pct"] == 100.0
     assert report["false_downgrades_on_high_risk"] == 0
     assert report["in_memory_median_us"] < 5000.0

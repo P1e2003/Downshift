@@ -11,8 +11,17 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from downshift_core import RoutingDecision, record_routing_event
-from stats_cli import compute_summary, load_events, render_ascii_scoreboard
+from downshift_core import (
+    RoutingDecision,
+    _get_max_ledger_bytes,
+    record_routing_event,
+)
+from stats_cli import (
+    TIER_COST_WEIGHT,
+    compute_summary,
+    load_events,
+    render_ascii_scoreboard,
+)
 
 STATS_CLI = ROOT / "scripts" / "stats_cli.py"
 
@@ -191,3 +200,120 @@ def test_concurrent_appends_preserve_all_events_without_corruption(
     assert all(results)
     events = load_events(ledger)
     assert len(events) == 40
+
+
+def test_cost_multiplier_savings_and_legacy_event_defaults(tmp_path: Path) -> None:
+    assert TIER_COST_WEIGHT == {"frontier": 1.00, "fast": 0.20, "lite": 0.04}
+
+    # Empty ledger state
+    empty_summary = compute_summary([])
+    assert empty_summary["est_cost_saved_pct"] == 0.0
+    assert empty_summary["active_count"] == 0
+    assert empty_summary["shadow_count"] == 0
+    assert empty_summary["total_prompt_chars"] == 0
+
+    ledger = tmp_path / "cost_roi.jsonl"
+    # 1. Lite active call (120 chars) -> weight 0.04
+    record_routing_event(
+        decision=RoutingDecision(
+            host="antigravity",
+            tier="lite",
+            target_model="flash_lite",
+            should_overwrite=True,
+            reason="read_only_simple_lookup",
+        ),
+        conversation_id="c-1",
+        subagent_type="research",
+        role="Locator",
+        original_model="inherit",
+        ledger_path=ledger,
+        mode="active",
+        prompt_chars=120,
+    )
+    # 2. Fast shadow call (380 chars) -> weight 0.20
+    record_routing_event(
+        decision=RoutingDecision(
+            host="claude",
+            tier="fast",
+            target_model="sonnet",
+            should_overwrite=True,
+            reason="read_only_research_survey",
+        ),
+        conversation_id="c-2",
+        subagent_type="Explore",
+        role="Surveyor",
+        original_model="inherit",
+        ledger_path=ledger,
+        mode="shadow",
+        prompt_chars=380,
+    )
+    # 3. Append a legacy v0.1.0 line without mode or prompt_chars (frontier -> weight 1.00)
+    legacy_line = json.dumps(
+        {
+            "timestamp": "2026-10-30T05:00:00Z",
+            "conversation_id": "c-legacy",
+            "host": "antigravity",
+            "subagent_type": "self",
+            "role": "Implementer",
+            "original_model": "inherit",
+            "target_model": "inherit",
+            "tier": "frontier",
+            "reason": "frontier_default_stateful_work",
+            "overwritten": False,
+        }
+    )
+    with ledger.open("a", encoding="utf-8") as f:
+        f.write(legacy_line + "\n")
+
+    loaded = load_events(ledger)
+    summary = compute_summary(loaded)
+    assert summary["total"] == 3
+    assert summary["active_count"] == 2
+    assert summary["shadow_count"] == 1
+    assert summary["total_prompt_chars"] == 500
+    # actual_weighted = 0.04 + 0.20 + 1.00 = 1.24; saved = 1.0 - (1.24 / 3) = 58.7%
+    assert summary["est_cost_saved_pct"] == 58.7
+
+    board = render_ascii_scoreboard(summary, ledger)
+    assert "58.7%" in board
+    assert "2 active, 1 shadow" in board
+    assert "500 prompt chars" in board
+
+
+def test_ledger_auto_rotation_keeps_newest_half_under_byte_limit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # 1. Invalid or non-positive env values fall back to 5 MB (5_242_880)
+    assert _get_max_ledger_bytes({}) == 5_242_880
+    assert _get_max_ledger_bytes({"DOWNSHIFT_MAX_LEDGER_BYTES": "invalid"}) == 5_242_880
+    assert _get_max_ledger_bytes({"DOWNSHIFT_MAX_LEDGER_BYTES": "0"}) == 5_242_880
+    assert _get_max_ledger_bytes({"DOWNSHIFT_MAX_LEDGER_BYTES": "-500"}) == 5_242_880
+    assert _get_max_ledger_bytes({"DOWNSHIFT_MAX_LEDGER_BYTES": "1024"}) == 1024
+
+    # 2. Enforce 1024-byte cap across 20 writes
+    monkeypatch.setenv("DOWNSHIFT_MAX_LEDGER_BYTES", "1024")
+    ledger = tmp_path / "rotated_ledger.jsonl"
+
+    for idx in range(20):
+        ok = record_routing_event(
+            decision=RoutingDecision(
+                host="antigravity",
+                tier="lite",
+                target_model="flash_lite",
+                should_overwrite=True,
+                reason="read_only_simple_lookup",
+            ),
+            conversation_id=f"conv-rot-{idx}",
+            subagent_type="research",
+            role=f"Role {idx}",
+            original_model="inherit",
+            ledger_path=ledger,
+            mode="active",
+            prompt_chars=42,
+        )
+        assert ok is True
+        assert ledger.stat().st_size <= 1024
+
+    events = load_events(ledger)
+    assert 1 <= len(events) < 10
+    assert events[-1]["conversation_id"] == "conv-rot-19"

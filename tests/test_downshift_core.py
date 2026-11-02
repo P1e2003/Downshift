@@ -15,7 +15,9 @@ from downshift_core import (
     detect_host,
     extract_workspace_dir,
     load_config,
+    score_prompt_complexity,
     should_nudge_pre_invocation,
+    strip_benign_code_identifiers,
 )
 
 
@@ -423,3 +425,258 @@ def test_custom_high_risk_keywords_and_pinned_roles() -> None:
     assert extract_workspace_dir({"workspacePaths": ["/repo/chaxy"]}) == "/repo/chaxy"
     assert extract_workspace_dir({"cwd": "/repo/claude"}) == "/repo/claude"
     assert extract_workspace_dir({}) is None
+
+
+def test_strip_benign_code_identifiers_and_pure_lookup_disambiguation() -> None:
+    masked = strip_benign_code_identifiers(
+        "Find the file where auth_service.py is defined and check_permission_gate or AuthPermissionService is called"
+    )
+    assert "auth_service.py" not in masked
+    assert "check_permission_gate" not in masked
+    assert "AuthPermissionService" not in masked
+
+    # Standalone natural-language words remain unmasked
+    unmasked_nl = strip_benign_code_identifiers(
+        "Audit auth and permission checks in the service"
+    )
+    assert "auth" in unmasked_nl.lower()
+    assert "permission" in unmasked_nl.lower()
+
+    # 1. Pure read-only lookup referencing auth_service.py routes to lite (FR-001, FR-002)
+    lookup_auth = classify_subagent_call(
+        type_name="research",
+        role="File Locator",
+        prompt="Find the file where auth_service.py is defined",
+        current_model="inherit",
+        host="antigravity",
+    )
+    assert lookup_auth.tier == "lite"
+    assert lookup_auth.target_model == "flash_lite"
+    assert lookup_auth.should_overwrite is True
+    assert lookup_auth.reason == "read_only_simple_lookup"
+
+    # 2. Pure read-only lookup referencing 001_migration.py routes to lite
+    lookup_mig = classify_subagent_call(
+        type_name="Explore",
+        role="File Locator",
+        prompt="Locate 001_migration.py in the repository",
+        current_model="",
+        host="claude",
+    )
+    assert lookup_mig.tier == "lite"
+    assert lookup_mig.target_model == "haiku"
+    assert lookup_mig.should_overwrite is True
+
+    # 3. Genuine security audit on auth_service.py stays on frontier
+    audit_auth = classify_subagent_call(
+        type_name="research",
+        role="Security Auditor",
+        prompt="Audit auth_service.py for JWT token bypass",
+        current_model="inherit",
+        host="antigravity",
+    )
+    assert audit_auth.tier == "frontier"
+    assert audit_auth.target_model == "inherit"
+    assert audit_auth.should_overwrite is False
+    assert audit_auth.reason.startswith("safety_guardrail:")
+
+    # 4. Genuine migration rollback investigation on 001_migration.py stays on frontier
+    investigate_mig = classify_subagent_call(
+        type_name="research",
+        role="DB Investigator",
+        prompt="Investigate migration rollback failure in 001_migration.py",
+        current_model="inherit",
+        host="antigravity",
+    )
+    assert investigate_mig.tier == "frontier"
+    assert investigate_mig.should_overwrite is False
+
+    # 5. Workspace custom high_risk_keywords are enforced on unmasked text (FR-003)
+    custom_cfg = DownshiftConfig(high_risk_keywords=("auth_service.py",))
+    custom_blocked = classify_subagent_call(
+        type_name="research",
+        role="File Locator",
+        prompt="Find the file where auth_service.py is defined",
+        current_model="inherit",
+        host="antigravity",
+        config=custom_cfg,
+    )
+    assert custom_blocked.tier == "frontier"
+    assert custom_blocked.should_overwrite is False
+    assert custom_blocked.reason == "workspace_config:high_risk_keyword"
+
+
+def test_score_prompt_complexity_and_promotion_from_lite_to_fast() -> None:
+    # 1. Repeated occurrences of the same path are deduplicated (edge case)
+    dup_profile = score_prompt_complexity(
+        "Find file where resolve_contact.py is imported in resolve_contact.py and exported from resolve_contact.py"
+    )
+    assert dup_profile["path_count"] == 1
+    dup_decision = classify_subagent_call(
+        type_name="research",
+        role="File Locator",
+        prompt="Find file where resolve_contact.py is imported in resolve_contact.py and exported from resolve_contact.py",
+        current_model="inherit",
+        host="antigravity",
+    )
+    assert dup_decision.tier == "lite"
+
+    # 2. >= 3 distinct file paths promotes simple lookup to fast (FR-004, FR-005)
+    multi_path_prompt = (
+        "Find file definitions and check imports across backend/app/main.py, "
+        "backend/app/services/webhook_service.py, and frontend/src/App.tsx"
+    )
+    mp_profile = score_prompt_complexity(multi_path_prompt)
+    assert int(mp_profile["path_count"]) >= 3
+    mp_decision = classify_subagent_call(
+        type_name="research",
+        role="File Locator",
+        prompt=multi_path_prompt,
+        current_model="inherit",
+        host="antigravity",
+    )
+    assert mp_decision.tier == "fast"
+    assert mp_decision.target_model == "flash"
+    assert mp_decision.reason == "promoted_to_fast:multi_file_or_long_prompt"
+
+    # 3. Prompt > 600 chars promotes simple lookup to fast
+    long_prompt = "Find file where resolve_contact is defined. " + (
+        "Additional repository context for locating caller module. " * 12
+    )
+    assert score_prompt_complexity(long_prompt)["char_len"] > 600
+    long_decision = classify_subagent_call(
+        type_name="Explore",
+        role="Locator",
+        prompt=long_prompt,
+        current_model="",
+        host="claude",
+    )
+    assert long_decision.tier == "fast"
+    assert long_decision.target_model == "sonnet"
+    assert long_decision.reason == "promoted_to_fast:multi_file_or_long_prompt"
+
+    # 4. Fenced code block promotes simple lookup to fast
+    fence_prompt = "Where is this function defined?\n```python\ndef handle_webhook(payload):\n    return True\n```"
+    assert score_prompt_complexity(fence_prompt)["has_code_fence"] is True
+    fence_decision = classify_subagent_call(
+        type_name="research",
+        role="Code Locator",
+        prompt=fence_prompt,
+        current_model="inherit",
+        host="antigravity",
+    )
+    assert fence_decision.tier == "fast"
+    assert fence_decision.reason == "promoted_to_fast:multi_file_or_long_prompt"
+
+    # 5. Stack trace promotes simple lookup to fast
+    trace_prompt = (
+        "Locate the line causing this error:\n"
+        "Traceback (most recent call last):\n"
+        '  File "backend/app/main.py", line 42, in startup\n'
+        "    raise RuntimeError('boom')"
+    )
+    assert score_prompt_complexity(trace_prompt)["has_stack_trace"] is True
+    trace_decision = classify_subagent_call(
+        type_name="research",
+        role="Traceback Locator",
+        prompt=trace_prompt,
+        current_model="inherit",
+        host="antigravity",
+    )
+    assert trace_decision.tier == "fast"
+    assert trace_decision.reason == "promoted_to_fast:multi_file_or_long_prompt"
+
+
+def test_bilingual_vietnamese_routing_and_safety_guardrails() -> None:
+    # 1. Vietnamese simple lookups (accented & unaccented) -> lite (FR-006)
+    vi_lookup_1 = classify_subagent_call(
+        type_name="research",
+        role="Tìm kiếm",
+        prompt="Tìm file định nghĩa hàm resolve_contact",
+        current_model="inherit",
+        host="antigravity",
+    )
+    assert vi_lookup_1.tier == "lite"
+    assert vi_lookup_1.target_model == "flash_lite"
+
+    vi_lookup_2 = classify_subagent_call(
+        type_name="Explore",
+        role="Tim kiem",
+        prompt="Tim ham check_health o file nao trong repo?",
+        current_model="",
+        host="claude",
+    )
+    assert vi_lookup_2.tier == "lite"
+    assert vi_lookup_2.target_model == "haiku"
+
+    # 2. Vietnamese codebase survey & pure test/lint runner -> fast (FR-007)
+    vi_survey = classify_subagent_call(
+        type_name="research",
+        role="Khảo sát mã nguồn",
+        prompt="Tóm tắt luồng xử lý tin nhắn và kiểm tra toàn bộ các nơi gọi NotificationService",
+        current_model="inherit",
+        host="antigravity",
+    )
+    assert vi_survey.tier == "fast"
+    assert vi_survey.target_model == "flash"
+    assert vi_survey.reason == "read_only_research_survey"
+
+    vi_test_runner = classify_subagent_call(
+        type_name="self",
+        role="Kiểm thử",
+        prompt="Chạy pytest và kiểm tra lint trên thư mục scripts",
+        current_model="inherit",
+        host="antigravity",
+    )
+    assert vi_test_runner.tier == "fast"
+    assert vi_test_runner.target_model == "flash"
+    assert vi_test_runner.reason == "verification_test_or_lint_runner"
+
+    # 3. Vietnamese code mutation blocks Tier 2 test-runner offloading on self (FR-007)
+    vi_mutation = classify_subagent_call(
+        type_name="self",
+        role="Kỹ sư backend",
+        prompt="Sửa lỗi trong webhook_service.py rồi chạy pytest",
+        current_model="inherit",
+        host="antigravity",
+    )
+    assert vi_mutation.tier == "frontier"
+    assert vi_mutation.should_overwrite is False
+    assert vi_mutation.reason == "frontier_default_stateful_work"
+
+    # 4. Vietnamese high-risk engineering terms stay on frontier (FR-008)
+    vi_high_risk_prompts = [
+        "Kiểm tra phân quyền và xác thực người dùng trong tenants.py",
+        "Ra soat bao mat va phan quyen API",
+        "Phân tích lỗi khóa bảng và tranh chấp đồng thời khi tạo contact",
+        "Kiem tra di tru du lieu va schema trong backend",
+        "Điều tra lỗi mất tin nhắn trên production",
+        "Tìm file auth_service.py và kiểm tra lỗi bảo mật JWT",
+    ]
+    for prompt in vi_high_risk_prompts:
+        decision = classify_subagent_call(
+            type_name="research",
+            role="Kiểm tra",
+            prompt=prompt,
+            current_model="inherit",
+            host="antigravity",
+        )
+        assert decision.tier == "frontier", f"Expected frontier for: {prompt}"
+        assert decision.should_overwrite is False
+        assert decision.reason.startswith("safety_guardrail:")
+
+    # 5. Vietnamese PreInvocation user prompt classification (FR-009)
+    vi_nudge = classify_user_prompt(
+        "Quét log và tìm tất cả các file gọi NotificationService",
+        invocation_num=1,
+        host="antigravity",
+    )
+    assert vi_nudge.should_inject is True
+
+    vi_no_nudge_high_risk = classify_user_prompt(
+        "Tìm tất cả lỗi bảo mật và phân quyền trong hệ thống",
+        invocation_num=1,
+        host="antigravity",
+    )
+    assert vi_no_nudge_high_risk.should_inject is False
+    assert vi_no_nudge_high_risk.reason == "high_risk_or_frontier_tag"

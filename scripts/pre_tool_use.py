@@ -36,11 +36,12 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         args = _as_dict(tool_call.get("args"))
         type_name = str(args.get("TypeName") or "")
         role = str(args.get("Role") or "")
+        prompt_text = str(args.get("Prompt") or "")
         orig_model = str(args.get("Model") or "inherit")
         decision = classify_subagent_call(
             type_name=type_name,
             role=role,
-            prompt=str(args.get("Prompt") or ""),
+            prompt=prompt_text,
             current_model=orig_model,
             host="antigravity",
             config=config,
@@ -52,6 +53,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
             role=role,
             original_model=orig_model,
             mode=config.mode,
+            prompt_chars=len(prompt_text),
         )
         if config.mode == "active" and decision.should_overwrite:
             return {
@@ -70,11 +72,12 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
     tool_input = dict(_as_dict(payload.get("tool_input")))
     type_name = str(tool_input.get("subagent_type") or "general-purpose")
     role = str(tool_input.get("description") or "")
+    prompt_text = str(tool_input.get("prompt") or "")
     orig_model = str(tool_input.get("model") or "")
     decision = classify_subagent_call(
         type_name=type_name,
         role=role,
-        prompt=str(tool_input.get("prompt") or ""),
+        prompt=prompt_text,
         current_model=orig_model,
         host=host,
         config=config,
@@ -86,6 +89,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         role=role,
         original_model=orig_model or "inherit",
         mode=config.mode,
+        prompt_chars=len(prompt_text),
     )
     if config.mode == "active" and decision.should_overwrite:
         updated_input = dict(tool_input)
@@ -102,7 +106,11 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> int:
     try:
-        raw = sys.stdin.read()
+        raw_bytes = sys.stdin.buffer.read()
+        try:
+            raw = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raw = raw_bytes.decode(sys.stdin.encoding or "utf-8", errors="replace")
         if not raw or not raw.strip():
             sys.stdout.write(json.dumps({"decision": "allow"}) + "\n")
             return 0

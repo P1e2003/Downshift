@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from pathlib import Path
 from typing import Any
 
 from downshift_core import get_ledger_path
+
+TIER_COST_WEIGHT: dict[str, float] = {
+    "frontier": 1.00,
+    "fast": 0.20,
+    "lite": 0.04,
+}
 
 
 def load_events(ledger_path: Path, limit: int | None = None) -> list[dict[str, Any]]:
@@ -35,27 +42,51 @@ def load_events(ledger_path: Path, limit: int | None = None) -> list[dict[str, A
 
 
 def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate total subagents intercepted, frontier calls saved, and tier counts."""
+    """Aggregate total subagents intercepted, frontier calls saved, cost ROI, and mode counts."""
     total = len(events)
     tiers = {"lite": 0, "fast": 0, "frontier": 0}
     models: dict[str, int] = {}
     saved = 0
+    active_count = 0
+    shadow_count = 0
+    total_prompt_chars = 0
+    actual_weighted_cost = 0.0
 
     for ev in events:
         tier = str(ev.get("tier") or "frontier")
         if tier not in tiers:
             tier = "frontier"
         tiers[tier] += 1
+        actual_weighted_cost += TIER_COST_WEIGHT.get(tier, 1.00)
         model = str(ev.get("target_model") or "inherit")
         models[model] = models.get(model, 0) + 1
         if tier in ("lite", "fast") and bool(ev.get("overwritten", True)):
             saved += 1
 
+        mode = str(ev.get("mode") or "active").strip().lower()
+        if mode == "shadow":
+            shadow_count += 1
+        else:
+            active_count += 1
+
+        raw_chars = ev.get("prompt_chars", 0)
+        try:
+            total_prompt_chars += max(0, int(raw_chars or 0))
+        except (ValueError, TypeError):
+            pass
+
     saved_pct = round((saved / total) * 100.0, 1) if total > 0 else 0.0
+    est_cost_saved_pct = (
+        round((1.0 - (actual_weighted_cost / total)) * 100.0, 1) if total > 0 else 0.0
+    )
     return {
         "total": total,
         "saved": saved,
         "saved_pct": saved_pct,
+        "est_cost_saved_pct": est_cost_saved_pct,
+        "active_count": active_count,
+        "shadow_count": shadow_count,
+        "total_prompt_chars": total_prompt_chars,
         "tiers": tiers,
         "models": models,
     }
@@ -72,6 +103,10 @@ def render_ascii_scoreboard(summary: dict[str, Any], ledger_path: Path) -> str:
 
     saved = int(summary["saved"])
     saved_pct = float(summary["saved_pct"])
+    est_cost_saved_pct = float(summary.get("est_cost_saved_pct", 0.0))
+    active_count = int(summary.get("active_count", total))
+    shadow_count = int(summary.get("shadow_count", 0))
+    total_prompt_chars = int(summary.get("total_prompt_chars", 0))
     tiers = summary["tiers"]
     lite = int(tiers.get("lite", 0))
     fast = int(tiers.get("fast", 0))
@@ -83,11 +118,11 @@ def render_ascii_scoreboard(summary: dict[str, Any], ledger_path: Path) -> str:
 
     return (
         f"  downshift stats                   live ledger · {ledger_path}\n\n"
-        f"  Total subagents intercepted : {total}\n"
-        f"  Frontier calls saved        : {saved} ({saved_pct:.1f}%)\n"
-        f"  ├── Routed to lite (Tier 1) : {lite:2d} ({lite_pct:.1f}%)  [flash_lite / haiku]\n"
-        f"  ├── Routed to fast (Tier 2) : {fast:2d} ({fast_pct:.1f}%)  [flash / sonnet]\n"
-        f"  └── Kept on frontier        : {frontier:2d} ({frontier_pct:.1f}%)  [safety guardrail / stateful mutation]\n"
+        f"  Total subagents intercepted : {total}  ({active_count} active, {shadow_count} shadow · {total_prompt_chars:,} prompt chars)\n"
+        f"  Frontier calls saved        : {saved} ({saved_pct:.1f}%)  · Est. credit cost saved: {est_cost_saved_pct:.1f}%\n"
+        f"  ├── Routed to lite (Tier 1) : {lite:2d} ({lite_pct:.1f}%)  [flash_lite / haiku · 0.04x cost]\n"
+        f"  ├── Routed to fast (Tier 2) : {fast:2d} ({fast_pct:.1f}%)  [flash / sonnet · 0.20x cost]\n"
+        f"  └── Kept on frontier        : {frontier:2d} ({frontier_pct:.1f}%)  [safety guardrail / stateful mutation · 1.00x]\n"
     )
 
 
@@ -121,6 +156,8 @@ def main(argv: list[str] | None = None) -> int:
 
     events = load_events(ledger_path, limit=args.limit)
     summary = compute_summary(events)
+    with contextlib.suppress(AttributeError, OSError, ValueError):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
     if args.json:
         sys.stdout.write(json.dumps(summary, indent=2) + "\n")
     else:
