@@ -24,26 +24,32 @@ GENERAL_SUBAGENTS = frozenset(
 HIGH_RISK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "alembic_or_migration",
-        re.compile(r"\b(alembic|migrations?|schema\s+change|ddl)\b", re.IGNORECASE),
+        re.compile(
+            r"\b(alembic|migrations?|schema\s+change|ddl|di\s+trú\s+dữ\s+liệu|di\s+tru\s+du\s+lieu)\b",
+            re.IGNORECASE,
+        ),
     ),
     (
         "concurrency_or_locking",
         re.compile(
-            r"\b(deadlocks?|race\s+conditions?|advisory[_\s]+locks?|for\s+update|savepoints?|rollbacks?)\b",
+            r"\b(deadlocks?|race\s+conditions?|advisory[_\s]+locks?|for\s+update|savepoints?|rollbacks?|"
+            r"khóa\s+bảng|khoa\s+bang|tranh\s+chấp\s+đồng\s+thời|tranh\s+chap\s+dong\s+thoi)\b",
             re.IGNORECASE,
         ),
     ),
     (
         "security_or_auth",
         re.compile(
-            r"\b(security|auth(?:entication|orization)?|permissions?|idor|cryptograph(?:y|ic)|jwt|csrf|xss|secrets?)\b",
+            r"\b(security|auth(?:entication|orization)?|permissions?|idor|cryptograph(?:y|ic)|jwt|csrf|xss|secrets?|"
+            r"phân\s+quyền|phan\s+quyen|bảo\s+mật|bao\s+mat|xác\s+thực|xac\s+thuc)\b",
             re.IGNORECASE,
         ),
     ),
     (
         "production_incident",
         re.compile(
-            r"\b(production\s+incident|outage|data\s+corruption|billing\s+account)\b",
+            r"\b(production\s+incident|outage|data\s+corruption|billing\s+account|"
+            r"lỗi\s+mất\s+tin\s+nhắn|loi\s+mat\s+tin\s+nhan)\b",
             re.IGNORECASE,
         ),
     ),
@@ -54,27 +60,57 @@ LITE_TAG_RE = re.compile(r"(?:^|\s)@(flash_lite|lite|haiku)\b", re.IGNORECASE)
 FAST_TAG_RE = re.compile(r"(?:^|\s)@(flash|sonnet|fast|downshift)\b", re.IGNORECASE)
 
 SIMPLE_LOOKUP_RE = re.compile(
-    r"\b(find\s+file|locate|where\s+is|git\s+status|git\s+branch|list\s+files|count\s+lines)\b",
+    r"\b(find\s+(?:the\s+)?file|locate|where\s+is|git\s+status|git\s+branch|list\s+files|count\s+lines|"
+    r"tìm\s+file|tim\s+file|tìm\s+hàm|tim\s+ham|tìm\s+vị\s+trí|tim\s+vi\s+tri|"
+    r"ở\s+file\s+nào|o\s+file\s+nao|định\s+nghĩa\s+ở\s+đâu|dinh\s+nghia\s+o\s+dau|"
+    r"liệt\s+kê\s+tên\s+file|liet\s+ke\s+ten\s+file)\b",
     re.IGNORECASE,
 )
 COMPLEX_RESEARCH_RE = re.compile(
-    r"\b(survey|trace\s+all|analyze|architecture|summarize\s+how|compare|audit|across\s+the\s+backend)\b",
+    r"\b(survey|trace\s+all|analyze|architecture|summarize\s+how|compare|audit|across\s+the\s+backend|"
+    r"tóm\s+tắt\s+luồng|tom\s+tat\s+luong|kiểm\s+tra\s+toàn\s+bộ|kiem\s+tra\s+toan\s+bo|"
+    r"tìm\s+tất\s+cả|tim\s+tat\s+ca|quét\s+log|quet\s+log)\b",
     re.IGNORECASE,
 )
 
 VERIFICATION_RUNNER_RE = re.compile(
-    r"\b(pytest|vitest|ruff|eslint|npm\s+run\s+(?:test|lint|build)|uv\s+run\s+(?:pytest|ruff)|run\s+tests?)\b",
+    r"\b(pytest|vitest|ruff|eslint|npm\s+run\s+(?:test|lint|build)|uv\s+run\s+(?:pytest|ruff)|run\s+tests?|"
+    r"chạy\s+tests?|chay\s+tests?|chạy\s+pytest|chay\s+pytest|kiểm\s+tra\s+lint|kiem\s+tra\s+lint)\b",
     re.IGNORECASE,
 )
 CODE_MUTATION_RE = re.compile(
-    r"\b(implement|refactor|fix\s+bug|edit\s+file|write\s+code|create\s+endpoint|modify|patch)\b",
+    r"\b(implement|refactor|fix\s+bug|edit\s+file|write\s+code|create\s+endpoint|modify|patch|"
+    r"sửa\s+lỗi|sua\s+loi|cập\s+nhật\s+code|cap\s+nhat\s+code|viết\s+thêm|viet\s+them|"
+    r"triển\s+khai|trien\s+khai|tái\s+cấu\s+trúc|tai\s+cau\s+truc)\b",
     re.IGNORECASE,
 )
 
 ROUTINE_PROMPT_NUDGE_RE = re.compile(
-    r"\b(search\s+the\s+(?:logs?|codebase)|find\s+all\s+(?:files|occurrences|callers)|list\s+all\s+callers|scan\s+logs?)\b",
+    r"\b(search\s+the\s+(?:logs?|codebase)|find\s+all\s+(?:files|occurrences|callers)|list\s+all\s+callers|scan\s+logs?|"
+    r"tìm\s+tất\s+cả|tim\s+tat\s+ca|quét\s+log|quet\s+log|kiểm\s+tra\s+toàn\s+bộ|kiem\s+tra\s+toan\s+bo|"
+    r"tóm\s+tắt\s+luồng|tom\s+tat\s+luong)\b",
     re.IGNORECASE,
 )
+
+FILE_PATH_TOKEN_RE = re.compile(
+    r"\b[\w./\\-]+?\.(?:py|ts|tsx|js|jsx|json|sql|md|yml|yaml|sh|cmd|toml|ini|cfg|env|lock)\b",
+    re.IGNORECASE,
+)
+GLOB_PATH_RE = re.compile(r"\b[\w.-]+(?:/[\w.*-]+)+\b")
+CODE_IDENTIFIER_RE = re.compile(
+    r"\b[a-zA-Z0-9]+(?:_[a-zA-Z0-9]+)+\b|\b[a-z]+(?:[A-Z][a-z0-9]+)+\b|\b(?:[A-Z]+[a-z0-9]+){2,}[A-Z]*\b"
+)
+STACK_TRACE_RE = re.compile(
+    r"(?:Traceback \(most recent call last\):|File \"[^\"]+\", line \d+|\bat [\w.$]+ \([\w./\\-]+:\d+:\d+\))"
+)
+AUDIT_OR_MUTATION_INTENT_RE = re.compile(
+    r"\b(audit|investigate|debug|fix|patch|refactor|implement|vulnerability|exploit|bypass|review|"
+    r"kiểm\s+toán|kiem\s+toan|kiểm\s+tra\s+lỗi|kiem\s+tra\s+loi|phân\s+tích\s+lỗi|phan\s+tich\s+loi|"
+    r"điều\s+tra|dieu\s+tra|rà\s+soát|ra\s+soat|sửa\s+lỗi|sua\s+loi)\b",
+    re.IGNORECASE,
+)
+
+DEFAULT_MAX_LEDGER_BYTES = 5_242_880
 
 HOST_MODEL_MAP: dict[str, dict[str, str]] = {
     "antigravity": {
@@ -286,6 +322,31 @@ def _match_high_risk(combined_text: str) -> str | None:
     return None
 
 
+def strip_benign_code_identifiers(text: str) -> str:
+    """Mask explicit file-path tokens and compound code identifiers during pure read-only lookups."""
+    if not text:
+        return ""
+    masked = FILE_PATH_TOKEN_RE.sub(" <path> ", text)
+    return CODE_IDENTIFIER_RE.sub(" <id> ", masked)
+
+
+def score_prompt_complexity(prompt: str) -> dict[str, int | bool]:
+    """Return structural complexity signals for a subagent prompt."""
+    text = prompt or ""
+    paths: set[str] = set()
+    for match in FILE_PATH_TOKEN_RE.finditer(text):
+        paths.add(match.group(0).strip().replace("\\", "/").lower())
+    for match in GLOB_PATH_RE.finditer(text):
+        paths.add(match.group(0).strip().replace("\\", "/").lower())
+    return {
+        "char_len": len(text),
+        "path_count": len(paths),
+        "has_code_fence": "```" in text,
+        "has_stack_trace": bool(STACK_TRACE_RE.search(text)),
+        "line_count": len(text.splitlines()),
+    }
+
+
 def classify_subagent_call(
     type_name: str,
     role: str,
@@ -349,7 +410,7 @@ def classify_subagent_call(
             reason="workspace_config:pinned_role",
         )
 
-    # 4. Workspace custom high_risk_keywords blocklist (FR-010)
+    # 4. Workspace custom high_risk_keywords blocklist — always evaluated on unmasked text (FR-003)
     if _match_custom_high_risk(combined, cfg.high_risk_keywords) is not None:
         return RoutingDecision(
             host=host,
@@ -359,8 +420,22 @@ def classify_subagent_call(
             reason="workspace_config:high_risk_keyword",
         )
 
-    # 5. Hard safety guardrail blocklist — never downgrade high-risk engineering tasks
+    # 5. Hard safety guardrail blocklist (with benign identifier disambiguation on pure read-only lookups, FR-001/FR-002)
+    is_readonly = norm_type in READ_ONLY_SUBAGENTS
+    simple_lookup_checked = False
+    is_simple_lookup = False
     risk_match = _match_high_risk(combined)
+    if risk_match is not None and is_readonly:
+        simple_lookup_checked = True
+        is_simple_lookup = bool(SIMPLE_LOOKUP_RE.search(combined)) and not bool(
+            COMPLEX_RESEARCH_RE.search(combined)
+        )
+        if (
+            is_simple_lookup
+            and not AUDIT_OR_MUTATION_INTENT_RE.search(combined)
+            and not CODE_MUTATION_RE.search(combined)
+        ):
+            risk_match = _match_high_risk(strip_benign_code_identifiers(combined))
     if risk_match is not None:
         return RoutingDecision(
             host=host,
@@ -381,11 +456,28 @@ def classify_subagent_call(
             reason="workspace_config:pinned_role",
         )
 
-    # 7. Read-only subagents (research / Explore)
-    if norm_type in READ_ONLY_SUBAGENTS:
-        if SIMPLE_LOOKUP_RE.search(combined) and not COMPLEX_RESEARCH_RE.search(
-            combined
-        ):
+    # 7. Read-only subagents (research / Explore) with structural complexity promotion (FR-004, FR-005)
+    if is_readonly:
+        if not simple_lookup_checked:
+            is_simple_lookup = bool(SIMPLE_LOOKUP_RE.search(combined)) and not bool(
+                COMPLEX_RESEARCH_RE.search(combined)
+            )
+        if is_simple_lookup:
+            complexity = score_prompt_complexity(prompt)
+            if (
+                int(complexity["char_len"]) > 600
+                or int(complexity["path_count"]) >= 3
+                or bool(complexity["has_code_fence"])
+                or bool(complexity["has_stack_trace"])
+            ):
+                target = _resolve_target_model(host, "fast")
+                return RoutingDecision(
+                    host=host,
+                    tier="fast",
+                    target_model=target,
+                    should_overwrite=True,
+                    reason="promoted_to_fast:multi_file_or_long_prompt",
+                )
             target = _resolve_target_model(host, "lite")
             return RoutingDecision(
                 host=host,
@@ -495,8 +587,21 @@ def get_ledger_path(override: str | Path | None = None) -> Path:
     return Path.home() / ".gemini" / "downshift_ledger.jsonl"
 
 
+def _get_max_ledger_bytes(env: Mapping[str, str] | None = None) -> int:
+    """Return the maximum ledger size in bytes (default 5 MB; fail-open on invalid values)."""
+    env_map = env if env is not None else os.environ
+    raw = (env_map.get("DOWNSHIFT_MAX_LEDGER_BYTES") or "").strip()
+    if not raw:
+        return DEFAULT_MAX_LEDGER_BYTES
+    try:
+        val = int(raw)
+        return val if val > 0 else DEFAULT_MAX_LEDGER_BYTES
+    except ValueError:
+        return DEFAULT_MAX_LEDGER_BYTES
+
+
 def _append_line_locked(path: Path, line_bytes: bytes) -> None:
-    """Append a line to path with a cross-process file lock on Windows and POSIX."""
+    """Append a line to path with a cross-process file lock and bounded size auto-rotation."""
     fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
     locked = False
     try:
@@ -517,8 +622,30 @@ def _append_line_locked(path: Path, line_bytes: bytes) -> None:
             fcntl.flock(fd, fcntl.LOCK_EX)
             locked = True
 
-        os.lseek(fd, 0, os.SEEK_END)
-        os.write(fd, line_bytes)
+        max_bytes = _get_max_ledger_bytes()
+        st_size = os.fstat(fd).st_size
+        if st_size > 0 and (st_size + len(line_bytes) > max_bytes):
+            os.lseek(fd, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            existing_lines = [
+                ln for ln in b"".join(chunks).splitlines(keepends=True) if ln.strip()
+            ]
+            kept = existing_lines[len(existing_lines) // 2 :]
+            kept_size = sum(len(ln) for ln in kept)
+            while kept and (kept_size + len(line_bytes) > max_bytes):
+                removed = kept.pop(0)
+                kept_size -= len(removed)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, b"".join(kept) + line_bytes)
+        else:
+            os.lseek(fd, 0, os.SEEK_END)
+            os.write(fd, line_bytes)
     finally:
         if locked:
             with contextlib.suppress(OSError):
@@ -542,6 +669,7 @@ def record_routing_event(
     original_model: str = "inherit",
     ledger_path: str | Path | None = None,
     mode: str = "active",
+    prompt_chars: int = 0,
 ) -> bool:
     """Append a privacy-safe routing event (never storing raw Prompt text) to the JSONL ledger."""
     try:
@@ -554,6 +682,7 @@ def record_routing_event(
             "mode": str(mode or "active"),
             "subagent_type": str(subagent_type or ""),
             "role": str(role or "")[:80],
+            "prompt_chars": max(0, int(prompt_chars or 0)),
             "original_model": str(original_model or "inherit"),
             "target_model": decision.target_model,
             "tier": decision.tier,

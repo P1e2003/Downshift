@@ -16,20 +16,23 @@ PRE_INVOCATION = ROOT / "scripts" / "pre_invocation.py"
 def _run_hook(
     script: Path, payload: dict | str, extra_env: dict[str, str] | None = None
 ) -> tuple[int, dict]:
-    raw_input = json.dumps(payload) if isinstance(payload, dict) else payload
+    raw_input = (
+        json.dumps(payload, ensure_ascii=False)
+        if isinstance(payload, dict)
+        else payload
+    )
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
     proc = subprocess.run(
         [sys.executable, str(script)],
-        input=raw_input,
-        text=True,
+        input=raw_input.encode("utf-8"),
         capture_output=True,
         env=env,
         timeout=5,
         check=False,
     )
-    out = proc.stdout.strip()
+    out = proc.stdout.decode("utf-8", errors="replace").strip()
     return proc.returncode, (json.loads(out) if out else {})
 
 
@@ -456,3 +459,125 @@ def test_portable_hook_launcher_fails_open_when_target_or_runtime_missing(
     )
     assert proc_inv.returncode == 0
     assert json.loads(proc_inv.stdout.strip()) == {}
+
+
+def test_pre_tool_use_cli_benign_filename_vs_audit_and_prompt_chars(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "v020_cli_ledger.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+
+    lookup_prompt = "Find the file where auth_service.py is defined"
+    code_lookup, data_lookup = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-benign-1",
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Role": "File Locator",
+                    "Prompt": lookup_prompt,
+                    "Model": "inherit",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert code_lookup == 0
+    assert data_lookup == {
+        "decision": "allow",
+        "overwrite": {"Model": "flash_lite"},
+    }
+
+    audit_prompt = "Audit auth_service.py for JWT token bypass"
+    code_audit, data_audit = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-audit-1",
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Role": "Security Auditor",
+                    "Prompt": audit_prompt,
+                    "Model": "inherit",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert code_audit == 0
+    assert data_audit == {"decision": "allow"}
+
+    entries = [
+        json.loads(line)
+        for line in ledger.read_text(encoding="utf-8").strip().splitlines()
+    ]
+    assert len(entries) == 2
+    assert entries[0]["tier"] == "lite"
+    assert entries[0]["prompt_chars"] == len(lookup_prompt)
+    assert lookup_prompt not in ledger.read_text(encoding="utf-8")
+    assert entries[1]["tier"] == "frontier"
+    assert entries[1]["prompt_chars"] == len(audit_prompt)
+
+
+def test_bilingual_vietnamese_hooks_cli(tmp_path: Path) -> None:
+    ledger = tmp_path / "vi_ledger.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+
+    # 1. Vietnamese simple lookup -> flash_lite
+    code_vi_lite, data_vi_lite = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-vi-1",
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Role": "Tìm kiếm",
+                    "Prompt": "Tìm file định nghĩa hàm resolve_contact",
+                    "Model": "inherit",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert code_vi_lite == 0
+    assert data_vi_lite == {
+        "decision": "allow",
+        "overwrite": {"Model": "flash_lite"},
+    }
+
+    # 2. Vietnamese high-risk prompt -> frontier pass-through
+    code_vi_hr, data_vi_hr = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-vi-2",
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Role": "Kiểm toán bảo mật",
+                    "Prompt": "Kiểm tra phân quyền và xác thực trong tenants.py",
+                    "Model": "inherit",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert code_vi_hr == 0
+    assert data_vi_hr == {"decision": "allow"}
+
+    # 3. Vietnamese routine prompt on turn 1 -> injects delegation hint
+    code_vi_inv, data_vi_inv = _run_hook(
+        PRE_INVOCATION,
+        {
+            "conversationId": "conv-vi-3",
+            "invocationNum": 1,
+            "lastUserInput": "Quét log và tìm tất cả các file gọi NotificationService",
+        },
+        extra_env=env,
+    )
+    assert code_vi_inv == 0
+    assert "injectSteps" in data_vi_inv

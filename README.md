@@ -34,12 +34,15 @@ flowchart LR
 
 ### Hard Safety Guardrails (Never Downshifted)
 
-Even if a subagent is spawned as `research` or `Explore`, Downshift **never** downgrades the model if the `Role` or `Prompt` matches high-risk engineering patterns:
+Even if a subagent is spawned as `research` or `Explore`, Downshift **never** downgrades the model if the `Role` or `Prompt` matches high-risk engineering patterns (English or Vietnamese):
 
-- **Database & Schema:** `alembic`, `migration`, `schema change`, `ddl`
-- **Concurrency & Transactions:** `deadlock`, `race condition`, `advisory lock`, `for update`, `savepoint`, `rollback`
-- **Security & Auth:** `security`, `auth`, `authentication`, `authorization`, `permission`, `idor`, `cryptography`, `jwt`, `csrf`, `xss`, `secret`
-- **Production Incidents:** `production incident`, `outage`, `data corruption`, `billing account`
+- **Database & Schema:** `alembic`, `migration`, `schema change`, `ddl`, `di trú dữ liệu`
+- **Concurrency & Transactions:** `deadlock`, `race condition`, `advisory lock`, `for update`, `savepoint`, `rollback`, `khóa bảng`, `tranh chấp đồng thời`
+- **Security & Auth:** `security`, `auth`, `authentication`, `authorization`, `permission`, `idor`, `cryptography`, `jwt`, `csrf`, `xss`, `secret`, `phân quyền`, `bảo mật`, `xác thực`
+- **Production Incidents:** `production incident`, `outage`, `data corruption`, `billing account`, `lỗi mất tin nhắn`
+- **Context-Aware Disambiguation & Complexity Promotion (`v0.2.0`):**
+  - Pure read-only file/symbol location lookups (`Find the file where auth_service.py is defined`, `Locate 001_migration.py`) mask benign filename and `snake_case`/`camelCase` tokens so they route to Tier 1 (`lite`) without false-positive frontier locks, while genuine audits (`Audit auth_service.py for JWT token bypass`) remain on Tier 3 (`frontier`).
+  - Simple lookup prompts exceeding `600` characters, referencing `>= 3` distinct file paths, or embedding fenced code blocks / stack tracebacks are automatically promoted from Tier 1 (`lite`) to Tier 2 (`fast`).
 
 ---
 
@@ -113,7 +116,7 @@ Install via `gemini-extension.json` (loads `rules/AGENTS.md` context rules).
 
 ## Live Telemetry & Skills (`/downshift-stats` & `/downshift-help`)
 
-Every intercepted subagent routing decision is appended to `~/.gemini/downshift_ledger.jsonl` (or `DOWNSHIFT_LEDGER_PATH`). **Raw prompt text is never written to disk** — only timestamps, subagent type, truncated role, tier, model, and routing reason code are recorded.
+Every intercepted subagent routing decision is appended to `~/.gemini/downshift_ledger.jsonl` (or `DOWNSHIFT_LEDGER_PATH`) with bounded size auto-rotation (`DOWNSHIFT_MAX_LEDGER_BYTES`, default `5 MB`). **Raw prompt text is never written to disk** — only timestamps, subagent type, truncated role, integer `prompt_chars`, mode (`active` / `shadow`), tier, model, and routing reason code are recorded.
 
 Run the scoreboard CLI directly or invoke `/downshift-stats` in chat:
 
@@ -121,11 +124,11 @@ Run the scoreboard CLI directly or invoke `/downshift-stats` in chat:
 $ python ./scripts/stats_cli.py
   downshift stats                   live ledger · ~/.gemini/downshift_ledger.jsonl
 
-  Total subagents intercepted : 20
-  Frontier calls saved        : 14 (70.0%)
-  ├── Routed to lite (Tier 1) :  5 (25.0%)  [flash_lite / haiku]
-  ├── Routed to fast (Tier 2) :  9 (45.0%)  [flash / sonnet]
-  └── Kept on frontier        :  6 (30.0%)  [safety guardrail / stateful mutation]
+  Total subagents intercepted : 20  (18 active, 2 shadow · 14,520 prompt chars)
+  Frontier calls saved        : 14 (70.0%)  · Est. credit cost saved: 58.4%
+  ├── Routed to lite (Tier 1) :  5 (25.0%)  [flash_lite / haiku · 0.04x cost]
+  ├── Routed to fast (Tier 2) :  9 (45.0%)  [flash / sonnet · 0.20x cost]
+  └── Kept on frontier        :  6 (30.0%)  [safety guardrail / stateful mutation · 1.00x]
 ```
 
 Flags:
@@ -137,7 +140,7 @@ Flags:
 
 ## Benchmark Results (`benchmarks/run_benchmark.py`)
 
-Reproduce the 20-scenario benchmark across Antigravity and Claude Code payloads:
+Reproduce the 30-scenario benchmark across Antigravity and Claude Code payloads:
 
 ```bash
 python ./benchmarks/run_benchmark.py
@@ -145,11 +148,11 @@ python ./benchmarks/run_benchmark.py
 
 | Metric | Result |
 | :--- | :--- |
-| **Scenarios Evaluated** | `20` (`5` simple lookup, `5` codebase/log survey, `4` test/lint runner, `6` high-risk/mutation) |
-| **Routing Classification Accuracy** | **`100.0%` (`20/20`)** |
+| **Scenarios Evaluated** | `30` (`S01`–`S30`: English + Vietnamese lookups, surveys, test/lint runners, benign filenames, complexity promotion, workspace overrides, and high-risk guardrails) |
+| **Routing Classification Accuracy** | **`100.0%` (`30/30`)** |
 | **False Downgrades on High-Risk Tasks** | **`0` (`100%` safety recall)** |
-| **Frontier Subagent Calls Saved** | **`70.0%` (`14/20` offloaded to Tier 1 / Tier 2)** |
-| **In-Memory Classifier Latency (`p50`)** | **`~41 µs` (`0.04 ms`)** |
+| **Frontier Subagent Calls Saved** | **`70.0%` (`21/30` offloaded to Tier 1 / Tier 2)** |
+| **In-Memory Classifier Latency (`p50`)** | **`< 50 µs` (`< 0.05 ms`)** |
 
 ---
 

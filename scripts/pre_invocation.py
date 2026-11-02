@@ -64,7 +64,11 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> int:
     try:
-        raw = sys.stdin.read()
+        raw_bytes = sys.stdin.buffer.read()
+        try:
+            raw = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raw = raw_bytes.decode(sys.stdin.encoding or "utf-8", errors="replace")
         if not raw or not raw.strip():
             sys.stdout.write("{}\n")
             return 0
