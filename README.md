@@ -46,6 +46,19 @@ Even if a subagent is spawned as `research` or `Explore`, Downshift **never** do
 
 ---
 
+## 4-Step Parallel Multi-Subagent Fan-Out (`v0.2.5`)
+
+When a first-turn user prompt asks to map out an issue, compare a specification against `main` / `develop`, or audit a repository/plugin across multiple layers (in English or Vietnamese), Downshift's `PreInvocation` / `UserPromptSubmit` hook (`PARALLEL_MAP_NUDGE_RE`, `reason="parallel_issue_map_or_comparison"`) guides the agent through a **4-step parallel fan-out workflow**:
+
+1. **Step 1 — Decompose Issue Scope (Main Agent, 1 Turn):** Read the issue or spec and partition the investigation into **2–4 disjoint slices** (e.g., Backend Models/Migrations, API Routes/Services, Frontend UI/Hooks).
+2. **Step 2 — Parallel Slice Mapping (Single-Turn Fan-Out):** Spawn **2–4 read-only subagents in a single turn** (`invoke_subagent` on Antigravity, `Task`/`Explore` on Claude Code, `spawn_agent` on OpenAI Codex). Keeping bounded lookups `< 600` chars and `< 3` file paths allows Downshift to route them to **Tier 1 (`lite` — `0.04x` cost)** while single-module comparisons route to **Tier 2 (`fast` — `0.20x` cost)**.
+3. **Step 3 — Parallel Baseline Comparison & Boundary Contract Extraction:** Each subagent compares its slice against the baseline and returns what exists, what is missing, stale spec assumptions, candidate files, and **exact cross-layer boundary contracts** (API routes, request/response field names such as `snake_case` vs `camelCase`, function/type signatures, and DB/lock invariants).
+4. **Step 4 — Main-Agent Cross-Layer Check & Verdict (Fan-In):** Once all parallel subagents finish, the main (`frontier`) agent reconciles cross-layer boundary contracts across slices, verifies security/concurrency/migration guardrails, and writes the final unified **Map-Out Verdict**.
+
+- **Anti-Storm & Safety Guardrails:** Capped at `2–4` disjoint read-only subagents per turn (`1–2` known files are read directly or via a single Tier 1 lookup), with automatic suppression whenever `HIGH_RISK_RE` keywords or `@frontier` tags appear in the prompt.
+
+---
+
 ## Inline `@tag` Overrides
 
 Override Downshift's heuristics on any prompt or subagent call:

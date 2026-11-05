@@ -720,3 +720,141 @@ def test_codex_spawn_agent_and_pre_invocation_cli(tmp_path: Path) -> None:
     assert data_inv["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
     assert "spawn_agent" in data_inv["hookSpecificOutput"]["additionalContext"]
     assert "systemMessage" not in data_inv
+
+
+def test_pre_invocation_cli_parallel_fan_out_advisory(tmp_path: Path) -> None:
+    # 1. Antigravity PreInvocation on turn 1 parallel mapping/audit prompt
+    code_agy, data_agy = _run_hook(
+        PRE_INVOCATION,
+        {
+            "conversationId": "conv-parallel-1",
+            "invocationNum": 1,
+            "lastUserInput": "Check the new plugin downshift for me, all of it",
+        },
+    )
+    assert code_agy == 0
+    msg_agy = data_agy["injectSteps"][0]["ephemeralMessage"]
+    assert "4-step parallel fan-out" in msg_agy
+    assert "invoke_subagent" in msg_agy
+    assert "flash_lite/flash" in msg_agy
+
+    # 2. Claude Code UserPromptSubmit on Vietnamese parallel issue map/compare prompt
+    code_claude, data_claude = _run_hook(
+        PRE_INVOCATION,
+        {
+            "session_id": "sess-parallel-claude",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "Phân tích issue và đối chiếu spec với codebase",
+        },
+    )
+    assert code_claude == 0
+    msg_claude = data_claude["hookSpecificOutput"]["additionalContext"]
+    assert "4-step parallel fan-out" in msg_claude
+    assert "Task/Explore" in msg_claude
+    assert "Haiku/Sonnet" in msg_claude
+
+    # 3. OpenAI Codex UserPromptSubmit via PLUGIN_DATA on parallel issue map prompt
+    code_codex, data_codex = _run_hook(
+        PRE_INVOCATION,
+        {
+            "session_id": "sess-parallel-codex",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "Map out the issue across backend and frontend",
+        },
+        extra_env={"PLUGIN_DATA": str(tmp_path)},
+    )
+    assert code_codex == 0
+    msg_codex = data_codex["hookSpecificOutput"]["additionalContext"]
+    assert "4-step parallel fan-out" in msg_codex
+    assert "spawn_agent" in msg_codex
+    assert "gpt-6-luna/gpt-6.1-sol" in msg_codex
+
+
+def test_parallel_pre_tool_use_concurrent_fan_out(tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    ledger = tmp_path / "parallel_fanout_ledger.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+
+    slice_payloads = [
+        # Slice 1: Antigravity bounded file/symbol lookup (<600 chars, <3 paths) -> Tier 1 lite (flash_lite)
+        {
+            "conversationId": "conv-fanout-1",
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Role": "Slice 1 File Locator",
+                    "Prompt": "Locate scripts/downshift_core.py and check where classify_user_prompt is defined",
+                    "Model": "inherit",
+                },
+            },
+        },
+        # Slice 2: Claude Code bounded file lookup (<600 chars, <3 paths) -> Tier 1 lite (haiku)
+        {
+            "session_id": "sess-fanout-2",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Task",
+            "tool_input": {
+                "subagent_type": "Explore",
+                "description": "Slice 2 Manifest Locator",
+                "prompt": "Find the file where hooks/claude-codex-hooks.json is located and count lines",
+            },
+        },
+        # Slice 3: Antigravity module-level comparison survey -> Tier 2 fast (flash)
+        {
+            "conversationId": "conv-fanout-3",
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Role": "Slice 3 Backend Mapper",
+                    "Prompt": "Survey all callers across scripts/ and tests/ and compare the issue spec against main",
+                    "Model": "inherit",
+                },
+            },
+        },
+        # Slice 4: OpenAI Codex module-level comparison survey -> Tier 2 fast (gpt-6.1-sol)
+        {
+            "session_id": "sess-fanout-4",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "message": "Survey all skill files across skills/ and rules/ and summarize the routing flow",
+                "reasoning_effort": "high",
+            },
+        },
+    ]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(
+            pool.map(
+                lambda p: _run_hook(PRE_TOOL_USE, p, extra_env=env), slice_payloads
+            )
+        )
+
+    assert results[0] == (
+        0,
+        {"decision": "allow", "overwrite": {"Model": "flash_lite"}},
+    )
+    assert results[1][0] == 0
+    assert results[1][1]["hookSpecificOutput"]["updatedInput"]["model"] == "haiku"
+    assert results[2] == (
+        0,
+        {"decision": "allow", "overwrite": {"Model": "flash"}},
+    )
+    assert results[3][0] == 0
+    assert results[3][1]["hookSpecificOutput"]["updatedInput"]["model"] == "gpt-6.1-sol"
+    assert (
+        results[3][1]["hookSpecificOutput"]["updatedInput"]["reasoning_effort"]
+        == "medium"
+    )
+
+    lines = [
+        json.loads(line)
+        for line in ledger.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(lines) == 4
+    tiers = sorted(entry["tier"] for entry in lines)
+    assert tiers == ["fast", "fast", "lite", "lite"]

@@ -23,7 +23,7 @@ def test_all_manifests_parse_and_share_name_and_version() -> None:
         assert path.exists(), f"Missing manifest: {path}"
         data = json.loads(path.read_text(encoding="utf-8"))
         assert data["name"] == "downshift"
-        assert data["version"] == "0.2.0"
+        assert data["version"] == "0.2.5"
         assert data.get("description")
         loaded.append(data)
 
