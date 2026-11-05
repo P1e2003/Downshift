@@ -12,12 +12,12 @@ description: >
 Run the scoreboard CLI and display its output verbatim in a fenced `text` block:
 
 ```bash
-python ./scripts/stats_cli.py
+"./scripts/run_hook.cmd" ./scripts/stats_cli.py
 ```
 
 If the user asks to reset the ledger, run:
 
 ```bash
-python ./scripts/stats_cli.py --reset
+"./scripts/run_hook.cmd" ./scripts/stats_cli.py --reset
 ```
 

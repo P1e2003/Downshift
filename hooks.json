@@ -1,15 +1,10 @@
 {
-  "description": "Downshift lifecycle hooks for pre-invocation delegation guidance and subagent model routing.",
-  "hooks": {
+  "downshift": {
     "PreInvocation": [
       {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"./scripts/run_hook.cmd\" ./scripts/pre_invocation.py",
-            "timeout": 5
-          }
-        ]
+        "type": "command",
+        "command": "\"./scripts/run_hook.cmd\" ./scripts/pre_invocation.py",
+        "timeout": 5
       }
     ],
     "PreToolUse": [

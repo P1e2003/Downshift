@@ -26,11 +26,11 @@ flowchart LR
 
 ## 3-Tier Routing Matrix
 
-| Tier | Google Antigravity (`invoke_subagent`) | Claude Code (`Task` / `Agent`) | OpenAI Codex | Target Workloads |
+| Tier | Google Antigravity (`invoke_subagent`) | Claude Code (`Task` / `Agent`) | OpenAI Codex (`spawn_agent`) | Target Workloads |
 | :--- | :--- | :--- | :--- | :--- |
-| **Tier 1 (`lite`)** | `flash_lite` | `haiku` | `flash_lite` | Bounded file/symbol locating (`find file`, `where is`, `locate`), `git status`, `git branch`, directory listing, line counting |
-| **Tier 2 (`fast`)** | `flash` | `sonnet` | `flash` | Multi-file codebase surveys (`research` / `Explore`), caller tracing, log scanning, and pure test/lint/build verification (`pytest`, `vitest`, `ruff`, `eslint`, `npm run build`) |
-| **Tier 3 (`frontier`)** | `inherit` | `inherit` | `inherit` | Architecture design, stateful code mutations, database migrations, concurrency/locking, and security/auth |
+| **Tier 1 (`lite`)** | `flash_lite` | `haiku` | `gpt-6-luna` (`low`) | Bounded file/symbol locating (`find file`, `where is`, `locate`), `git status`, `git branch`, directory listing, line counting |
+| **Tier 2 (`fast`)** | `flash` | `sonnet` | `gpt-6.1-sol` (`medium`) | Multi-file codebase surveys (`research` / `Explore`), caller tracing, log scanning, and pure test/lint/build verification (`pytest`, `vitest`, `ruff`, `eslint`, `npm run build`) |
+| **Tier 3 (`frontier`)** | `inherit` | `inherit` | `inherit` (`gpt-6-astra`) | Architecture design, stateful code mutations, database migrations, concurrency/locking, and security/auth |
 
 ### Hard Safety Guardrails (Never Downshifted)
 

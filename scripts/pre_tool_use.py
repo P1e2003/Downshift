@@ -63,10 +63,15 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         if tool_name != "invoke_subagent":
             return {"decision": "allow"}
 
-        args = _as_dict(tool_call.get("args"))
+        raw_args = tool_call.get("args")
+        if not isinstance(raw_args, dict):
+            return {"decision": "allow"}
+        args = raw_args
         type_name = str(args.get("TypeName") or "")
         role = str(args.get("Role") or "")
         prompt_text = str(args.get("Prompt") or "")
+        if not role.strip() and not prompt_text.strip():
+            return {"decision": "allow"}
         orig_model = str(args.get("Model") or "inherit")
         decision = classify_subagent_call(
             type_name=type_name,
@@ -99,10 +104,24 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
     if tool_name.lower() not in CLAUDE_SUBAGENT_TOOLS:
         return {}
 
-    tool_input = dict(_as_dict(payload.get("tool_input")))
+    raw_tool_input = payload.get("tool_input")
+    if not isinstance(raw_tool_input, dict):
+        return {}
+    tool_input = dict(raw_tool_input)
     type_name, role, prompt_text = _extract_claude_or_codex_fields(
         tool_name, tool_input
     )
+    is_codex_spawn = tool_name.strip().lower() in (
+        "spawn_agent",
+        "multi_agent_v1__spawn_agent",
+    )
+    has_user_role = bool(
+        str(tool_input.get("description") or tool_input.get("role") or "").strip()
+    )
+    if not prompt_text.strip() and (
+        not has_user_role if is_codex_spawn else not role.strip()
+    ):
+        return {}
     orig_model = str(tool_input.get("model") or "")
     decision = classify_subagent_call(
         type_name=type_name,

@@ -27,6 +27,13 @@ def test_all_manifests_parse_and_share_name_and_version() -> None:
         assert data.get("description")
         loaded.append(data)
 
+    assert loaded[0]["hooks"] == "./hooks.json"
+    assert loaded[0]["skills"] == "./skills"
+    assert loaded[0]["rules"] == "./rules"
+    assert len(loaded[0]["suggestedPrompts"]) == 3
+    for unsupported_key in ("author", "license", "keywords", "displayName"):
+        assert unsupported_key not in loaded[0]
+
     assert loaded[3]["contextFileName"] == "rules/AGENTS.md"
     assert (ROOT / loaded[3]["contextFileName"]).exists()
 
@@ -46,14 +53,30 @@ def test_hooks_json_references_existing_scripts() -> None:
     assert launcher_sh.exists(), f"Missing POSIX launcher: {launcher_sh}"
 
     agy_hooks = json.loads((ROOT / "hooks.json").read_text(encoding="utf-8"))
-    for event_list in agy_hooks["hooks"].values():
-        for matcher_group in event_list:
-            for hook in matcher_group["hooks"]:
-                cmd = hook["command"]
-                assert "run_hook.cmd" in cmd, f"Expected run_hook.cmd in: {cmd}"
-                match = re.search(r"\./(scripts/[a-zA-Z0-9_]+\.py)", cmd)
-                assert match is not None, f"Could not parse script path from: {cmd}"
-                assert (ROOT / match.group(1)).exists()
+    assert "description" not in agy_hooks
+    assert "hooks" not in agy_hooks
+    assert list(agy_hooks.keys()) == ["downshift"]
+    spec = agy_hooks["downshift"]
+    assert isinstance(spec["PreInvocation"], list)
+    for hook in spec["PreInvocation"]:
+        assert hook["type"] == "command"
+        assert "hooks" not in hook
+        cmd = hook["command"]
+        assert "run_hook.cmd" in cmd, f"Expected run_hook.cmd in: {cmd}"
+        match = re.search(r"\./(scripts/[a-zA-Z0-9_]+\.py)", cmd)
+        assert match is not None, f"Could not parse script path from: {cmd}"
+        assert (ROOT / match.group(1)).exists()
+
+    assert isinstance(spec["PreToolUse"], list)
+    assert spec["PreToolUse"][0]["matcher"] == "invoke_subagent"
+    for matcher_group in spec["PreToolUse"]:
+        for hook in matcher_group["hooks"]:
+            assert hook["type"] == "command"
+            cmd = hook["command"]
+            assert "run_hook.cmd" in cmd, f"Expected run_hook.cmd in: {cmd}"
+            match = re.search(r"\./(scripts/[a-zA-Z0-9_]+\.py)", cmd)
+            assert match is not None, f"Could not parse script path from: {cmd}"
+            assert (ROOT / match.group(1)).exists()
 
     claude_hooks_path = ROOT / "hooks" / "claude-codex-hooks.json"
     assert claude_hooks_path.exists()
