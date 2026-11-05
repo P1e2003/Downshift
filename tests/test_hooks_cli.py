@@ -122,20 +122,46 @@ def test_pre_tool_use_cli_preserves_frontier_on_high_risk_task(tmp_path: Path) -
     assert data == {"decision": "allow"}
 
 
-def test_pre_tool_use_cli_fails_open_on_invalid_json() -> None:
-    code, data = _run_hook(PRE_TOOL_USE, "{not-valid-json")
+def test_pre_tool_use_cli_fails_open_on_invalid_json(tmp_path: Path) -> None:
+    ledger = tmp_path / "invalid_json_ledger.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+    code, data = _run_hook(PRE_TOOL_USE, "{not-valid-json", extra_env=env)
     assert code == 0
     assert data == {"decision": "allow"}
 
-    # Non-dict truthy nested fields must also fail open with exit code 0
+    # Non-dict truthy nested fields must also fail open with exit code 0 without writing to ledger
     for malformed in (
         {"toolCall": "not-a-dict"},
         {"toolCall": {"name": "invoke_subagent", "args": [1, 2, 3]}},
         {"tool_name": "Task", "tool_input": 42},
     ):
-        m_code, m_data = _run_hook(PRE_TOOL_USE, malformed)
+        m_code, m_data = _run_hook(PRE_TOOL_USE, malformed, extra_env=env)
         assert m_code == 0
         assert isinstance(m_data, dict)
+    assert not ledger.exists()
+
+
+def test_pre_tool_use_skips_ledger_on_empty_or_non_dict_args(tmp_path: Path) -> None:
+    ledger = tmp_path / "empty_args_ledger.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+    for payload in (
+        {"toolCall": {"name": "invoke_subagent", "args": {}}},
+        {
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {"TypeName": "research", "Role": "   ", "Prompt": ""},
+            }
+        },
+        {"tool_name": "Task", "tool_input": {}},
+        {
+            "tool_name": "spawn_agent",
+            "tool_input": {"description": "", "message": "   "},
+        },
+    ):
+        code, data = _run_hook(PRE_TOOL_USE, payload, extra_env=env)
+        assert code == 0
+        assert isinstance(data, dict)
+    assert not ledger.exists()
 
 
 def test_pre_invocation_cli_supports_antigravity_and_claude_codex() -> None:
