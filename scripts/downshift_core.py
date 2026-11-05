@@ -104,6 +104,23 @@ CODE_MUTATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+PARALLEL_MAP_NUDGE_RE = re.compile(
+    r"\b("
+    r"map\s+out\s+(?:the\s+)?(?:issue|spec|feature|pr|task)|"
+    r"issue\s+map(?:-out)?|"
+    r"compare\s+(?:the\s+)?(?:issue|spec|pr|branch|codebase|against\s+(?:main|develop))|"
+    r"check\s+.*\ball\s+of\s+it|"
+    r"audit\s+(?:the\s+)?(?:entire|whole|full|new\s+)?(?:plugin|repo|repository|codebase|workspace)|"
+    r"across\s+backend\s+and\s+frontend|"
+    r"đối\s+chiếu\s+(?:issue|spec|code|nhánh)|doi\s+chieu\s+(?:issue|spec|code|nhanh)|"
+    r"so\s+sánh\s+(?:issue|spec|code|nhánh)|so\s+sanh\s+(?:issue|spec|code|nhanh)|"
+    r"phân\s+tích\s+issue|phan\s+tich\s+issue|"
+    r"kiểm\s+tra\s+tất\s+cả|kiem\s+tra\s+tat\s+ca|"
+    r"rà\s+soát\s+toàn\s+bộ|ra\s+soat\s+toan\s+bo"
+    r")\b",
+    re.IGNORECASE,
+)
+
 ROUTINE_PROMPT_NUDGE_RE = re.compile(
     r"\b(search\s+the\s+(?:logs?|codebase)|find\s+all\s+(?:files|occurrences|callers)|list\s+all\s+callers|scan\s+logs?|"
     r"tìm\s+tất\s+cả|tim\s+tat\s+ca|quét\s+log|quet\s+log|kiểm\s+tra\s+toàn\s+bộ|kiem\s+tra\s+toan\s+bo|"
@@ -598,6 +615,38 @@ def classify_user_prompt(
             should_inject=False,
             message="",
             reason="high_risk_or_frontier_tag",
+        )
+
+    if PARALLEL_MAP_NUDGE_RE.search(text):
+        if host == "codex":
+            msg = (
+                "[Downshift] Multi-part issue mapping/comparison task detected. "
+                "Use the 4-step parallel fan-out workflow: (1) decompose the issue into 2-4 disjoint slices, "
+                "(2) spawn parallel read-only spawn_agent calls in a single turn to map each slice and extract exact boundary contracts (routes, payload keys, types), "
+                "(3) compare each slice against the baseline in parallel (Downshift routes bounded slices to gpt-6-luna/gpt-6.1-sol), and "
+                "(4) reconcile cross-layer boundary contracts and synthesize the final verdict on the main agent."
+            )
+        elif host == "claude":
+            msg = (
+                "[Downshift] Multi-part issue mapping/comparison task detected. "
+                "Use the 4-step parallel fan-out workflow: (1) decompose the issue into 2-4 disjoint slices, "
+                "(2) spawn parallel read-only Task/Explore subagents in a single turn to map each slice and extract exact boundary contracts (routes, payload keys, types), "
+                "(3) compare each slice against the baseline in parallel (Downshift routes bounded slices to Haiku/Sonnet), and "
+                "(4) reconcile cross-layer boundary contracts and synthesize the final verdict on the main agent."
+            )
+        else:
+            msg = (
+                "[Downshift] Multi-part issue mapping/comparison task detected. "
+                "Use the 4-step parallel fan-out workflow: (1) decompose the issue into 2-4 disjoint slices, "
+                "(2) spawn parallel read-only invoke_subagent calls in a single turn to map each slice and extract exact boundary contracts (routes, payload keys, types), "
+                "(3) compare each slice against the baseline in parallel (Downshift routes bounded slices to flash_lite/flash), and "
+                "(4) reconcile cross-layer boundary contracts and synthesize the final verdict on the main agent."
+            )
+        return PromptAdvisory(
+            host=host,
+            should_inject=True,
+            message=msg,
+            reason="parallel_issue_map_or_comparison",
         )
 
     if ROUTINE_PROMPT_NUDGE_RE.search(text):

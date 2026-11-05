@@ -23,6 +23,13 @@ Display this compact reference card in a fenced `text` block:
     alembic · migration · deadlock · race condition · advisory lock · for update · savepoint
     rollback · security · auth · permission · idor · phân quyền · bảo mật · khóa bảng · di trú dữ liệu
 
+  4-Step Parallel Multi-Subagent Fan-Out (Issue Mapping & Comparison)
+    1. Decompose   Split multi-layer issue/spec into 2-4 disjoint slices on the main agent
+    2. Map         Spawn 2-4 read-only subagents in 1 turn (<600 chars & <3 paths -> Tier 1 lite)
+    3. Compare     Each subagent compares its slice vs baseline & extracts exact boundary contracts
+    4. Verdict     Main (frontier) agent reconciles cross-layer contracts (snake_case/camelCase, auth)
+    Guardrails     Cap at 2-4 subagents/turn · 1-2 known files stay direct · read-only fan-out only
+
   Inline @tag Overrides
     @pro / @opus / @frontier / @inherit   Force Tier 3 (frontier)
     @flash / @sonnet / @fast / @downshift Force Tier 2 (fast)

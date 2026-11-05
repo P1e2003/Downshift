@@ -757,3 +757,126 @@ def test_codex_tier_model_mapping_and_spawn_agent_routing() -> None:
     assert codex_advisory.should_inject is True
     assert "spawn_agent" in codex_advisory.message
     assert "gpt-6-luna/gpt-6.1-sol" in codex_advisory.message
+
+
+def test_classify_user_prompt_parallel_map_en() -> None:
+    agy = classify_user_prompt(
+        "Map out the issue and compare the spec against develop across backend and frontend",
+        invocation_num=1,
+        host="antigravity",
+    )
+    assert agy.should_inject is True
+    assert agy.reason == "parallel_issue_map_or_comparison"
+    assert "4-step parallel fan-out" in agy.message
+    assert "invoke_subagent" in agy.message
+    assert "flash_lite/flash" in agy.message
+    assert "reconcile cross-layer boundary contracts" in agy.message
+
+    claude = classify_user_prompt(
+        "Check the new plugin downshift for me, all of it",
+        invocation_num=1,
+        host="claude",
+    )
+    assert claude.should_inject is True
+    assert claude.reason == "parallel_issue_map_or_comparison"
+    assert "Task/Explore" in claude.message
+    assert "Haiku/Sonnet" in claude.message
+
+    codex = classify_user_prompt(
+        "Audit the entire codebase and compare the PR against main",
+        invocation_num=1,
+        host="codex",
+    )
+    assert codex.should_inject is True
+    assert codex.reason == "parallel_issue_map_or_comparison"
+    assert "spawn_agent" in codex.message
+    assert "gpt-6-luna/gpt-6.1-sol" in codex.message
+
+    turn2 = classify_user_prompt(
+        "Map out the issue across backend and frontend",
+        invocation_num=2,
+        host="antigravity",
+    )
+    assert turn2.should_inject is False
+    assert turn2.reason == "not_first_turn_or_empty"
+
+
+def test_classify_user_prompt_parallel_map_vi() -> None:
+    vi_accented = classify_user_prompt(
+        "Phân tích issue và đối chiếu spec với codebase",
+        invocation_num=1,
+        host="antigravity",
+    )
+    assert vi_accented.should_inject is True
+    assert vi_accented.reason == "parallel_issue_map_or_comparison"
+    assert "invoke_subagent" in vi_accented.message
+
+    vi_unaccented = classify_user_prompt(
+        "phan tich issue va so sanh nhanh develop",
+        invocation_num=1,
+        host="claude",
+    )
+    assert vi_unaccented.should_inject is True
+    assert vi_unaccented.reason == "parallel_issue_map_or_comparison"
+    assert "Task/Explore" in vi_unaccented.message
+
+    vi_audit_accented = classify_user_prompt(
+        "Rà soát toàn bộ plugin và kiểm tra tất cả",
+        invocation_num=1,
+        host="codex",
+    )
+    assert vi_audit_accented.should_inject is True
+    assert vi_audit_accented.reason == "parallel_issue_map_or_comparison"
+    assert "spawn_agent" in vi_audit_accented.message
+
+    vi_audit_unaccented = classify_user_prompt(
+        "ra soat toan bo va kiem tra tat ca",
+        invocation_num=1,
+        host="antigravity",
+    )
+    assert vi_audit_unaccented.should_inject is True
+    assert vi_audit_unaccented.reason == "parallel_issue_map_or_comparison"
+
+
+def test_classify_user_prompt_parallel_map_suppressed_by_high_risk_or_tag() -> None:
+    high_risk_en = classify_user_prompt(
+        "Map out the issue for the JWT authentication bypass and alembic migration",
+        invocation_num=1,
+        host="antigravity",
+    )
+    assert high_risk_en.should_inject is False
+    assert high_risk_en.reason == "high_risk_or_frontier_tag"
+
+    frontier_tag = classify_user_prompt(
+        "@pro map out issue #18 across backend and frontend",
+        invocation_num=1,
+        host="antigravity",
+    )
+    assert frontier_tag.should_inject is False
+    assert frontier_tag.reason == "high_risk_or_frontier_tag"
+
+    high_risk_vi = classify_user_prompt(
+        "Phân tích issue phân quyền và bảo mật trên nhánh develop",
+        invocation_num=1,
+        host="claude",
+    )
+    assert high_risk_vi.should_inject is False
+    assert high_risk_vi.reason == "high_risk_or_frontier_tag"
+
+
+def test_classify_user_prompt_routine_search_preserved() -> None:
+    routine_en = classify_user_prompt(
+        "Scan logs for timeout errors and list all callers of send_message",
+        invocation_num=1,
+        host="antigravity",
+    )
+    assert routine_en.should_inject is True
+    assert routine_en.reason == "routine_search_or_log_task"
+
+    routine_vi = classify_user_prompt(
+        "Kiểm tra toàn bộ log và tìm tất cả các file gọi hàm send_message",
+        invocation_num=1,
+        host="antigravity",
+    )
+    assert routine_vi.should_inject is True
+    assert routine_vi.reason == "routine_search_or_log_task"
