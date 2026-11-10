@@ -880,3 +880,163 @@ def test_classify_user_prompt_routine_search_preserved() -> None:
     )
     assert routine_vi.should_inject is True
     assert routine_vi.reason == "routine_search_or_log_task"
+
+
+def test_codex_and_claude_slice_mapper_routes_to_lite_or_fast() -> None:
+    # 1. OpenAI Codex spawn_agent bounded slice lookup (<600 chars, <3 files) -> Tier 1 lite (gpt-6-luna)
+    codex_lite = classify_subagent_call(
+        type_name="spawn_agent",
+        role="Slice 1 Backend Mapper",
+        prompt="Read backend/app/models/tenant.py and backend/app/schemas/tenant.py and extract the field and type signatures",
+        current_model="inherit",
+        host="codex",
+    )
+    assert codex_lite.tier == "lite"
+    assert codex_lite.target_model == "gpt-6-luna"
+    assert codex_lite.should_overwrite is True
+    assert codex_lite.reason == "read_only_simple_lookup"
+
+    # 2. Claude Code default general-purpose Task bounded slice lookup -> Tier 1 lite (haiku)
+    claude_lite = classify_subagent_call(
+        type_name="general-purpose",
+        role="Slice 1 Route Extractor",
+        prompt="Inspect the file backend/app/api/tenants.py and extract the route signatures",
+        current_model="",
+        host="claude",
+    )
+    assert claude_lite.tier == "lite"
+    assert claude_lite.target_model == "haiku"
+    assert claude_lite.should_overwrite is True
+    assert claude_lite.reason == "read_only_simple_lookup"
+
+    # 3. Vietnamese accented & unaccented slice lookup on Codex / Claude -> Tier 1 lite
+    vi_accented_lite = classify_subagent_call(
+        type_name="spawn_agent",
+        role="Slice 1 Nghiên cứu",
+        prompt="Đọc file backend/app/main.py và trích xuất route",
+        current_model="inherit",
+        host="codex",
+    )
+    assert vi_accented_lite.tier == "lite"
+    assert vi_accented_lite.target_model == "gpt-6-luna"
+
+    vi_unaccented_lite = classify_subagent_call(
+        type_name="general-purpose",
+        role="Slice 2 Khao sat",
+        prompt="Doc file backend/app/main.py va trich xuat chu ky",
+        current_model="",
+        host="claude",
+    )
+    assert vi_unaccented_lite.tier == "lite"
+    assert vi_unaccented_lite.target_model == "haiku"
+
+    # 4. Multi-file slice comparison (>=3 files or COMPLEX_RESEARCH_RE) -> Tier 2 fast
+    claude_fast = classify_subagent_call(
+        type_name="general-purpose",
+        role="Slice 2 API Comparator",
+        prompt=(
+            "Map out slice across backend/app/api/tenants.py, "
+            "backend/app/services/tenant_service.py, and "
+            "backend/app/repositories/tenant.py and check what already exists vs develop"
+        ),
+        current_model="",
+        host="claude",
+    )
+    assert claude_fast.tier == "fast"
+    assert claude_fast.target_model == "sonnet"
+    assert claude_fast.should_overwrite is True
+    assert claude_fast.reason == "read_only_research_survey"
+
+    # 5. Role-only read-only slice survey without explicit lookup verb -> Tier 2 fast
+    role_only_fast = classify_subagent_call(
+        type_name="spawn_agent",
+        role="Slice 3 Frontend Comparator",
+        prompt="Check frontend/src/hooks/useWorkspaceStore.ts and summarize state transitions",
+        current_model="inherit",
+        host="codex",
+    )
+    assert role_only_fast.tier == "fast"
+    assert role_only_fast.target_model == "gpt-6.1-sol"
+    assert role_only_fast.should_overwrite is True
+    assert role_only_fast.reason == "read_only_research_survey"
+
+
+def test_read_only_role_never_downgrades_code_mutation_or_high_risk() -> None:
+    mutation_prompts = [
+        "Read backend/app/api/tenants.py and update the endpoint to fix the bug",
+        "Inspect backend/app/models/tenant.py and add a new field for workspace_cap",
+        "Read backend/app/services/tenant_service.py and delete the method",
+        "Inspect the slice and apply the fix to backend/app/main.py",
+        "Đọc file backend/app/main.py và chỉnh sửa logic xử lý",
+        "Doc file backend/app/main.py va them moi endpoint",
+    ]
+    for prompt in mutation_prompts:
+        decision = classify_subagent_call(
+            type_name="general-purpose",
+            role="Slice 1 Backend Mapper",
+            prompt=prompt,
+            current_model="",
+            host="claude",
+        )
+        assert decision.tier == "frontier", (
+            f"Expected frontier for mutation prompt: {prompt}"
+        )
+        assert decision.target_model == "inherit"
+        assert decision.should_overwrite is False
+
+    # Audit/review intent with a Mapper role also stays on frontier
+    audit_decision = classify_subagent_call(
+        type_name="spawn_agent",
+        role="Slice 1 Mapper",
+        prompt="Read backend/app/services/tenant_service.py and review the implementation for bugs",
+        current_model="inherit",
+        host="codex",
+    )
+    assert audit_decision.tier == "frontier"
+    assert audit_decision.should_overwrite is False
+
+    # High-risk domain with a Mapper role stays on frontier
+    high_risk_decision = classify_subagent_call(
+        type_name="general-purpose",
+        role="Slice 1 Auth Mapper",
+        prompt="Read backend/app/core/security.py and extract JWT RBAC permission contracts",
+        current_model="",
+        host="claude",
+    )
+    assert high_risk_decision.tier == "frontier"
+    assert high_risk_decision.reason.startswith("safety_guardrail:")
+
+
+def test_classify_user_prompt_respects_custom_high_risk_keywords() -> None:
+    cfg = DownshiftConfig(high_risk_keywords=(" vietmoney_vault ", "billing_ledger"))
+
+    # Parallel mapping prompt containing custom high-risk keyword is suppressed
+    suppressed_map = classify_user_prompt(
+        "Map out the issue for vietmoney_vault across backend and frontend",
+        invocation_num=1,
+        host="antigravity",
+        config=cfg,
+    )
+    assert suppressed_map.should_inject is False
+    assert suppressed_map.reason == "high_risk_or_frontier_tag"
+
+    # Routine search prompt containing custom high-risk keyword is suppressed via should_nudge_pre_invocation
+    assert (
+        should_nudge_pre_invocation(
+            "Search the logs for billing_ledger errors",
+            invocation_num=1,
+            host="antigravity",
+            config=cfg,
+        )
+        is None
+    )
+
+    # Unrelated parallel mapping prompt still nudges normally with the same config
+    allowed_map = classify_user_prompt(
+        "Map out the issue for contact tags across backend and frontend",
+        invocation_num=1,
+        host="antigravity",
+        config=cfg,
+    )
+    assert allowed_map.should_inject is True
+    assert allowed_map.reason == "parallel_issue_map_or_comparison"

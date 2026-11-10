@@ -78,17 +78,34 @@ FRONTIER_TAG_RE = re.compile(r"(?:^|\s)@(pro|opus|frontier|inherit)\b", re.IGNOR
 LITE_TAG_RE = re.compile(r"(?:^|\s)@(flash_lite|lite|haiku)\b", re.IGNORECASE)
 FAST_TAG_RE = re.compile(r"(?:^|\s)@(flash|sonnet|fast|downshift)\b", re.IGNORECASE)
 
+READ_ONLY_ROLE_RE = re.compile(
+    r"\b(research(?:er)?|explor(?:e|er)|map(?:per|ping)|slice\s+\d+|"
+    r"inspect(?:or)?|scan(?:ner)?|compar(?:ator)|extract(?:or)|"
+    r"locator|lookup|reader|survey(?:or)?|"
+    r"nghiên\s+cứu|nghien\s+cuu|khảo\s+sát|khao\s+sat|đối\s+chiếu|doi\s+chieu)\b",
+    re.IGNORECASE,
+)
+
 SIMPLE_LOOKUP_RE = re.compile(
     r"\b(find\s+(?:the\s+)?file|locate|where\s+is|git\s+status|git\s+branch|list\s+files|count\s+lines|"
+    r"read\s+(?:the\s+)?(?:file|files|slice|module|[a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]+)s?|"
+    r"inspect\s+(?:the\s+)?(?:file|files|slice|module|[a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]+)s?|"
+    r"extract\s+(?:the\s+)?(?:route|field|schema|type|signature|boundary|contract)s?|"
     r"tìm\s+file|tim\s+file|tìm\s+hàm|tim\s+ham|tìm\s+vị\s+trí|tim\s+vi\s+tri|"
     r"ở\s+file\s+nào|o\s+file\s+nao|định\s+nghĩa\s+ở\s+đâu|dinh\s+nghia\s+o\s+dau|"
-    r"liệt\s+kê\s+tên\s+file|liet\s+ke\s+ten\s+file)\b",
+    r"liệt\s+kê\s+tên\s+file|liet\s+ke\s+ten\s+file|"
+    r"đọc\s+file|doc\s+file|"
+    r"trích\s+xuất\s+(?:route|field|schema|type|chữ\s+ký|chu\s+ky)|"
+    r"trich\s+xuat\s+(?:route|field|schema|type|chu\s+ky))\b",
     re.IGNORECASE,
 )
 COMPLEX_RESEARCH_RE = re.compile(
     r"\b(survey|trace\s+all|analyze|architecture|summarize\s+how|compare|audit|across\s+the\s+backend|"
+    r"map\s+(?:out\s+)?slice|extract\s+boundary\s+contracts?|"
+    r"what\s+already\s+exists\s+vs|check\s+what\s+(?:already\s+)?exists|"
     r"tóm\s+tắt\s+luồng|tom\s+tat\s+luong|kiểm\s+tra\s+toàn\s+bộ|kiem\s+tra\s+toan\s+bo|"
-    r"tìm\s+tất\s+cả|tim\s+tat\s+ca|quét\s+log|quet\s+log)\b",
+    r"tìm\s+tất\s+cả|tim\s+tat\s+ca|quét\s+log|quet\s+log|"
+    r"phân\s+tích\s+slice|phan\s+tich\s+slice)\b",
     re.IGNORECASE,
 )
 
@@ -99,7 +116,12 @@ VERIFICATION_RUNNER_RE = re.compile(
 )
 CODE_MUTATION_RE = re.compile(
     r"\b(implement|refactor|fix\s+bug|edit\s+file|write\s+code|create\s+endpoint|modify|patch|"
+    r"update\s+(?:the\s+)?(?:file|code|function|endpoint|model|test|logic)|"
+    r"add\s+(?:a\s+)?(?:new\s+)?(?:field|column|method|route|endpoint|test)|"
+    r"(?:delete|remove)\s+(?:the\s+)?(?:file|function|method|route|endpoint|code)|"
+    r"apply\s+(?:the\s+)?fix|"
     r"sửa\s+lỗi|sua\s+loi|cập\s+nhật\s+code|cap\s+nhat\s+code|viết\s+thêm|viet\s+them|"
+    r"chỉnh\s+sửa|chinh\s+sua|thêm\s+mới|them\s+moi|"
     r"triển\s+khai|trien\s+khai|tái\s+cấu\s+trúc|tai\s+cau\s+truc)\b",
     re.IGNORECASE,
 )
@@ -482,12 +504,15 @@ def classify_subagent_call(
         )
 
     # 5. Hard safety guardrail blocklist (with benign identifier disambiguation on pure read-only lookups, FR-001/FR-002)
-    is_codex_spawn = norm_type in ("spawn_agent", "multi_agent_v1__spawn_agent")
     is_readonly = norm_type in READ_ONLY_SUBAGENTS or (
-        is_codex_spawn
+        norm_type in GENERAL_SUBAGENTS
         and not CODE_MUTATION_RE.search(combined)
+        and not AUDIT_OR_MUTATION_INTENT_RE.search(combined)
+        and not VERIFICATION_RUNNER_RE.search(combined)
         and bool(
-            SIMPLE_LOOKUP_RE.search(combined) or COMPLEX_RESEARCH_RE.search(combined)
+            SIMPLE_LOOKUP_RE.search(combined)
+            or COMPLEX_RESEARCH_RE.search(combined)
+            or READ_ONLY_ROLE_RE.search(role or "")
         )
     )
     simple_lookup_checked = False
@@ -601,6 +626,7 @@ def classify_user_prompt(
     last_user_input: str,
     invocation_num: int = 1,
     host: str = "antigravity",
+    config: DownshiftConfig | None = None,
 ) -> PromptAdvisory:
     """Return an ephemeral delegation reminder on the first turn of routine search/log prompts."""
     text = (last_user_input or "").strip()
@@ -609,7 +635,12 @@ def classify_user_prompt(
             host=host, should_inject=False, message="", reason="not_first_turn_or_empty"
         )
 
-    if FRONTIER_TAG_RE.search(text) or _match_high_risk(text) is not None:
+    cfg = config or load_config()
+    if (
+        FRONTIER_TAG_RE.search(text)
+        or _match_high_risk(text) is not None
+        or _match_custom_high_risk(text, cfg.high_risk_keywords) is not None
+    ):
         return PromptAdvisory(
             host=host,
             should_inject=False,
@@ -684,10 +715,14 @@ def should_nudge_pre_invocation(
     last_user_input: str,
     invocation_num: int = 1,
     host: str = "antigravity",
+    config: DownshiftConfig | None = None,
 ) -> str | None:
     """Convenience wrapper returning the nudge string or None."""
     advisory = classify_user_prompt(
-        last_user_input=last_user_input, invocation_num=invocation_num, host=host
+        last_user_input=last_user_input,
+        invocation_num=invocation_num,
+        host=host,
+        config=config,
     )
     return advisory.message if advisory.should_inject else None
 

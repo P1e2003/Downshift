@@ -858,3 +858,51 @@ def test_parallel_pre_tool_use_concurrent_fan_out(tmp_path: Path) -> None:
     assert len(lines) == 4
     tiers = sorted(entry["tier"] for entry in lines)
     assert tiers == ["fast", "fast", "lite", "lite"]
+
+
+def test_pre_invocation_cli_workspace_custom_high_risk_suppression(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".downshift.json").write_text(
+        json.dumps({"high_risk_keywords": ["vietmoney_vault"]}),
+        encoding="utf-8",
+    )
+
+    # 1. Antigravity PreInvocation suppresses parallel map nudge when custom high_risk_keyword matches
+    code_agy_suppressed, data_agy_suppressed = _run_hook(
+        PRE_INVOCATION,
+        {
+            "conversationId": "conv-custom-hr-1",
+            "invocationNum": 1,
+            "workspacePaths": [str(tmp_path)],
+            "lastUserInput": "Map out the issue for vietmoney_vault across backend and frontend",
+        },
+    )
+    assert code_agy_suppressed == 0
+    assert data_agy_suppressed == {}
+
+    # 2. Claude Code UserPromptSubmit suppresses nudge when custom high_risk_keyword matches
+    code_claude_suppressed, data_claude_suppressed = _run_hook(
+        PRE_INVOCATION,
+        {
+            "session_id": "sess-custom-hr-2",
+            "hook_event_name": "UserPromptSubmit",
+            "cwd": str(tmp_path),
+            "prompt": "Map out the issue for VIETMONEY_VAULT across backend and frontend",
+        },
+    )
+    assert code_claude_suppressed == 0
+    assert data_claude_suppressed == {}
+
+    # 3. Non-matching prompt in the same workspace still injects the 4-step parallel fan-out nudge
+    code_agy_allowed, data_agy_allowed = _run_hook(
+        PRE_INVOCATION,
+        {
+            "conversationId": "conv-custom-hr-3",
+            "invocationNum": 1,
+            "workspacePaths": [str(tmp_path)],
+            "lastUserInput": "Map out the issue for contact tags across backend and frontend",
+        },
+    )
+    assert code_agy_allowed == 0
+    assert "injectSteps" in data_agy_allowed
