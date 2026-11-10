@@ -1,4 +1,4 @@
-"""Unit and CLI tests for Downshift local JSONL telemetry ledger & stats_cli.py (US-1.2 / Issue #5)."""
+"""Unit and CLI tests for Downshift local JSONL telemetry ledger & stats_cli.py (US-1.2 / Issue #5 & US-2.9 / Issue #23)."""
 
 from __future__ import annotations
 
@@ -89,6 +89,7 @@ def test_stats_cli_empty_ledger_renders_zero_state(tmp_path: Path) -> None:
     proc = subprocess.run(
         [sys.executable, str(STATS_CLI), "--ledger", str(missing_ledger)],
         text=True,
+        encoding="utf-8",
         capture_output=True,
         timeout=5,
         check=False,
@@ -402,12 +403,40 @@ def test_stats_cli_aggregates_hosts_reasons_and_guardrail_count(
     assert summary["guardrail_count"] == 3
 
     board = render_ascii_scoreboard(summary, ledger)
+    assert "╭─ ⚡ downshift stats" in board
+    assert "Credit cost     all-frontier  ████████████████████  100.0%" in board
     assert "[flash_lite / haiku / gpt-6-luna · 0.04x cost]" in board
     assert "[flash / sonnet / gpt-6.1-sol · 0.20x cost]" in board
     assert (
-        "  Hosts & guardrails          : antigravity: 3, claude: 3, codex: 2 · 3 high-risk call(s) protected by guardrails\n"
+        "Hosts & guardrails          : antigravity: 3, claude: 3, codex: 2 · 3 high-risk call(s) protected by guardrails\n"
         in board
     )
+    assert "Top routing reasons         : workspace_config:pinned_role: 2" in board
+
+    html_out = tmp_path / "scoreboard.html"
+    ledger.write_text(
+        "\n".join(json.dumps(ev) for ev in raw_events) + "\n", encoding="utf-8"
+    )
+    proc_html = subprocess.run(
+        [
+            sys.executable,
+            str(STATS_CLI),
+            "--ledger",
+            str(ledger),
+            "--html",
+            str(html_out),
+        ],
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    assert proc_html.returncode == 0
+    assert html_out.exists()
+    html_text = html_out.read_text(encoding="utf-8")
+    assert "Downshift Scoreboard 2.0" in html_text
+    assert "antigravity: 3, claude: 3, codex: 2" in html_text
 
 
 def test_stats_cli_clean_removes_only_zero_char_roleless_and_corrupted_rows(
