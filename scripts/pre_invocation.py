@@ -34,6 +34,7 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
             last_user_input=last_user_input,
             invocation_num=invocation_num,
             host="antigravity",
+            config=config,
         )
         if advisory.should_inject:
             return {
@@ -51,6 +52,7 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
         last_user_input=prompt,
         invocation_num=1,
         host=host,
+        config=config,
     )
     if advisory.should_inject:
         return {
