@@ -1079,3 +1079,122 @@ def record_routing_event(
         now_utc=now_utc,
     )
     return ok
+
+
+def clean_ledger_file(ledger_path: str | Path | None = None) -> tuple[int, int]:
+    """Remove corrupted JSONL lines and synthetic empty rows (prompt_chars <= 0 and empty role) under an OS file lock."""
+    path = get_ledger_path(ledger_path)
+    if not path.exists():
+        return (0, 0)
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
+    locked = False
+    removed_count = 0
+    kept_lines: list[bytes] = []
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            for _ in range(250):
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    time.sleep(0.002)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            locked = True
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+
+        for raw_line in b"".join(chunks).splitlines(keepends=True):
+            if not raw_line.strip():
+                continue
+            try:
+                item = json.loads(raw_line.decode("utf-8", errors="replace"))
+            except ValueError:
+                removed_count += 1
+                continue
+            if not isinstance(item, dict):
+                removed_count += 1
+                continue
+            try:
+                p_chars = int(item.get("prompt_chars") or 0)
+            except (ValueError, TypeError):
+                p_chars = 0
+            role_str = str(item.get("role") or "").strip()
+            if p_chars <= 0 and not role_str:
+                removed_count += 1
+                continue
+            kept_lines.append(
+                raw_line if raw_line.endswith(b"\n") else (raw_line + b"\n")
+            )
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        if kept_lines:
+            os.write(fd, b"".join(kept_lines))
+    finally:
+        if locked:
+            with contextlib.suppress(OSError):
+                if os.name == "nt":
+                    import msvcrt
+
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+    return (removed_count, len(kept_lines))
+
+
+def reset_ledger_file(ledger_path: str | Path | None = None) -> None:
+    """Truncate the JSONL ledger file to 0 bytes under an exclusive OS file lock."""
+    path = get_ledger_path(ledger_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
+    locked = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            for _ in range(250):
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    time.sleep(0.002)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            locked = True
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+    finally:
+        if locked:
+            with contextlib.suppress(OSError):
+                if os.name == "nt":
+                    import msvcrt
+
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)

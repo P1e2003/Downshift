@@ -1,4 +1,4 @@
-"""Scoreboard CLI for Downshift local JSONL telemetry ledger (US-1.2 / Issue #5)."""
+"""Scoreboard CLI for Downshift local JSONL telemetry ledger (US-1.2 / Issue #5 & US-2.9 / Issue #23)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from downshift_core import get_ledger_path
+from downshift_core import clean_ledger_file, get_ledger_path, reset_ledger_file
 
 TIER_COST_WEIGHT: dict[str, float] = {
     "frontier": 1.00,
@@ -42,13 +42,16 @@ def load_events(ledger_path: Path, limit: int | None = None) -> list[dict[str, A
 
 
 def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate total subagents intercepted, frontier calls saved, cost ROI, and mode counts."""
+    """Aggregate total subagents intercepted, frontier calls saved, cost ROI, and mode/host/reason counts."""
     total = len(events)
     tiers = {"lite": 0, "fast": 0, "frontier": 0}
     models: dict[str, int] = {}
+    hosts: dict[str, int] = {}
+    reasons: dict[str, int] = {}
     saved = 0
     active_count = 0
     shadow_count = 0
+    guardrail_count = 0
     total_prompt_chars = 0
     actual_weighted_cost = 0.0
 
@@ -62,6 +65,18 @@ def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         models[model] = models.get(model, 0) + 1
         if tier in ("lite", "fast") and bool(ev.get("overwritten", True)):
             saved += 1
+
+        host = str(ev.get("host") or "antigravity").strip().lower() or "antigravity"
+        hosts[host] = hosts.get(host, 0) + 1
+
+        reason = str(ev.get("reason") or "unknown").strip() or "unknown"
+        reasons[reason] = reasons.get(reason, 0) + 1
+        if (
+            reason.startswith("safety_guardrail:")
+            or reason == "workspace_config:high_risk_keyword"
+            or (reason == "workspace_config:pinned_role" and tier == "frontier")
+        ):
+            guardrail_count += 1
 
         mode = str(ev.get("mode") or "active").strip().lower()
         if mode == "shadow":
@@ -89,6 +104,9 @@ def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         "total_prompt_chars": total_prompt_chars,
         "tiers": tiers,
         "models": models,
+        "hosts": hosts,
+        "reasons": reasons,
+        "guardrail_count": guardrail_count,
     }
 
 
@@ -111,6 +129,9 @@ def render_ascii_scoreboard(summary: dict[str, Any], ledger_path: Path) -> str:
     lite = int(tiers.get("lite", 0))
     fast = int(tiers.get("fast", 0))
     frontier = int(tiers.get("frontier", 0))
+    hosts = summary.get("hosts") or {}
+    host_summary = ", ".join(f"{h}: {c}" for h, c in sorted(hosts.items())) or "none"
+    guardrail_count = int(summary.get("guardrail_count", 0))
 
     lite_pct = round((lite / total) * 100.0, 1)
     fast_pct = round((fast / total) * 100.0, 1)
@@ -120,9 +141,10 @@ def render_ascii_scoreboard(summary: dict[str, Any], ledger_path: Path) -> str:
         f"  downshift stats                   live ledger · {ledger_path}\n\n"
         f"  Total subagents intercepted : {total}  ({active_count} active, {shadow_count} shadow · {total_prompt_chars:,} prompt chars)\n"
         f"  Frontier calls saved        : {saved} ({saved_pct:.1f}%)  · Est. credit cost saved: {est_cost_saved_pct:.1f}%\n"
-        f"  ├── Routed to lite (Tier 1) : {lite:2d} ({lite_pct:.1f}%)  [flash_lite / haiku · 0.04x cost]\n"
-        f"  ├── Routed to fast (Tier 2) : {fast:2d} ({fast_pct:.1f}%)  [flash / sonnet · 0.20x cost]\n"
+        f"  ├── Routed to lite (Tier 1) : {lite:2d} ({lite_pct:.1f}%)  [flash_lite / haiku / gpt-6-luna · 0.04x cost]\n"
+        f"  ├── Routed to fast (Tier 2) : {fast:2d} ({fast_pct:.1f}%)  [flash / sonnet / gpt-6.1-sol · 0.20x cost]\n"
         f"  └── Kept on frontier        : {frontier:2d} ({frontier_pct:.1f}%)  [safety guardrail / stateful mutation · 1.00x]\n"
+        f"  Hosts & guardrails          : {host_summary} · {guardrail_count} high-risk call(s) protected by guardrails\n"
     )
 
 
@@ -138,6 +160,11 @@ def main(argv: list[str] | None = None) -> int:
         "--reset", action="store_true", help="Truncate/reset the ledger file"
     )
     parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Remove synthetic empty and corrupted rows from the ledger",
+    )
+    parser.add_argument(
         "--limit", type=int, default=None, help="Only aggregate the last N events"
     )
     args = parser.parse_args(argv)
@@ -146,12 +173,22 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.reset:
         try:
-            ledger_path.parent.mkdir(parents=True, exist_ok=True)
-            ledger_path.write_text("", encoding="utf-8")
+            reset_ledger_file(ledger_path)
             sys.stdout.write(f"Reset Downshift ledger at {ledger_path}\n")
             return 0
         except OSError as exc:
             sys.stderr.write(f"Failed to reset ledger: {exc}\n")
+            return 1
+
+    if args.clean:
+        try:
+            removed, retained = clean_ledger_file(ledger_path)
+            sys.stdout.write(
+                f"Cleaned {removed} synthetic/corrupted event(s) from {ledger_path} ({retained} valid event(s) retained)\n"
+            )
+            return 0
+        except OSError as exc:
+            sys.stderr.write(f"Failed to clean ledger: {exc}\n")
             return 1
 
     events = load_events(ledger_path, limit=args.limit)

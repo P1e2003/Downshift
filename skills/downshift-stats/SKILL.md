@@ -15,9 +15,14 @@ Run the scoreboard CLI and display its output verbatim in a fenced `text` block:
 "./scripts/run_hook.cmd" ./scripts/stats_cli.py
 ```
 
+If the user asks to clean synthetic empty or corrupted rows from the ledger (preserving all valid routing events), run:
+
+```bash
+"./scripts/run_hook.cmd" ./scripts/stats_cli.py --clean
+```
+
 If the user asks to reset the ledger, run:
 
 ```bash
 "./scripts/run_hook.cmd" ./scripts/stats_cli.py --reset
 ```
-
