@@ -55,7 +55,7 @@ When a first-turn user prompt asks to map out an issue, compare a specification 
 3. **Step 3 — Parallel Baseline Comparison & Boundary Contract Extraction:** Each subagent compares its slice against the baseline and returns what exists, what is missing, stale spec assumptions, candidate files, and **exact cross-layer boundary contracts** (API routes, request/response field names such as `snake_case` vs `camelCase`, function/type signatures, and DB/lock invariants).
 4. **Step 4 — Main-Agent Cross-Layer Check & Verdict (Fan-In):** Once all parallel subagents finish, the main (`frontier`) agent reconciles cross-layer boundary contracts across slices, verifies security/concurrency/migration guardrails, and writes the final unified **Map-Out Verdict**.
 
-- **Anti-Storm & Safety Guardrails:** Capped at `2–4` disjoint read-only subagents per turn (`1–2` known files are read directly or via a single Tier 1 lookup), with automatic suppression whenever `HIGH_RISK_RE` keywords or `@frontier` tags appear in the prompt.
+- **Anti-Storm & Safety Guardrails:** Capped at `2–4` disjoint read-only subagents per turn (`1–2` known files are read directly or via a single Tier 1 lookup), with automatic suppression whenever `HIGH_RISK_RE` keywords or `@frontier` tags appear in the prompt. At runtime, Downshift's `PreToolUse` dynamic burst-cap guardrail (`max_burst_subagents: 4` within `burst_window_seconds: 5` per `conversation_id`, overridable via `DOWNSHIFT_MAX_BURST`) atomically downgrades any 5th+ burst-eligible `fast` subagent to Tier 1 (`lite`, `reason="burst_cap_downgraded_to_lite"`) inside the cross-process ledger file lock while leaving safety guardrails and explicit `@tag` / `pinned_roles` overrides untouched.
 
 ---
 
@@ -95,7 +95,9 @@ Example `.downshift.json` at the workspace root:
   "pinned_roles": {
     "Security Auditor": "frontier",
     "Log Reader": "lite"
-  }
+  },
+  "max_burst_subagents": 4,
+  "burst_window_seconds": 5
 }
 ```
 

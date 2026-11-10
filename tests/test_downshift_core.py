@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -10,11 +12,14 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from downshift_core import (
     DownshiftConfig,
+    RoutingDecision,
     classify_subagent_call,
     classify_user_prompt,
     detect_host,
     extract_workspace_dir,
     load_config,
+    record_and_apply_burst_cap,
+    record_routing_event,
     score_prompt_complexity,
     should_nudge_pre_invocation,
     strip_benign_code_identifiers,
@@ -1040,3 +1045,225 @@ def test_classify_user_prompt_respects_custom_high_risk_keywords() -> None:
     )
     assert allowed_map.should_inject is True
     assert allowed_map.reason == "parallel_issue_map_or_comparison"
+
+
+def test_burst_cap_downgrades_fifth_fast_subagent_in_same_conversation(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "burst_ledger.jsonl"
+    cfg = DownshiftConfig(max_burst_subagents=4, burst_window_seconds=5)
+    t0 = datetime(2026, 11, 10, 7, 0, 0, tzinfo=UTC)
+
+    base_fast = RoutingDecision(
+        host="antigravity",
+        tier="fast",
+        target_model="flash",
+        should_overwrite=True,
+        reason="read_only_research_survey",
+    )
+
+    # 1st..4th fast subagents in conv-burst-1 within 5s stay fast
+    for idx in range(4):
+        eff = record_and_apply_burst_cap(
+            base_fast,
+            conversation_id="conv-burst-1",
+            subagent_type="research",
+            role=f"Slice {idx + 1} Mapper",
+            original_model="inherit",
+            ledger_path=ledger,
+            config=cfg,
+            now_utc=t0 + timedelta(seconds=idx),
+        )
+        assert eff.tier == "fast"
+        assert eff.target_model == "flash"
+        assert eff.reason == "read_only_research_survey"
+
+    # 5th and 6th fast subagents (including verification_test_or_lint_runner on codex) in conv-burst-1 within 5s downgrade to lite
+    eff_5 = record_and_apply_burst_cap(
+        base_fast,
+        conversation_id="conv-burst-1",
+        subagent_type="research",
+        role="Slice 5 Mapper",
+        original_model="inherit",
+        ledger_path=ledger,
+        config=cfg,
+        now_utc=t0 + timedelta(seconds=4),
+    )
+    assert eff_5.tier == "lite"
+    assert eff_5.target_model == "flash_lite"
+    assert eff_5.should_overwrite is True
+    assert eff_5.reason == "burst_cap_downgraded_to_lite"
+
+    codex_fast = RoutingDecision(
+        host="codex",
+        tier="fast",
+        target_model="gpt-6.1-sol",
+        should_overwrite=True,
+        reason="verification_test_or_lint_runner",
+    )
+    eff_6 = record_and_apply_burst_cap(
+        codex_fast,
+        conversation_id="conv-burst-1",
+        subagent_type="spawn_agent",
+        role="Test Runner 6",
+        original_model="inherit",
+        ledger_path=ledger,
+        config=cfg,
+        now_utc=t0 + timedelta(seconds=4, milliseconds=500),
+    )
+    assert eff_6.tier == "lite"
+    assert eff_6.target_model == "gpt-6-luna"
+    assert eff_6.reason == "burst_cap_downgraded_to_lite"
+
+    # Different conversation_id is isolated and stays fast
+    eff_other_conv = record_and_apply_burst_cap(
+        base_fast,
+        conversation_id="conv-burst-2",
+        subagent_type="research",
+        role="Slice 1 Mapper",
+        original_model="inherit",
+        ledger_path=ledger,
+        config=cfg,
+        now_utc=t0 + timedelta(seconds=4),
+    )
+    assert eff_other_conv.tier == "fast"
+    assert eff_other_conv.target_model == "flash"
+
+    # Same conversation_id after > 5s window expires stays fast
+    eff_after_window = record_and_apply_burst_cap(
+        base_fast,
+        conversation_id="conv-burst-1",
+        subagent_type="research",
+        role="Post-Window Mapper",
+        original_model="inherit",
+        ledger_path=ledger,
+        config=cfg,
+        now_utc=t0 + timedelta(seconds=11),
+    )
+    assert eff_after_window.tier == "fast"
+    assert eff_after_window.target_model == "flash"
+
+
+def test_burst_cap_never_downgrades_high_risk_or_inline_tag(tmp_path: Path) -> None:
+    ledger = tmp_path / "immune_ledger.jsonl"
+    cfg = DownshiftConfig(max_burst_subagents=4, burst_window_seconds=5)
+    t0 = datetime(2026, 11, 10, 7, 10, 0, tzinfo=UTC)
+
+    base_fast = RoutingDecision(
+        host="claude",
+        tier="fast",
+        target_model="sonnet",
+        should_overwrite=True,
+        reason="read_only_research_survey",
+    )
+    for idx in range(4):
+        record_routing_event(
+            base_fast,
+            conversation_id="conv-immune",
+            subagent_type="Explore",
+            role=f"Slice {idx + 1}",
+            original_model="inherit",
+            ledger_path=ledger,
+            config=cfg,
+            now_utc=t0,
+        )
+
+    immune_decisions = [
+        RoutingDecision(
+            host="claude",
+            tier="frontier",
+            target_model="inherit",
+            should_overwrite=False,
+            reason="safety_guardrail:alembic_or_migration",
+        ),
+        RoutingDecision(
+            host="claude",
+            tier="frontier",
+            target_model="inherit",
+            should_overwrite=False,
+            reason="workspace_config:high_risk_keyword",
+        ),
+        RoutingDecision(
+            host="claude",
+            tier="fast",
+            target_model="sonnet",
+            should_overwrite=True,
+            reason="inline_tag_override:fast",
+        ),
+        RoutingDecision(
+            host="claude",
+            tier="fast",
+            target_model="sonnet",
+            should_overwrite=True,
+            reason="workspace_config:pinned_role",
+        ),
+    ]
+    for immune in immune_decisions:
+        eff = record_and_apply_burst_cap(
+            immune,
+            conversation_id="conv-immune",
+            subagent_type="Explore",
+            role="Protected Subagent",
+            original_model="inherit",
+            ledger_path=ledger,
+            config=cfg,
+            now_utc=t0 + timedelta(seconds=1),
+        )
+        assert eff == immune
+
+
+def test_burst_cap_skips_empty_conversation_id_and_respects_zero_config(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # 1. Verify load_config parses max_burst_subagents, burst_window_seconds, and DOWNSHIFT_MAX_BURST
+    (tmp_path / ".downshift.json").write_text(
+        json.dumps({"max_burst_subagents": 2, "burst_window_seconds": 10}),
+        encoding="utf-8",
+    )
+    loaded_cfg = load_config(workspace_dir=tmp_path, env={})
+    assert loaded_cfg.max_burst_subagents == 2
+    assert loaded_cfg.burst_window_seconds == 10
+
+    env_override_cfg = load_config(
+        workspace_dir=tmp_path, env={"DOWNSHIFT_MAX_BURST": "0"}
+    )
+    assert env_override_cfg.max_burst_subagents == 0
+
+    ledger = tmp_path / "skip_ledger.jsonl"
+    base_fast = RoutingDecision(
+        host="antigravity",
+        tier="fast",
+        target_model="flash",
+        should_overwrite=True,
+        reason="promoted_to_fast:multi_file_or_long_prompt",
+    )
+
+    # 2. Empty or whitespace conversation_id never triggers burst cap
+    strict_cfg = DownshiftConfig(max_burst_subagents=2, burst_window_seconds=5)
+    for _ in range(5):
+        eff_empty = record_and_apply_burst_cap(
+            base_fast,
+            conversation_id="   ",
+            subagent_type="research",
+            role="Anonymous Researcher",
+            original_model="inherit",
+            ledger_path=ledger,
+            config=strict_cfg,
+        )
+        assert eff_empty.tier == "fast"
+        assert eff_empty.reason == "promoted_to_fast:multi_file_or_long_prompt"
+
+    # 3. max_burst_subagents=0 disables burst cap even with matching conversation_id
+    disabled_cfg = DownshiftConfig(max_burst_subagents=0, burst_window_seconds=5)
+    for _ in range(6):
+        eff_disabled = record_and_apply_burst_cap(
+            base_fast,
+            conversation_id="conv-disabled-cap",
+            subagent_type="research",
+            role="Uncapped Researcher",
+            original_model="inherit",
+            ledger_path=ledger,
+            config=disabled_cfg,
+        )
+        assert eff_disabled.tier == "fast"
+        assert eff_disabled.reason == "promoted_to_fast:multi_file_or_long_prompt"

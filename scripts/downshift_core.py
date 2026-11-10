@@ -193,6 +193,18 @@ CODEX_TIER_REASONING_EFFORT: dict[str, str] = {
     "fast": "medium",
 }
 
+DEFAULT_MAX_BURST_SUBAGENTS = 4
+DEFAULT_BURST_WINDOW_SECONDS = 5
+BURST_TAIL_READ_BYTES = 65_536
+
+BURST_ELIGIBLE_REASONS: frozenset[str] = frozenset(
+    {
+        "read_only_research_survey",
+        "promoted_to_fast:multi_file_or_long_prompt",
+        "verification_test_or_lint_runner",
+    }
+)
+
 
 @dataclass(frozen=True)
 class DownshiftConfig:
@@ -200,6 +212,8 @@ class DownshiftConfig:
     hints: bool = True
     high_risk_keywords: tuple[str, ...] = ()
     pinned_roles: dict[str, str] = field(default_factory=dict)
+    max_burst_subagents: int = DEFAULT_MAX_BURST_SUBAGENTS
+    burst_window_seconds: int = DEFAULT_BURST_WINDOW_SECONDS
 
 
 @dataclass(frozen=True)
@@ -310,6 +324,8 @@ def load_config(
     hints = True
     high_risk_keywords: tuple[str, ...] = ()
     pinned_roles: dict[str, str] = {}
+    max_burst_subagents = DEFAULT_MAX_BURST_SUBAGENTS
+    burst_window_seconds = DEFAULT_BURST_WINDOW_SECONDS
 
     cfg_path = _find_config_file(workspace_dir, env_map)
     if cfg_path is not None:
@@ -342,6 +358,20 @@ def load_config(
                             and v.strip().lower() in VALID_TIERS
                         ):
                             pinned_roles[k.strip()] = v.strip().lower()
+                raw_max_burst = raw_data.get("max_burst_subagents")
+                if (
+                    isinstance(raw_max_burst, int)
+                    and not isinstance(raw_max_burst, bool)
+                    and raw_max_burst >= 0
+                ):
+                    max_burst_subagents = raw_max_burst
+                raw_burst_window = raw_data.get("burst_window_seconds")
+                if (
+                    isinstance(raw_burst_window, int)
+                    and not isinstance(raw_burst_window, bool)
+                    and raw_burst_window >= 1
+                ):
+                    burst_window_seconds = raw_burst_window
 
     env_mode = (env_map.get("DOWNSHIFT_MODE") or "").strip().lower()
     if env_mode in VALID_MODES:
@@ -356,11 +386,20 @@ def load_config(
     elif env_hints in ("1", "true", "yes", "on"):
         hints = True
 
+    env_max_burst = (env_map.get("DOWNSHIFT_MAX_BURST") or "").strip()
+    if env_max_burst:
+        with contextlib.suppress(ValueError):
+            parsed_burst = int(env_max_burst)
+            if parsed_burst >= 0:
+                max_burst_subagents = parsed_burst
+
     return DownshiftConfig(
         mode=mode,
         hints=hints,
         high_risk_keywords=high_risk_keywords,
         pinned_roles=pinned_roles,
+        max_burst_subagents=max_burst_subagents,
+        burst_window_seconds=burst_window_seconds,
     )
 
 
@@ -811,37 +850,232 @@ def _append_line_locked(path: Path, line_bytes: bytes) -> None:
         os.close(fd)
 
 
-def record_routing_event(
-    decision: RoutingDecision,
+def _count_recent_burst_in_locked_fd(
+    fd: int,
+    st_size: int,
     conversation_id: str,
-    subagent_type: str,
-    role: str,
+    now_ts: datetime,
+    window_seconds: int,
+) -> int:
+    """Count recent events for conversation_id within window_seconds from the last <= 64 KB of a locked fd."""
+    if st_size <= 0 or window_seconds <= 0:
+        return 0
+    start_offset = max(0, st_size - BURST_TAIL_READ_BYTES)
+    os.lseek(fd, start_offset, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    lines = b"".join(chunks).splitlines()
+    if start_offset > 0 and lines:
+        lines = lines[1:]
+    count = 0
+    for raw_line in lines:
+        if not raw_line.strip():
+            continue
+        try:
+            obj = json.loads(raw_line.decode("utf-8", errors="replace"))
+            if not isinstance(obj, dict):
+                continue
+            if str(obj.get("conversation_id") or "").strip() != conversation_id:
+                continue
+            raw_ts = str(obj.get("timestamp") or "").strip()
+            if not raw_ts:
+                continue
+            if raw_ts.endswith("Z"):
+                raw_ts = raw_ts[:-1] + "+00:00"
+            entry_ts = datetime.fromisoformat(raw_ts)
+            if entry_ts.tzinfo is None:
+                entry_ts = entry_ts.replace(tzinfo=UTC)
+            delta = (now_ts - entry_ts).total_seconds()
+            if 0.0 <= delta <= float(window_seconds):
+                count += 1
+        except (ValueError, TypeError):
+            continue
+    return count
+
+
+def _record_event_locked(
+    decision: RoutingDecision,
+    *,
+    conversation_id: str = "",
+    subagent_type: str = "",
+    role: str = "",
     original_model: str = "inherit",
     ledger_path: str | Path | None = None,
     mode: str = "active",
     prompt_chars: int = 0,
-) -> bool:
-    """Append a privacy-safe routing event (never storing raw Prompt text) to the JSONL ledger."""
+    config: DownshiftConfig | None = None,
+    now_utc: datetime | None = None,
+) -> tuple[RoutingDecision, bool]:
+    """Atomically evaluate the burst cap and append the routing event inside the OS file lock."""
+    cfg = config if config is not None else load_config()
+    now_ts = now_utc if now_utc is not None else datetime.now(UTC)
+    if now_ts.tzinfo is None:
+        now_ts = now_ts.replace(tzinfo=UTC)
     try:
         path = get_ledger_path(ledger_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        entry = {
-            "timestamp": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "conversation_id": str(conversation_id or ""),
-            "host": decision.host,
-            "mode": str(mode or "active"),
-            "subagent_type": str(subagent_type or ""),
-            "role": str(role or "")[:80],
-            "prompt_chars": max(0, int(prompt_chars or 0)),
-            "original_model": str(original_model or "inherit"),
-            "target_model": decision.target_model,
-            "tier": decision.tier,
-            "reason": decision.reason,
-            "overwritten": decision.should_overwrite,
-        }
-        line_bytes = (json.dumps(entry, separators=(",", ":")) + "\n").encode("utf-8")
-        _append_line_locked(path, line_bytes)
-        return True
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
+        locked = False
+        effective_decision = decision
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                for _ in range(250):
+                    try:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                        locked = True
+                        break
+                    except OSError:
+                        time.sleep(0.002)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                locked = True
+
+            st_size = os.fstat(fd).st_size
+            norm_conv = str(conversation_id or "").strip()
+            if (
+                cfg.max_burst_subagents > 0
+                and norm_conv
+                and decision.tier == "fast"
+                and decision.reason in BURST_ELIGIBLE_REASONS
+            ):
+                recent_count = _count_recent_burst_in_locked_fd(
+                    fd=fd,
+                    st_size=st_size,
+                    conversation_id=norm_conv,
+                    now_ts=now_ts,
+                    window_seconds=cfg.burst_window_seconds,
+                )
+                if recent_count >= cfg.max_burst_subagents:
+                    effective_decision = RoutingDecision(
+                        host=decision.host,
+                        tier="lite",
+                        target_model=_resolve_target_model(decision.host, "lite"),
+                        should_overwrite=True,
+                        reason="burst_cap_downgraded_to_lite",
+                    )
+
+            entry = {
+                "timestamp": now_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "conversation_id": str(conversation_id or ""),
+                "host": effective_decision.host,
+                "mode": str(mode or "active"),
+                "subagent_type": str(subagent_type or ""),
+                "role": str(role or "")[:80],
+                "prompt_chars": max(0, int(prompt_chars or 0)),
+                "original_model": str(original_model or "inherit"),
+                "target_model": effective_decision.target_model,
+                "tier": effective_decision.tier,
+                "reason": effective_decision.reason,
+                "overwritten": effective_decision.should_overwrite,
+            }
+            line_bytes = (json.dumps(entry, separators=(",", ":")) + "\n").encode(
+                "utf-8"
+            )
+
+            max_bytes = _get_max_ledger_bytes()
+            if st_size > 0 and (st_size + len(line_bytes) > max_bytes):
+                os.lseek(fd, 0, os.SEEK_SET)
+                chunks: list[bytes] = []
+                while True:
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                existing_lines = [
+                    ln
+                    for ln in b"".join(chunks).splitlines(keepends=True)
+                    if ln.strip()
+                ]
+                kept = existing_lines[len(existing_lines) // 2 :]
+                kept_size = sum(len(ln) for ln in kept)
+                while kept and (kept_size + len(line_bytes) > max_bytes):
+                    removed = kept.pop(0)
+                    kept_size -= len(removed)
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.ftruncate(fd, 0)
+                os.write(fd, b"".join(kept) + line_bytes)
+            else:
+                os.lseek(fd, 0, os.SEEK_END)
+                os.write(fd, line_bytes)
+        finally:
+            if locked:
+                with contextlib.suppress(OSError):
+                    if os.name == "nt":
+                        import msvcrt
+
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        return effective_decision, True
     except OSError:
         # Non-blocking fail-open if disk or directory is unwritable
-        return False
+        return decision, False
+
+
+def record_and_apply_burst_cap(
+    decision: RoutingDecision,
+    conversation_id: str = "",
+    subagent_type: str = "",
+    role: str = "",
+    original_model: str = "inherit",
+    ledger_path: str | Path | None = None,
+    mode: str = "active",
+    prompt_chars: int = 0,
+    config: DownshiftConfig | None = None,
+    now_utc: datetime | None = None,
+) -> RoutingDecision:
+    """Atomically apply the dynamic burst cap and append the event to the JSONL ledger."""
+    effective_decision, _ = _record_event_locked(
+        decision=decision,
+        conversation_id=conversation_id,
+        subagent_type=subagent_type,
+        role=role,
+        original_model=original_model,
+        ledger_path=ledger_path,
+        mode=mode,
+        prompt_chars=prompt_chars,
+        config=config,
+        now_utc=now_utc,
+    )
+    return effective_decision
+
+
+def record_routing_event(
+    decision: RoutingDecision,
+    conversation_id: str = "",
+    subagent_type: str = "",
+    role: str = "",
+    original_model: str = "inherit",
+    ledger_path: str | Path | None = None,
+    mode: str = "active",
+    prompt_chars: int = 0,
+    config: DownshiftConfig | None = None,
+    now_utc: datetime | None = None,
+) -> bool:
+    """Append a privacy-safe routing event (never storing raw Prompt text) to the JSONL ledger."""
+    _, ok = _record_event_locked(
+        decision=decision,
+        conversation_id=conversation_id,
+        subagent_type=subagent_type,
+        role=role,
+        original_model=original_model,
+        ledger_path=ledger_path,
+        mode=mode,
+        prompt_chars=prompt_chars,
+        config=config,
+        now_utc=now_utc,
+    )
+    return ok

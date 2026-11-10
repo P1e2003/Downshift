@@ -12,7 +12,7 @@ from downshift_core import (
     detect_host,
     extract_workspace_dir,
     load_config,
-    record_routing_event,
+    record_and_apply_burst_cap,
 )
 
 CLAUDE_SUBAGENT_TOOLS = frozenset(
@@ -81,7 +81,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
             host="antigravity",
             config=config,
         )
-        record_routing_event(
+        decision = record_and_apply_burst_cap(
             decision=decision,
             conversation_id=str(payload.get("conversationId") or ""),
             subagent_type=type_name,
@@ -89,6 +89,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
             original_model=orig_model,
             mode=config.mode,
             prompt_chars=len(prompt_text),
+            config=config,
         )
         if config.mode == "active" and decision.should_overwrite:
             return {
@@ -131,7 +132,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         host=host,
         config=config,
     )
-    record_routing_event(
+    decision = record_and_apply_burst_cap(
         decision=decision,
         conversation_id=str(payload.get("session_id") or ""),
         subagent_type=type_name,
@@ -139,6 +140,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         original_model=orig_model or "inherit",
         mode=config.mode,
         prompt_chars=len(prompt_text),
+        config=config,
     )
     if config.mode == "active" and decision.should_overwrite:
         updated_input = dict(tool_input)

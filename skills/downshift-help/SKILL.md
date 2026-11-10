@@ -28,18 +28,18 @@ Display this compact reference card in a fenced `text` block:
     2. Map         Spawn 2-4 read-only subagents in 1 turn (<600 chars & <3 paths -> Tier 1 lite)
     3. Compare     Each subagent compares its slice vs baseline & extracts exact boundary contracts
     4. Verdict     Main (frontier) agent reconciles cross-layer contracts (snake_case/camelCase, auth)
-    Guardrails     Cap at 2-4 subagents/turn · 1-2 known files stay direct · read-only fan-out only
+    Guardrails     Cap at 2-4 subagents/turn (enforced at runtime: 5th+ fast -> lite) · 1-2 known files stay direct · read-only fan-out only
 
   Inline @tag Overrides
     @pro / @opus / @frontier / @inherit   Force Tier 3 (frontier)
     @flash / @sonnet / @fast / @downshift Force Tier 2 (fast)
     @flash_lite / @lite / @haiku          Force Tier 1 (lite)
 
-  Modes & Workspace Config (.downshift.json / DOWNSHIFT_MODE)
+  Modes & Workspace Config (.downshift.json / DOWNSHIFT_MODE / DOWNSHIFT_MAX_BURST)
     active (default)   Enforce model routing + record telemetry
     shadow             Dry-run: record telemetry without overwriting models
     off                Disable routing, telemetry, and hints
-    .downshift.json    mode, hints, high_risk_keywords, pinned_roles
+    .downshift.json    mode, hints, high_risk_keywords, pinned_roles, max_burst_subagents (4), burst_window_seconds (5)
 
   Commands
     /downshift-stats   Show live routing scoreboard from ~/.gemini/downshift_ledger.jsonl
