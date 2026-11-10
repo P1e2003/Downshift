@@ -906,3 +906,65 @@ def test_pre_invocation_cli_workspace_custom_high_risk_suppression(
     )
     assert code_agy_allowed == 0
     assert "injectSteps" in data_agy_allowed
+
+
+def test_concurrent_6_subagent_storm_caps_excess_to_lite(tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    ledger = tmp_path / "storm_ledger.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+
+    storm_payloads = [
+        {
+            "session_id": "storm-1",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "role": f"Slice {idx + 1} Module Mapper",
+                "message": "Map out slice across backend/app/api/tenants.py, backend/app/services/tenant_service.py, and backend/app/repositories/tenant.py and check what already exists vs develop",
+                "reasoning_effort": "high",
+            },
+        }
+        for idx in range(6)
+    ]
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(
+            pool.map(
+                lambda p: _run_hook(PRE_TOOL_USE, p, extra_env=env), storm_payloads
+            )
+        )
+
+    assert all(rc == 0 for rc, _ in results)
+    models = sorted(
+        data["hookSpecificOutput"]["updatedInput"]["model"] for _, data in results
+    )
+    efforts = sorted(
+        data["hookSpecificOutput"]["updatedInput"]["reasoning_effort"]
+        for _, data in results
+    )
+    assert models == [
+        "gpt-6-luna",
+        "gpt-6-luna",
+        "gpt-6.1-sol",
+        "gpt-6.1-sol",
+        "gpt-6.1-sol",
+        "gpt-6.1-sol",
+    ]
+    assert efforts == ["low", "low", "medium", "medium", "medium", "medium"]
+
+    entries = [
+        json.loads(line)
+        for line in ledger.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(entries) == 6
+    assert sorted(e["tier"] for e in entries) == [
+        "fast",
+        "fast",
+        "fast",
+        "fast",
+        "lite",
+        "lite",
+    ]
+    assert sum(1 for e in entries if e["reason"] == "burst_cap_downgraded_to_lite") == 2

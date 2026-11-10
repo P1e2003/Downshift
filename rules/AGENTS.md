@@ -28,7 +28,7 @@ When mapping a new issue, auditing a plugin/repository, or comparing a specifica
 4. **Step 4 — Main-Agent Cross-Layer Check & Verdict (Fan-In):** Once all parallel subagents report back, the main (`frontier`) agent explicitly cross-checks boundary contracts across slices (e.g., Backend response fields vs. Frontend TypeScript interfaces, auth/tenant dependencies vs. caller headers), verifies security/concurrency/migration guardrails, and writes the final unified **Map-Out Verdict**.
 
 **Parallel Fan-Out Guardrails:**
-- **2–4 Subagent Cap (Anti-Storm Rule):** Never spawn more than `4` subagents in a single turn.
+- **2–4 Subagent Cap (Anti-Storm Rule):** Never spawn more than `4` subagents in a single turn. Enforced at runtime by Downshift's `PreToolUse` dynamic burst-cap guardrail (`max_burst_subagents: 4` per `burst_window_seconds: 5` per `conversation_id`, configurable in `.downshift.json` or `DOWNSHIFT_MAX_BURST`), which atomically downgrades a 5th+ non-high-risk `fast` subagent to Tier 1 (`lite`, `reason="burst_cap_downgraded_to_lite"`).
 - **Minimum Task Threshold:** Do not fan out for `1–2` known files; read them directly or use a single Tier 1 (`lite`) lookup subagent.
 - **Read-Only Fan-Out Boundary:** Parallel subagents sharing `Workspace="inherit"` must remain read-only (`research` / `Explore`) so concurrent workers never race on file edits or DB state.
 - **Cross-Layer Boundary Blind-Spot Guardrail:** Because parallel subagents inspect slices in isolation, each subagent MUST report exact interface/payload signatures in Step 3 so the main agent can catch cross-layer mismatches in Step 4.
