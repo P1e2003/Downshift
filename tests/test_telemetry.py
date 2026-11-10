@@ -1,4 +1,4 @@
-"""Unit and CLI tests for Downshift local JSONL telemetry ledger & stats_cli.py (US-1.2 / Issue #5)."""
+"""Unit and CLI tests for Downshift local JSONL telemetry ledger & stats_cli.py (US-1.2 / Issue #5 & US-2.9 / Issue #23)."""
 
 from __future__ import annotations
 
@@ -89,6 +89,7 @@ def test_stats_cli_empty_ledger_renders_zero_state(tmp_path: Path) -> None:
     proc = subprocess.run(
         [sys.executable, str(STATS_CLI), "--ledger", str(missing_ledger)],
         text=True,
+        encoding="utf-8",
         capture_output=True,
         timeout=5,
         check=False,
@@ -317,3 +318,262 @@ def test_ledger_auto_rotation_keeps_newest_half_under_byte_limit(
     events = load_events(ledger)
     assert 1 <= len(events) < 10
     assert events[-1]["conversation_id"] == "conv-rot-19"
+
+
+def test_stats_cli_aggregates_hosts_reasons_and_guardrail_count(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "scoreboard_v2.jsonl"
+    raw_events = [
+        {
+            "host": "antigravity",
+            "tier": "lite",
+            "target_model": "flash_lite",
+            "overwritten": True,
+            "reason": "read_only_simple_lookup",
+            "prompt_chars": 120,
+        },
+        {
+            "host": "codex",
+            "tier": "lite",
+            "target_model": "gpt-6-luna",
+            "overwritten": True,
+            "reason": "burst_cap_downgraded_to_lite",
+            "prompt_chars": 210,
+        },
+        {
+            "host": "claude",
+            "tier": "fast",
+            "target_model": "sonnet",
+            "overwritten": True,
+            "reason": "read_only_research_survey",
+            "prompt_chars": 340,
+        },
+        {
+            "host": "antigravity",
+            "tier": "frontier",
+            "target_model": "inherit",
+            "overwritten": False,
+            "reason": "safety_guardrail:security_or_auth",
+            "prompt_chars": 500,
+        },
+        {
+            "host": "codex",
+            "tier": "frontier",
+            "target_model": "inherit",
+            "overwritten": False,
+            "reason": "workspace_config:high_risk_keyword",
+            "prompt_chars": 400,
+        },
+        {
+            "host": "claude",
+            "tier": "frontier",
+            "target_model": "inherit",
+            "overwritten": False,
+            "reason": "workspace_config:pinned_role",
+            "prompt_chars": 300,
+        },
+        {
+            "host": "claude",
+            "tier": "lite",
+            "target_model": "haiku",
+            "overwritten": True,
+            "reason": "workspace_config:pinned_role",
+            "prompt_chars": 100,
+        },
+        # Legacy v0.1.0 row omitting host and reason
+        {
+            "tier": "frontier",
+            "target_model": "inherit",
+            "overwritten": False,
+        },
+    ]
+
+    summary = compute_summary(raw_events)
+    assert summary["hosts"] == {"antigravity": 3, "claude": 3, "codex": 2}
+    assert summary["reasons"] == {
+        "read_only_simple_lookup": 1,
+        "burst_cap_downgraded_to_lite": 1,
+        "read_only_research_survey": 1,
+        "safety_guardrail:security_or_auth": 1,
+        "workspace_config:high_risk_keyword": 1,
+        "workspace_config:pinned_role": 2,
+        "unknown": 1,
+    }
+    assert summary["guardrail_count"] == 3
+
+    board = render_ascii_scoreboard(summary, ledger)
+    assert "╭─ ⚡ downshift stats" in board
+    assert "Credit cost     all-frontier  ████████████████████  100.0%" in board
+    assert "[flash_lite / haiku / gpt-6-luna · 0.04x cost]" in board
+    assert "[flash / sonnet / gpt-6.1-sol · 0.20x cost]" in board
+    assert (
+        "Hosts & guardrails          : antigravity: 3, claude: 3, codex: 2 · 3 high-risk call(s) protected by guardrails\n"
+        in board
+    )
+    assert "Top routing reasons         : workspace_config:pinned_role: 2" in board
+
+    html_out = tmp_path / "scoreboard.html"
+    ledger.write_text(
+        "\n".join(json.dumps(ev) for ev in raw_events) + "\n", encoding="utf-8"
+    )
+    proc_html = subprocess.run(
+        [
+            sys.executable,
+            str(STATS_CLI),
+            "--ledger",
+            str(ledger),
+            "--html",
+            str(html_out),
+        ],
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    assert proc_html.returncode == 0
+    assert html_out.exists()
+    html_text = html_out.read_text(encoding="utf-8")
+    assert "Downshift Scoreboard 2.0" in html_text
+    assert "antigravity: 3, claude: 3, codex: 2" in html_text
+
+
+def test_stats_cli_clean_removes_only_zero_char_roleless_and_corrupted_rows(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "dirty_ledger.jsonl"
+    rows = [
+        json.dumps(
+            {
+                "conversation_id": "c-valid-1",
+                "role": "Codebase Researcher",
+                "prompt_chars": 320,
+                "tier": "fast",
+            }
+        ),
+        json.dumps(
+            {
+                "conversation_id": "c-role-only",
+                "role": "Git Status Checker",
+                "prompt_chars": 0,
+                "tier": "lite",
+            }
+        ),
+        json.dumps(
+            {
+                "conversation_id": "c-prompt-only",
+                "role": "",
+                "prompt_chars": 45,
+                "tier": "lite",
+            }
+        ),
+        json.dumps(
+            {
+                "conversation_id": "c-synthetic-1",
+                "role": "",
+                "prompt_chars": 0,
+                "tier": "frontier",
+            }
+        ),
+        json.dumps(
+            {
+                "conversation_id": "c-synthetic-2",
+                "role": "   ",
+                "prompt_chars": 0,
+                "tier": "frontier",
+            }
+        ),
+        "CORRUPTED_NOT_JSON",
+        "[1, 2, 3]",
+    ]
+    ledger.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [sys.executable, str(STATS_CLI), "--ledger", str(ledger), "--clean"],
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert (
+        f"Cleaned 4 synthetic/corrupted event(s) from {ledger} (3 valid event(s) retained)"
+        in proc.stdout
+    )
+    remaining = load_events(ledger)
+    assert [ev["conversation_id"] for ev in remaining] == [
+        "c-valid-1",
+        "c-role-only",
+        "c-prompt-only",
+    ]
+
+
+def test_stats_cli_clean_handles_missing_ledger(tmp_path: Path) -> None:
+    missing = tmp_path / "no_such_ledger.jsonl"
+    proc = subprocess.run(
+        [sys.executable, str(STATS_CLI), "--ledger", str(missing), "--clean"],
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert (
+        f"Cleaned 0 synthetic/corrupted event(s) from {missing} (0 valid event(s) retained)"
+        in proc.stdout
+    )
+    assert not missing.exists()
+
+
+def test_concurrent_clean_and_append_preserves_integrity(tmp_path: Path) -> None:
+    from downshift_core import clean_ledger_file
+
+    ledger = tmp_path / "concurrent_clean.jsonl"
+    # Seed 5 synthetic rows + 5 valid rows
+    seed_lines = []
+    for i in range(5):
+        seed_lines.append(
+            json.dumps({"conversation_id": f"syn-{i}", "role": "", "prompt_chars": 0})
+        )
+        seed_lines.append(
+            json.dumps(
+                {"conversation_id": f"val-{i}", "role": "Finder", "prompt_chars": 80}
+            )
+        )
+    ledger.write_text("\n".join(seed_lines) + "\n", encoding="utf-8")
+
+    def _worker(idx: int) -> None:
+        if idx % 5 == 0:
+            clean_ledger_file(ledger)
+        else:
+            record_routing_event(
+                decision=RoutingDecision(
+                    host="antigravity",
+                    tier="lite",
+                    target_model="flash_lite",
+                    should_overwrite=True,
+                    reason="read_only_simple_lookup",
+                ),
+                conversation_id=f"live-{idx}",
+                subagent_type="research",
+                role="Locator",
+                original_model="inherit",
+                ledger_path=ledger,
+                prompt_chars=64,
+            )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(_worker, range(30)))
+
+    raw_lines = [
+        ln for ln in ledger.read_text(encoding="utf-8").splitlines() if ln.strip()
+    ]
+    assert len(raw_lines) >= 5
+    for ln in raw_lines:
+        parsed = json.loads(ln)
+        assert isinstance(parsed, dict)
+        assert (
+            int(parsed.get("prompt_chars") or 0) > 0
+            or str(parsed.get("role") or "").strip() != ""
+        )

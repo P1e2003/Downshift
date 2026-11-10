@@ -137,18 +137,28 @@ Run the scoreboard CLI directly or invoke `/downshift-stats` in chat:
 
 ```text
 $ python ./scripts/stats_cli.py
-  downshift stats                   live ledger · ~/.gemini/downshift_ledger.jsonl
-
-  Total subagents intercepted : 20  (18 active, 2 shadow · 14,520 prompt chars)
-  Frontier calls saved        : 14 (70.0%)  · Est. credit cost saved: 58.4%
-  ├── Routed to lite (Tier 1) :  5 (25.0%)  [flash_lite / haiku · 0.04x cost]
-  ├── Routed to fast (Tier 2) :  9 (45.0%)  [flash / sonnet · 0.20x cost]
-  └── Kept on frontier        :  6 (30.0%)  [safety guardrail / stateful mutation · 1.00x]
+  ╭─ ⚡ downshift stats ──────────────── live ledger · ~/.gemini/downshift_ledger.jsonl
+  │
+  │  Total subagents intercepted : 20  (18 active, 2 shadow · 14,520 prompt chars)
+  │  Frontier calls saved        : 14 (70.0%)  · Est. credit cost saved: 58.4%
+  │
+  │  Credit cost     all-frontier  ████████████████████  100.0%
+  │                  with router   ████████············   41.6%   ▼ 58.4% saved
+  │
+  │  ├── Routed to lite (Tier 1) :  5 (25.0%)  ███·········  [flash_lite / haiku / gpt-6-luna · 0.04x cost]
+  │  ├── Routed to fast (Tier 2) :  9 (45.0%)  █████·······  [flash / sonnet / gpt-6.1-sol · 0.20x cost]
+  │  └── Kept on frontier        :  6 (30.0%)  ████········  [safety guardrail / stateful mutation · 1.00x]
+  │
+  │  Hosts & guardrails          : antigravity: 16, codex: 4 · 4 high-risk call(s) protected by guardrails
+  │  Top routing reasons         : read_only_research_survey: 9, read_only_simple_lookup: 4, safety_guardrail:security_or_auth: 4, burst_cap_downgraded_to_lite: 1
+  ╰───────────────────────────────────────────────────────────────────────────────────────
 ```
 
 Flags:
-- `python ./scripts/stats_cli.py --json` — Emit machine-readable JSON summary
-- `python ./scripts/stats_cli.py --reset` — Truncate/reset the local ledger
+- `python ./scripts/stats_cli.py --json` — Emit machine-readable JSON summary (`hosts`, `reasons`, `guardrail_count`, `tiers`, `models`)
+- `python ./scripts/stats_cli.py --html <path.html>` — Write a theme-aware HTML scoreboard widget for Google Antigravity `generative_ui` (`<agent-embed>`)
+- `python ./scripts/stats_cli.py --clean` — Non-destructively remove corrupted lines and synthetic empty (`prompt_chars == 0` and empty `role`) entries under an exclusive OS file lock
+- `python ./scripts/stats_cli.py --reset` — Truncate/reset the local ledger under an exclusive OS file lock
 - `python ./scripts/stats_cli.py --limit 50` — Aggregate the most recent `N` events
 
 ---
