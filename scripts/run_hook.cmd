@@ -20,24 +20,24 @@ IF NOT EXIST "!RESOLVED_SCRIPT!" GOTO :FAIL_OPEN
 
 WHERE uv >NUL 2>NUL
 IF !ERRORLEVEL! EQU 0 (
-    uv run --no-project python "!RESOLVED_SCRIPT!"
+    uv run --no-project python "!RESOLVED_SCRIPT!" %2 %3 %4 %5 %6 %7 %8 %9
     EXIT /B 0
 )
 
 IF EXIST "%USERPROFILE%\.local\bin\uv.exe" (
-    "%USERPROFILE%\.local\bin\uv.exe" run --no-project python "!RESOLVED_SCRIPT!"
+    "%USERPROFILE%\.local\bin\uv.exe" run --no-project python "!RESOLVED_SCRIPT!" %2 %3 %4 %5 %6 %7 %8 %9
     EXIT /B 0
 )
 
 IF EXIST "%USERPROFILE%\.cargo\bin\uv.exe" (
-    "%USERPROFILE%\.cargo\bin\uv.exe" run --no-project python "!RESOLVED_SCRIPT!"
+    "%USERPROFILE%\.cargo\bin\uv.exe" run --no-project python "!RESOLVED_SCRIPT!" %2 %3 %4 %5 %6 %7 %8 %9
     EXIT /B 0
 )
 
 FOR /F "delims=" %%P IN ('WHERE python3 2^>NUL') DO (
     ECHO "%%P" | FINDSTR /I "WindowsApps" >NUL
     IF !ERRORLEVEL! NEQ 0 (
-        "%%P" "!RESOLVED_SCRIPT!"
+        "%%P" "!RESOLVED_SCRIPT!" %2 %3 %4 %5 %6 %7 %8 %9
         EXIT /B 0
     )
 )
@@ -45,14 +45,14 @@ FOR /F "delims=" %%P IN ('WHERE python3 2^>NUL') DO (
 FOR /F "delims=" %%P IN ('WHERE python 2^>NUL') DO (
     ECHO "%%P" | FINDSTR /I "WindowsApps" >NUL
     IF !ERRORLEVEL! NEQ 0 (
-        "%%P" "!RESOLVED_SCRIPT!"
+        "%%P" "!RESOLVED_SCRIPT!" %2 %3 %4 %5 %6 %7 %8 %9
         EXIT /B 0
     )
 )
 
 WHERE py >NUL 2>NUL
 IF !ERRORLEVEL! EQU 0 (
-    py -3 "!RESOLVED_SCRIPT!"
+    py -3 "!RESOLVED_SCRIPT!" %2 %3 %4 %5 %6 %7 %8 %9
     EXIT /B 0
 )
 

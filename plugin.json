@@ -1,6 +1,6 @@
 {
   "name": "downshift",
-  "version": "0.2.5",
+  "version": "0.3.0",
   "description": "Zero-dependency lifecycle hook plugin that routes read-only subagent research and test/lint execution to fast lightweight models (Flash / Flash Lite / Haiku / Sonnet / GPT-6-Luna / GPT-6.1-Sol) while preserving frontier models for architecture, concurrency, migrations, and code mutations.",
   "skills": "./skills",
   "rules": "./rules",

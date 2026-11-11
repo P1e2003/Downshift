@@ -23,7 +23,7 @@ def test_all_manifests_parse_and_share_name_and_version() -> None:
         assert path.exists(), f"Missing manifest: {path}"
         data = json.loads(path.read_text(encoding="utf-8"))
         assert data["name"] == "downshift"
-        assert data["version"] == "0.2.5"
+        assert data["version"] == "0.3.0"
         assert data.get("description")
         loaded.append(data)
 
@@ -107,6 +107,13 @@ def test_skills_have_valid_frontmatter() -> None:
         frontmatter = text.split("---\n", 2)[1]
         assert "name:" in frontmatter
         assert "description:" in frontmatter
+
+    stats_skill = (ROOT / "skills" / "downshift-stats" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    assert "python ./scripts/stats_cli.py" not in stats_skill
+    assert '"./scripts/run_hook.cmd" ./scripts/stats_cli.py --html' in stats_skill
+    assert "only if the user explicitly" in stats_skill.lower()
 
 
 def test_benchmark_suite_passes_100_percent_accuracy_and_zero_false_downgrades() -> (

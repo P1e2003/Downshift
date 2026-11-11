@@ -9,16 +9,16 @@ description: >
 
 # Downshift Stats
 
-1. Run the scoreboard CLI and display its box-drawn output verbatim in a fenced `text` block:
+1. **Default (1 tool call)**: Run the scoreboard CLI once and display its box-drawn output verbatim in a fenced `text` block (do **not** generate or write an HTML file unless requested):
 
 ```bash
 "./scripts/run_hook.cmd" ./scripts/stats_cli.py
 ```
 
-2. **On Google Antigravity (`generative_ui`)**: Also generate the compact interactive HTML widget card into your conversation artifact directory and embed it inline below the text block:
+2. **Optional HTML widget (`generative_ui`)**: Only if the user explicitly asks for an interactive HTML widget/card on Google Antigravity, generate and embed it:
 
 ```bash
-python ./scripts/stats_cli.py --html "<artifact_dir>/downshift_scoreboard.html"
+"./scripts/run_hook.cmd" ./scripts/stats_cli.py --html "<artifact_dir>/downshift_scoreboard.html"
 ```
 
 Then include `<agent-embed src="file:///<artifact_dir>/downshift_scoreboard.html"></agent-embed>` in your response (after calling `write_file` with `UserFacing: true` if required by the host).
