@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -24,6 +25,12 @@ from stats_cli import (
 )
 
 STATS_CLI = ROOT / "scripts" / "stats_cli.py"
+RUN_HOOK_CMD = ROOT / "scripts" / "run_hook.cmd"
+
+
+def _launcher_args(*extra: str) -> list[str]:
+    base = [str(RUN_HOOK_CMD), "./scripts/stats_cli.py", *extra]
+    return base if os.name == "nt" else ["sh", *base]
 
 
 def test_record_routing_event_writes_valid_jsonl_without_prompt(tmp_path: Path) -> None:
@@ -577,3 +584,118 @@ def test_concurrent_clean_and_append_preserves_integrity(tmp_path: Path) -> None
             int(parsed.get("prompt_chars") or 0) > 0
             or str(parsed.get("role") or "").strip() != ""
         )
+
+
+def test_run_hook_launcher_forwards_cli_flags(tmp_path: Path) -> None:
+    ledger = tmp_path / "launcher_flags.jsonl"
+    ledger.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "conversation_id": "valid-1",
+                        "host": "antigravity",
+                        "tier": "lite",
+                        "target_model": "flash_lite",
+                        "overwritten": True,
+                        "reason": "read_only_simple_lookup",
+                        "role": "File Locator",
+                        "prompt_chars": 42,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "conversation_id": "synthetic-1",
+                        "role": "",
+                        "prompt_chars": 0,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    isolated_env = {
+        **os.environ,
+        "DOWNSHIFT_LEDGER_PATH": str(tmp_path / "isolated_env.jsonl"),
+    }
+
+    proc_json = subprocess.run(
+        _launcher_args("--ledger", str(ledger), "--json"),
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        env=isolated_env,
+        timeout=15,
+        check=False,
+    )
+    assert proc_json.returncode == 0, proc_json.stderr
+    summary = json.loads(proc_json.stdout)
+    assert summary["total"] == 2
+
+    proc_clean = subprocess.run(
+        _launcher_args("--ledger", str(ledger), "--clean"),
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        env=isolated_env,
+        timeout=15,
+        check=False,
+    )
+    assert proc_clean.returncode == 0, proc_clean.stderr
+    assert "Cleaned 1 synthetic/corrupted event(s)" in proc_clean.stdout
+    assert "(1 valid event(s) retained)" in proc_clean.stdout
+
+    proc_reset = subprocess.run(
+        _launcher_args("--ledger", str(ledger), "--reset"),
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        env=isolated_env,
+        timeout=15,
+        check=False,
+    )
+    assert proc_reset.returncode == 0, proc_reset.stderr
+    assert f"Reset Downshift ledger at {ledger}" in proc_reset.stdout
+    assert ledger.read_text(encoding="utf-8") == ""
+
+
+def test_run_hook_launcher_preserves_paths_with_spaces(tmp_path: Path) -> None:
+    spaced_dir = tmp_path / "dir with spaces"
+    spaced_dir.mkdir(parents=True)
+    ledger = spaced_dir / "my ledger.jsonl"
+    html_out = spaced_dir / "scoreboard card.html"
+    record_routing_event(
+        decision=RoutingDecision(
+            host="codex",
+            tier="lite",
+            target_model="gpt-6-luna",
+            should_overwrite=True,
+            reason="read_only_simple_lookup",
+        ),
+        conversation_id="c-space-1",
+        subagent_type="spawn_agent",
+        role="Locator",
+        original_model="inherit",
+        ledger_path=ledger,
+        prompt_chars=55,
+    )
+
+    proc_html = subprocess.run(
+        _launcher_args("--ledger", str(ledger), "--html", str(html_out)),
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        env={
+            **os.environ,
+            "DOWNSHIFT_LEDGER_PATH": str(tmp_path / "isolated_space_env.jsonl"),
+        },
+        timeout=15,
+        check=False,
+    )
+    assert proc_html.returncode == 0, proc_html.stderr
+    assert html_out.exists()
+    html_text = html_out.read_text(encoding="utf-8")
+    assert "Downshift Scoreboard 2.0" in html_text
+    assert "codex: 1" in html_text
