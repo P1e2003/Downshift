@@ -113,7 +113,10 @@ def test_skills_have_valid_frontmatter() -> None:
     )
     assert "python ./scripts/stats_cli.py" not in stats_skill
     assert '"./scripts/run_hook.cmd" ./scripts/stats_cli.py --html' in stats_skill
-    assert "only if the user explicitly" in stats_skill.lower()
+    assert "<agent-embed" in stats_skill
+    assert "userfacing: true" in stats_skill.lower()
+    assert "by default" in stats_skill.lower()
+    assert "only if the user explicitly" not in stats_skill.lower()
 
 
 def test_benchmark_suite_passes_100_percent_accuracy_and_zero_false_downgrades() -> (

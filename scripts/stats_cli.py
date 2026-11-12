@@ -26,6 +26,22 @@ def _render_bar(pct: float, width: int = 20) -> str:
     return ("█" * filled) + ("·" * (width - filled))
 
 
+def _truncate_cell(value: str, max_len: int = 53) -> str:
+    """Clamp a single-line scoreboard field so 35-col prefix + value stays <= 88 cols."""
+    return value if len(value) <= max_len else value[: max_len - 1] + "…"
+
+
+def _format_top_reasons(reasons: dict[str, Any], limit: int = 4) -> str:
+    """Format top routing reasons in descending count order."""
+    return (
+        ", ".join(
+            f"{r}: {c}"
+            for r, c in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+        )
+        or "none"
+    )
+
+
 def load_events(ledger_path: Path, limit: int | None = None) -> list[dict[str, Any]]:
     """Read valid JSON objects from the JSONL ledger, skipping corrupted lines."""
     if not ledger_path.exists():
@@ -125,7 +141,7 @@ def render_ascii_scoreboard(summary: dict[str, Any], ledger_path: Path) -> str:
         return (
             f"  ╭─ ⚡ downshift stats ──────────────── live ledger · {ledger_path}\n"
             "  │  0 subagents intercepted yet.\n"
-            "  ╰───────────────────────────────────────────────────────────────────────────────────────\n"
+            "  ╰─────────────────────────────────────────────────────────────────────────────────────\n"
         )
 
     saved = int(summary["saved"])
@@ -142,14 +158,8 @@ def render_ascii_scoreboard(summary: dict[str, Any], ledger_path: Path) -> str:
     hosts = summary.get("hosts") or {}
     host_summary = ", ".join(f"{h}: {c}" for h, c in sorted(hosts.items())) or "none"
     guardrail_count = int(summary.get("guardrail_count", 0))
-    reasons = summary.get("reasons") or {}
-    top_reasons = (
-        ", ".join(
-            f"{r}: {c}"
-            for r, c in sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))[:4]
-        )
-        or "none"
-    )
+    host_line = _truncate_cell(f"{host_summary} · {guardrail_count} guardrail(s)")
+    top_reasons = _truncate_cell(_format_top_reasons(summary.get("reasons") or {}))
 
     lite_pct = round((lite / total) * 100.0, 1)
     fast_pct = round((fast / total) * 100.0, 1)
@@ -157,9 +167,9 @@ def render_ascii_scoreboard(summary: dict[str, Any], ledger_path: Path) -> str:
 
     baseline_bar = _render_bar(100.0, 20)
     router_bar = _render_bar(router_cost_pct, 20)
-    lite_bar = _render_bar(lite_pct, 12)
-    fast_bar = _render_bar(fast_pct, 12)
-    frontier_bar = _render_bar(frontier_pct, 12)
+    lite_bar = _render_bar(lite_pct, 10)
+    fast_bar = _render_bar(fast_pct, 10)
+    frontier_bar = _render_bar(frontier_pct, 10)
 
     return (
         f"  ╭─ ⚡ downshift stats ──────────────── live ledger · {ledger_path}\n"
@@ -170,13 +180,13 @@ def render_ascii_scoreboard(summary: dict[str, Any], ledger_path: Path) -> str:
         f"  │  Credit cost     all-frontier  {baseline_bar}  100.0%\n"
         f"  │                  with router   {router_bar}  {router_cost_pct:5.1f}%   ▼ {est_cost_saved_pct:.1f}% saved\n"
         "  │\n"
-        f"  │  ├── Routed to lite (Tier 1) : {lite:2d} ({lite_pct:.1f}%)  {lite_bar}  [flash_lite / haiku / gpt-6-luna · 0.04x cost]\n"
-        f"  │  ├── Routed to fast (Tier 2) : {fast:2d} ({fast_pct:.1f}%)  {fast_bar}  [flash / sonnet / gpt-6.1-sol · 0.20x cost]\n"
-        f"  │  └── Kept on frontier        : {frontier:2d} ({frontier_pct:.1f}%)  {frontier_bar}  [safety guardrail / stateful mutation · 1.00x]\n"
+        f"  │  ├── Routed to lite (Tier 1) : {lite:2d} ({lite_pct:.1f}%) {lite_bar} [flash_lite/haiku/luna 0.04x]\n"
+        f"  │  ├── Routed to fast (Tier 2) : {fast:2d} ({fast_pct:.1f}%) {fast_bar} [flash/sonnet/sol · 0.20x]\n"
+        f"  │  └── Kept on frontier        : {frontier:2d} ({frontier_pct:.1f}%) {frontier_bar} [guardrail/stateful · 1.00x]\n"
         "  │\n"
-        f"  │  Hosts & guardrails          : {host_summary} · {guardrail_count} high-risk call(s) protected by guardrails\n"
+        f"  │  Hosts & guardrails          : {host_line}\n"
         f"  │  Top routing reasons         : {top_reasons}\n"
-        "  ╰───────────────────────────────────────────────────────────────────────────────────────\n"
+        "  ╰─────────────────────────────────────────────────────────────────────────────────────\n"
     )
 
 
@@ -202,6 +212,7 @@ def render_html_widget(summary: dict[str, Any], ledger_path: Path) -> str:
     guardrail_count = int(summary.get("guardrail_count", 0))
     esc_path = html.escape(str(ledger_path))
     esc_hosts = html.escape(host_summary)
+    esc_reasons = html.escape(_format_top_reasons(summary.get("reasons") or {}))
 
     return f"""<!DOCTYPE html>
 <html>
@@ -268,6 +279,11 @@ def render_html_widget(summary: dict[str, Any], ledger_path: Path) -> str:
       <div class="w-full h-2 rounded-full bg-[var(--background)] overflow-hidden border border-[var(--border)]">
         <div class="h-full bg-amber-400 rounded-full" style="width: {frontier_pct:.1f}%"></div>
       </div>
+    </div>
+
+    <div class="pt-2 border-t border-[var(--border)] flex items-center justify-between gap-3 text-xs text-[var(--muted-foreground)]">
+      <span class="shrink-0 font-medium">Top routing reasons</span>
+      <span class="font-mono truncate" title="{esc_reasons}">{esc_reasons}</span>
     </div>
   </div>
 </body>
