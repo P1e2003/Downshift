@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from downshift_core import (
+    CODEX_TIER_REASONING_EFFORT,
     DownshiftConfig,
     RoutingDecision,
     classify_subagent_call,
@@ -1267,3 +1268,225 @@ def test_burst_cap_skips_empty_conversation_id_and_respects_zero_config(
         )
         assert eff_disabled.tier == "fast"
         assert eff_disabled.reason == "promoted_to_fast:multi_file_or_long_prompt"
+
+
+def test_inline_effort_tags_low_medium_high_route_across_hosts() -> None:
+    assert CODEX_TIER_REASONING_EFFORT == {
+        "lite": "low",
+        "fast": "medium",
+        "frontier": "high",
+    }
+
+    # 1. @low / @medium / @high (case-insensitive, Role or Prompt) route across all 3 hosts (FR-001, SC-001)
+    expected_models = {
+        "antigravity": {"lite": "flash_lite", "fast": "flash", "frontier": "inherit"},
+        "claude": {"lite": "haiku", "fast": "sonnet", "frontier": "inherit"},
+        "codex": {"lite": "gpt-6-luna", "fast": "gpt-6.1-sol", "frontier": "inherit"},
+    }
+    for host, tier_models in expected_models.items():
+        low_dec = classify_subagent_call(
+            type_name="self",
+            role="Slice Helper @LOW",
+            prompt="Inspect module structure",
+            current_model="inherit",
+            host=host,
+        )
+        assert low_dec.tier == "lite"
+        assert low_dec.target_model == tier_models["lite"]
+        assert low_dec.should_overwrite is True
+        assert low_dec.reason == "inline_override:lite"
+
+        med_dec = classify_subagent_call(
+            type_name="self",
+            role="Slice Helper",
+            prompt="Summarize module boundaries @Medium",
+            current_model="inherit",
+            host=host,
+        )
+        assert med_dec.tier == "fast"
+        assert med_dec.target_model == tier_models["fast"]
+        assert med_dec.should_overwrite is True
+        assert med_dec.reason == "inline_override:fast"
+
+        high_dec = classify_subagent_call(
+            type_name="research",
+            role="Deep Locator",
+            prompt="Find file where resolve_contact is defined @HIGH",
+            current_model="inherit",
+            host=host,
+        )
+        assert high_dec.tier == "frontier"
+        assert high_dec.target_model == "inherit"
+        assert high_dec.should_overwrite is False
+        assert high_dec.reason == "inline_override:frontier"
+
+    # 2. @high upgrades explicit lower-tier models to inherit (should_overwrite=True) & suppresses PreInvocation nudge
+    upgraded_high = classify_subagent_call(
+        type_name="spawn_agent",
+        role="Critical Verifier @high",
+        prompt="Locate file definitions",
+        current_model="gpt-6-luna",
+        host="codex",
+    )
+    assert upgraded_high.tier == "frontier"
+    assert upgraded_high.target_model == "inherit"
+    assert upgraded_high.should_overwrite is True
+    assert upgraded_high.reason == "inline_override:frontier"
+
+    same_low = classify_subagent_call(
+        type_name="spawn_agent",
+        role="Helper @low",
+        prompt="Check lines",
+        current_model="gpt-6-luna",
+        host="codex",
+    )
+    assert same_low.tier == "lite"
+    assert same_low.target_model == "gpt-6-luna"
+    assert same_low.should_overwrite is False
+
+    nudge_suppressed = classify_user_prompt(
+        "Map out the issue across backend and frontend @high",
+        invocation_num=1,
+        host="codex",
+    )
+    assert nudge_suppressed.should_inject is False
+    assert nudge_suppressed.reason == "high_risk_or_frontier_tag"
+
+    # 3. Word-boundary collisions (emails, prefixes) must NOT match @low / @medium / @high
+    for non_tag_prompt in (
+        "Update default config for user@localhost in settings",
+        "Set threshold to @lowest allowed value",
+        "Check @medium_rare enum constant",
+    ):
+        non_tag_dec = classify_subagent_call(
+            type_name="self",
+            role="Engineer",
+            prompt=non_tag_prompt,
+            current_model="inherit",
+            host="antigravity",
+        )
+        assert non_tag_dec.tier == "frontier"
+        assert non_tag_dec.reason == "frontier_default_stateful_work"
+
+    highlight_lookup = classify_subagent_call(
+        type_name="research",
+        role="Locator",
+        prompt="Find file where @highlight decorator is defined",
+        current_model="inherit",
+        host="antigravity",
+    )
+    assert highlight_lookup.tier == "lite"
+    assert highlight_lookup.reason == "read_only_simple_lookup"
+
+    # 4. Multi-tag conflict order: @high > @medium > @low across combined Role + Prompt (FR-001 Q3)
+    low_and_med = classify_subagent_call(
+        type_name="self",
+        role="Worker @low",
+        prompt="Analyze callers across module @medium",
+        current_model="inherit",
+        host="codex",
+    )
+    assert low_and_med.tier == "fast"
+    assert low_and_med.target_model == "gpt-6.1-sol"
+    assert low_and_med.reason == "inline_override:fast"
+
+    med_and_high = classify_subagent_call(
+        type_name="research",
+        role="Worker @medium",
+        prompt="Locate symbol @high",
+        current_model="inherit",
+        host="claude",
+    )
+    assert med_and_high.tier == "frontier"
+    assert med_and_high.reason == "inline_override:frontier"
+
+    # 5. High-risk safety guardrails block ALL lower-tier inline tags uniformly (FR-002 Q1, SC-002)
+    guardrail_cfg = DownshiftConfig(
+        high_risk_keywords=("vietmoney_vault",),
+        pinned_roles={"Security Auditor": "frontier"},
+    )
+    for tag in (
+        "@low",
+        "@medium",
+        "@lite",
+        "@flash_lite",
+        "@haiku",
+        "@fast",
+        "@flash",
+        "@sonnet",
+        "@downshift",
+    ):
+        blocked_builtin = classify_subagent_call(
+            type_name="research",
+            role=f"Helper {tag}",
+            prompt="Audit alembic migration and FOR UPDATE lock contention",
+            current_model="gpt-6-luna",
+            host="codex",
+            config=guardrail_cfg,
+        )
+        assert blocked_builtin.tier == "frontier", (
+            f"Tag {tag} bypassed safety guardrail"
+        )
+        assert blocked_builtin.target_model == "inherit"
+        assert blocked_builtin.should_overwrite is True
+        assert blocked_builtin.reason.startswith("safety_guardrail:")
+
+        blocked_custom = classify_subagent_call(
+            type_name="research",
+            role="Helper",
+            prompt=f"Inspect vietmoney_vault settlement flow {tag}",
+            current_model="inherit",
+            host="antigravity",
+            config=guardrail_cfg,
+        )
+        assert blocked_custom.tier == "frontier"
+        assert blocked_custom.should_overwrite is False
+        assert blocked_custom.reason == "workspace_config:high_risk_keyword"
+
+        blocked_pinned = classify_subagent_call(
+            type_name="research",
+            role="Security Auditor",
+            prompt=f"Locate helper constants {tag}",
+            current_model="inherit",
+            host="claude",
+            config=guardrail_cfg,
+        )
+        assert blocked_pinned.tier == "frontier"
+        assert blocked_pinned.reason == "workspace_config:pinned_role"
+
+    # 6. Safe untagged explicit lower-tier models preserve their native lite/fast tier (FR-004 Q2)
+    preserved_luna = classify_subagent_call(
+        type_name="spawn_agent",
+        role="Worker",
+        prompt="Summarize module notes",
+        current_model="gpt-6-luna",
+        host="codex",
+    )
+    assert preserved_luna.tier == "lite"
+    assert preserved_luna.target_model == "gpt-6-luna"
+    assert preserved_luna.should_overwrite is False
+    assert preserved_luna.reason == "caller_explicit_model_preserved"
+
+    preserved_sol = classify_subagent_call(
+        type_name="spawn_agent",
+        role="Worker",
+        prompt="Find file where resolve_contact is defined",
+        current_model="gpt-6.1-sol",
+        host="codex",
+    )
+    assert preserved_sol.tier == "fast"
+    assert preserved_sol.target_model == "gpt-6.1-sol"
+    assert preserved_sol.should_overwrite is False
+    assert preserved_sol.reason == "caller_explicit_model_preserved"
+
+    preserved_custom = classify_subagent_call(
+        type_name="spawn_agent",
+        role="Worker",
+        prompt="Find file where resolve_contact is defined",
+        current_model="o3-pro",
+        host="codex",
+    )
+    assert preserved_custom.tier == "frontier"
+    assert preserved_custom.target_model == "o3-pro"
+    assert preserved_custom.should_overwrite is False
+    assert preserved_custom.reason == "caller_explicit_model_preserved"

@@ -30,7 +30,7 @@ flowchart LR
 | :--- | :--- | :--- | :--- | :--- |
 | **Tier 1 (`lite`)** | `flash_lite` | `haiku` | `gpt-6-luna` (`low`) | Bounded file/symbol locating (`find file`, `where is`, `locate`), `git status`, `git branch`, directory listing, line counting |
 | **Tier 2 (`fast`)** | `flash` | `sonnet` | `gpt-6.1-sol` (`medium`) | Multi-file codebase surveys (`research` / `Explore`), caller tracing, log scanning, and pure test/lint/build verification (`pytest`, `vitest`, `ruff`, `eslint`, `npm run build`) |
-| **Tier 3 (`frontier`)** | `inherit` | `inherit` | `inherit` (`gpt-6-astra`) | Architecture design, stateful code mutations, database migrations, concurrency/locking, and security/auth |
+| **Tier 3 (`frontier`)** | `inherit` | `inherit` | `inherit` (`gpt-6-astra`, `high`) | Architecture design, stateful code mutations, database migrations, concurrency/locking, and security/auth |
 
 ### Hard Safety Guardrails (Never Downshifted)
 
@@ -61,13 +61,13 @@ When a first-turn user prompt asks to map out an issue, compare a specification 
 
 ## Inline `@tag` Overrides
 
-Override Downshift's heuristics on any prompt or subagent call:
+Override Downshift's heuristics on any prompt or subagent call (universal effort hand-out tags `@high`, `@medium`, and `@low` work identically across Google Antigravity, Claude Code, and OpenAI Codex; when multiple tags appear, `@high` > `@medium` > `@low` wins, and high-risk safety guardrails always block lower-tier tags):
 
 | Inline Tag | Effect |
 | :--- | :--- |
-| `@pro`, `@opus`, `@frontier`, `@inherit` | Force **Tier 3 (`frontier`)** — never downshift |
-| `@flash`, `@sonnet`, `@fast`, `@downshift` | Force **Tier 2 (`fast`)** (`flash` / `sonnet`) |
-| `@flash_lite`, `@lite`, `@haiku` | Force **Tier 1 (`lite`)** (`flash_lite` / `haiku`) |
+| `@high`, `@pro`, `@opus`, `@frontier`, `@inherit` | Force **Tier 3 (`frontier` / `high` effort)** — never downshift (upgrades explicit lower-tier models to `inherit`) |
+| `@medium`, `@flash`, `@sonnet`, `@fast`, `@downshift` | Route safe tasks to **Tier 2 (`fast` / `medium` effort)** (`flash` / `sonnet` / `gpt-6.1-sol`) — blocked by safety guardrails |
+| `@low`, `@flash_lite`, `@lite`, `@haiku` | Route safe tasks to **Tier 1 (`lite` / `low` effort)** (`flash_lite` / `haiku` / `gpt-6-luna`) — blocked by safety guardrails |
 
 ---
 
@@ -101,7 +101,7 @@ Example `.downshift.json` at the workspace root:
 }
 ```
 
-- **Precedence:** Inline `@tag` > explicit non-`inherit` model > `pinned_roles` mapped to `"frontier"` > built-in & custom `high_risk_keywords` safety guardrail > `pinned_roles` mapped to `"lite"` / `"fast"` > heuristic classification.
+- **Precedence:** Frontier `@high` / `@frontier` tag > explicit custom non-lower-tier model > `pinned_roles` mapped to `"frontier"` > built-in & custom `high_risk_keywords` safety guardrails > lower-tier `@medium` / `@low` inline tags (`@high` > `@medium` > `@low`) > explicit lower-tier model preservation > `pinned_roles` mapped to `"lite"` / `"fast"` > heuristic classification.
 - **Portable Hook Launcher:** `hooks.json` and `hooks/claude-codex-hooks.json` invoke `./scripts/run_hook.cmd` (which delegates to `scripts/run_hook.sh` on POSIX), resolving the plugin's `scripts/` directory relative to the launcher location and automatically discovering `uv`, `python3`, `python`, or `py -3` with fail-open fallback.
 
 ---

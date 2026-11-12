@@ -8,7 +8,7 @@ Always follow these model-tier delegation rules when spawning subagents (`invoke
 | :--- | :--- | :--- | :--- | :--- |
 | **Tier 1 (`lite`)** | `flash_lite` | `haiku` | `gpt-6-luna` (`low`) | Bounded read-only lookups: locating files, checking `git status` / `git branch`, listing directory contents, counting lines, or finding where a symbol is defined. |
 | **Tier 2 (`fast`)** | `flash` | `sonnet` | `gpt-6.1-sol` (`medium`) | Broad read-only codebase surveys (`research` / `Explore` / `spawn_agent`), tracing callers across modules, log scanning, and running pure test/lint/build verification (`pytest`, `vitest`, `ruff`, `eslint`, `npm run build`). |
-| **Tier 3 (`frontier`)** | `inherit` | `inherit` | `inherit` (`gpt-6-astra`) | Architecture design, multi-file stateful code mutations, database migrations (`alembic`), concurrency/locking (`FOR UPDATE`, `advisory lock`, `savepoint`, `deadlock`), and security/auth/permission logic. |
+| **Tier 3 (`frontier`)** | `inherit` | `inherit` | `inherit` (`gpt-6-astra`, `high`) | Architecture design, multi-file stateful code mutations, database migrations (`alembic`), concurrency/locking (`FOR UPDATE`, `advisory lock`, `savepoint`, `deadlock`), and security/auth/permission logic. |
 
 ## 2. Delegate Mechanical Exploration & Parallel Multi-Subagent Fan-Out
 
@@ -37,7 +37,9 @@ When mapping a new issue, auditing a plugin/repository, or comparing a specifica
 
 Include any of these inline tags in a prompt or subagent `Role`/`Prompt` to override heuristic routing:
 
-- `@pro`, `@opus`, `@frontier`, `@inherit` — Force **Tier 3 (`frontier`)**; never downshift.
-- `@flash`, `@sonnet`, `@fast`, `@downshift` — Force **Tier 2 (`fast`)**.
-- `@flash_lite`, `@lite`, `@haiku` — Force **Tier 1 (`lite`)**.
+- `@high`, `@pro`, `@opus`, `@frontier`, `@inherit` — Force **Tier 3 (`frontier` / `high` effort)**; never downshift (upgrades explicit lower-tier models to `inherit`).
+- `@medium`, `@flash`, `@sonnet`, `@fast`, `@downshift` — Route safe tasks to **Tier 2 (`fast` / `medium` effort)**; blocked by high-risk safety guardrails.
+- `@low`, `@flash_lite`, `@lite`, `@haiku` — Route safe tasks to **Tier 1 (`lite` / `low` effort)**; blocked by high-risk safety guardrails.
+
+When multiple inline tags appear in the same subagent call, the highest tier wins (`@high` > `@medium` > `@low`).
 
