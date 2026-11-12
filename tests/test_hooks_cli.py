@@ -734,7 +734,7 @@ def test_pre_invocation_cli_parallel_fan_out_advisory(tmp_path: Path) -> None:
     )
     assert code_agy == 0
     msg_agy = data_agy["injectSteps"][0]["ephemeralMessage"]
-    assert "4-step parallel fan-out" in msg_agy
+    assert "7-stage v2" in msg_agy
     assert "invoke_subagent" in msg_agy
     assert "flash_lite/flash" in msg_agy
 
@@ -749,7 +749,7 @@ def test_pre_invocation_cli_parallel_fan_out_advisory(tmp_path: Path) -> None:
     )
     assert code_claude == 0
     msg_claude = data_claude["hookSpecificOutput"]["additionalContext"]
-    assert "4-step parallel fan-out" in msg_claude
+    assert "7-stage v2" in msg_claude
     assert "Task/Explore" in msg_claude
     assert "Haiku/Sonnet" in msg_claude
 
@@ -765,7 +765,7 @@ def test_pre_invocation_cli_parallel_fan_out_advisory(tmp_path: Path) -> None:
     )
     assert code_codex == 0
     msg_codex = data_codex["hookSpecificOutput"]["additionalContext"]
-    assert "4-step parallel fan-out" in msg_codex
+    assert "7-stage v2" in msg_codex
     assert "spawn_agent" in msg_codex
     assert "gpt-6-luna/gpt-6.1-sol" in msg_codex
 
@@ -1451,3 +1451,119 @@ def test_antigravity_and_claude_never_emit_reasoning_effort(tmp_path: Path) -> N
         doc_text = (ROOT / doc_rel).read_text(encoding="utf-8")
         for effort_tag in ("@high", "@medium", "@low"):
             assert effort_tag in doc_text, f"Missing {effort_tag} in {doc_rel}"
+
+
+def test_pre_invocation_cli_7_stage_v2_orchestration_advisory(tmp_path: Path) -> None:
+    common_substrings = (
+        "7-stage v2",
+        "<=2",
+        "2-4",
+        "@low",
+        "@medium",
+        "@high",
+        "<=15",
+        "reconcile cross-layer boundary contracts",
+        "2-retry",
+    )
+
+    # 1. Antigravity PreInvocation on concise <15-char EN issue-drafting prompt
+    rc_agy, out_agy = _run_hook(
+        PRE_INVOCATION,
+        {
+            "conversationId": "conv-7stage-agy",
+            "invocationNum": 1,
+            "lastUserInput": "draft an issue",
+        },
+    )
+    assert rc_agy == 0
+    assert "systemMessage" not in out_agy
+    msg_agy = out_agy["injectSteps"][0]["ephemeralMessage"]
+    for sub in (*common_substrings, "invoke_subagent", "flash_lite/flash"):
+        assert sub in msg_agy
+
+    # 2. Claude Code UserPromptSubmit on accented VI planning + breakdown prompt with @medium preserved
+    rc_claude, out_claude = _run_hook(
+        PRE_INVOCATION,
+        {
+            "session_id": "sess-7stage-claude",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "Lên kế hoạch tính năng mới và chia nhỏ task @medium",
+        },
+    )
+    assert rc_claude == 0
+    assert "systemMessage" not in out_claude
+    msg_claude = out_claude["hookSpecificOutput"]["additionalContext"]
+    for sub in (*common_substrings, "Task/Explore", "Haiku/Sonnet"):
+        assert sub in msg_claude
+
+    # 3. OpenAI Codex UserPromptSubmit via PLUGIN_DATA on unaccented VI drafting + planning prompt
+    rc_codex, out_codex = _run_hook(
+        PRE_INVOCATION,
+        {
+            "session_id": "sess-7stage-codex",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "soan issue va lap ke hoach",
+        },
+        extra_env={"PLUGIN_DATA": str(tmp_path)},
+    )
+    assert rc_codex == 0
+    msg_codex = out_codex["hookSpecificOutput"]["additionalContext"]
+    for sub in (*common_substrings, "spawn_agent", "gpt-6-luna/gpt-6.1-sol"):
+        assert sub in msg_codex
+
+    # 4. Suppression checks: @high tag, built-in high-risk, Turn 2+, hints:false, shadow, off -> {}
+    for suppressed_payload in (
+        {
+            "conversationId": "conv-high-tag",
+            "invocationNum": 1,
+            "lastUserInput": "plan out this feature @high",
+        },
+        {
+            "conversationId": "conv-high-risk",
+            "invocationNum": 1,
+            "lastUserInput": "draft an issue for alembic migration",
+        },
+        {
+            "conversationId": "conv-turn2",
+            "invocationNum": 2,
+            "lastUserInput": "plan out this feature",
+        },
+    ):
+        rc_sup, out_sup = _run_hook(PRE_INVOCATION, suppressed_payload)
+        assert rc_sup == 0
+        assert out_sup == {}
+
+    for cfg_idx, cfg_obj in enumerate(
+        (
+            {"mode": "active", "hints": False},
+            {"mode": "shadow", "hints": True},
+            {"mode": "off", "hints": True},
+            {"mode": "active", "hints": True, "high_risk_keywords": ["pawn_vault"]},
+        )
+    ):
+        ws = tmp_path / f"ws_cfg_{cfg_idx}"
+        ws.mkdir()
+        (ws / ".downshift.json").write_text(json.dumps(cfg_obj), encoding="utf-8")
+        rc_cfg, out_cfg = _run_hook(
+            PRE_INVOCATION,
+            {
+                "session_id": f"sess-cfg-{cfg_idx}",
+                "hook_event_name": "UserPromptSubmit",
+                "cwd": str(ws),
+                "prompt": "plan out this feature for pawn_vault",
+            },
+        )
+        assert rc_cfg == 0
+        assert out_cfg == {}
+
+    # 5. All 3 policy/docs surfaces document the 7-Stage v2 lifecycle, hand-back & 2-retry circuit breaker (SC-003)
+    for doc_rel in ("rules/AGENTS.md", "skills/downshift-help/SKILL.md", "README.md"):
+        doc_plain = (ROOT / doc_rel).read_text(encoding="utf-8").replace("`", "")
+        assert "4-Step Parallel Multi-Subagent Fan-Out" not in doc_plain
+        for required_term in (
+            "7-Stage v2",
+            "0 subagents",
+            "Boundary Contract",
+            "2-retry circuit breaker",
+        ):
+            assert required_term in doc_plain, f"Missing {required_term!r} in {doc_rel}"

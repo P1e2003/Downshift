@@ -131,12 +131,23 @@ CODE_MUTATION_RE = re.compile(
 
 PARALLEL_MAP_NUDGE_RE = re.compile(
     r"\b("
-    r"map\s+out\s+(?:the\s+)?(?:issue|spec|feature|pr|task)|"
+    r"draft\s+(?:out\s+)?(?:an?\s+|the\s+|this\s+|these\s+)?(?:new\s+)?(?:issues?|specs?)|"
+    r"plan\s+(?:out\s+)?(?:an?\s+|the\s+|this\s+|these\s+)?(?:new\s+)?(?:issues?|features?|specs?|implementations?|workflows?)|"
+    r"break\s+down\s+(?:an?\s+|the\s+|this\s+|these\s+)?(?:new\s+)?(?:issues?|features?|specs?|tasks?)|"
+    r"(?:allocate|assign)\s+subagents?|(?:split|divide)\s+(?:into\s+)?(?:slices?|subagents?)|"
+    r"map\s+out\s+(?:an?\s+|the\s+|this\s+|these\s+)?(?:new\s+)?(?:issues?|specs?|features?|prs?|tasks?)|"
     r"issue\s+map(?:-out)?|"
     r"compare\s+(?:the\s+)?(?:issue|spec|pr|branch|codebase|against\s+(?:main|develop))|"
     r"check\s+.*\ball\s+of\s+it|"
     r"audit\s+(?:the\s+)?(?:entire|whole|full|new\s+)?(?:plugin|repo|repository|codebase|workspace)|"
     r"across\s+backend\s+and\s+frontend|"
+    r"soạn\s+(?:thảo\s+)?issue|soan\s+(?:thao\s+)?issue|"
+    r"(?:viết|tạo)\s+đặc\s+tả|(?:viet|tao)\s+dac\s+ta|"
+    r"(?:lên|lập)\s+kế\s+hoạch|(?:len|lap)\s+ke\s+hoach|"
+    r"chia\s+(?:nhỏ\s+)?(?:tasks?|việc|công\s+việc|slices?|subagents?)|"
+    r"chia\s+(?:nho\s+)?(?:tasks?|viec|cong\s+viec|slices?|subagents?)|"
+    r"phân\s+bổ\s+(?:subagents?|tasks?|công\s+việc)|"
+    r"phan\s+bo\s+(?:subagents?|tasks?|cong\s+viec)|"
     r"đối\s+chiếu\s+(?:issue|spec|code|nhánh)|doi\s+chieu\s+(?:issue|spec|code|nhanh)|"
     r"so\s+sánh\s+(?:issue|spec|code|nhánh)|so\s+sanh\s+(?:issue|spec|code|nhanh)|"
     r"phân\s+tích\s+issue|phan\s+tich\s+issue|"
@@ -700,29 +711,21 @@ def classify_user_prompt(
 
     if PARALLEL_MAP_NUDGE_RE.search(text):
         if host == "codex":
-            msg = (
-                "[Downshift] Multi-part issue mapping/comparison task detected. "
-                "Use the 4-step parallel fan-out workflow: (1) decompose the issue into 2-4 disjoint slices, "
-                "(2) spawn parallel read-only spawn_agent calls in a single turn to map each slice and extract exact boundary contracts (routes, payload keys, types), "
-                "(3) compare each slice against the baseline in parallel (Downshift routes bounded slices to gpt-6-luna/gpt-6.1-sol), and "
-                "(4) reconcile cross-layer boundary contracts and synthesize the final verdict on the main agent."
-            )
+            delegation = "spawn_agent calls in 1 turn (Downshift routes bounded slices to gpt-6-luna/gpt-6.1-sol)"
         elif host == "claude":
-            msg = (
-                "[Downshift] Multi-part issue mapping/comparison task detected. "
-                "Use the 4-step parallel fan-out workflow: (1) decompose the issue into 2-4 disjoint slices, "
-                "(2) spawn parallel read-only Task/Explore subagents in a single turn to map each slice and extract exact boundary contracts (routes, payload keys, types), "
-                "(3) compare each slice against the baseline in parallel (Downshift routes bounded slices to Haiku/Sonnet), and "
-                "(4) reconcile cross-layer boundary contracts and synthesize the final verdict on the main agent."
-            )
+            delegation = "Task/Explore subagents in 1 turn (Downshift routes bounded slices to Haiku/Sonnet)"
         else:
-            msg = (
-                "[Downshift] Multi-part issue mapping/comparison task detected. "
-                "Use the 4-step parallel fan-out workflow: (1) decompose the issue into 2-4 disjoint slices, "
-                "(2) spawn parallel read-only invoke_subagent calls in a single turn to map each slice and extract exact boundary contracts (routes, payload keys, types), "
-                "(3) compare each slice against the baseline in parallel (Downshift routes bounded slices to flash_lite/flash), and "
-                "(4) reconcile cross-layer boundary contracts and synthesize the final verdict on the main agent."
-            )
+            delegation = "invoke_subagent calls in 1 turn (Downshift routes bounded slices to flash_lite/flash)"
+        msg = (
+            "[Downshift] Multi-part issue drafting, planning, or mapping task detected. "
+            "Use the 7-stage v2 workflow: (1) fast-path <=2 known files directly (0 subagents), "
+            "(2) decompose 3+-file scope into 2-4 disjoint slices in 1 turn, "
+            "(3) hand out effort tags (@low <3-file lookup, @medium 3+-file survey/test/lint, @high architecture/mutations/migrations/locking/auth), "
+            f"(4) spawn parallel {delegation}, "
+            "(5) require <=15-line 4-field hand-backs (Files & Lines, Exists vs Missing, Boundary Contract, Risks) and reconcile cross-layer boundary contracts on the frontier main agent, "
+            "(6) run <=2-file checks directly or heavy suites via @medium with a 2-retry circuit breaker, and "
+            "(7) verify clean diff and release."
+        )
         return PromptAdvisory(
             host=host,
             should_inject=True,

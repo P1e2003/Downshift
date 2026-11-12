@@ -773,7 +773,7 @@ def test_classify_user_prompt_parallel_map_en() -> None:
     )
     assert agy.should_inject is True
     assert agy.reason == "parallel_issue_map_or_comparison"
-    assert "4-step parallel fan-out" in agy.message
+    assert "7-stage v2" in agy.message
     assert "invoke_subagent" in agy.message
     assert "flash_lite/flash" in agy.message
     assert "reconcile cross-layer boundary contracts" in agy.message
@@ -1490,3 +1490,120 @@ def test_inline_effort_tags_low_medium_high_route_across_hosts() -> None:
     assert preserved_custom.target_model == "o3-pro"
     assert preserved_custom.should_overwrite is False
     assert preserved_custom.reason == "caller_explicit_model_preserved"
+
+
+def test_classify_user_prompt_7_stage_v2_draft_plan_and_allocate_en_vi() -> None:
+    common_substrings = (
+        "7-stage v2",
+        "<=2",
+        "2-4",
+        "@low",
+        "@medium",
+        "@high",
+        "<=15",
+        "reconcile cross-layer boundary contracts",
+        "2-retry",
+    )
+
+    # 1. Concise <15-char EN & VI orchestration phrases match without length cutoff (Q3 / FR-003)
+    concise_cases = [
+        ("draft an issue", "antigravity", ("invoke_subagent", "flash_lite/flash")),
+        ("plan the issue", "claude", ("Task/Explore", "Haiku/Sonnet")),
+        ("lập kế hoạch", "codex", ("spawn_agent", "gpt-6-luna/gpt-6.1-sol")),
+    ]
+    for prompt, host, host_tokens in concise_cases:
+        assert len(prompt) < 15
+        adv = classify_user_prompt(prompt, invocation_num=1, host=host)
+        assert adv.should_inject is True, f"Expected advisory for {prompt!r} on {host}"
+        assert adv.reason == "parallel_issue_map_or_comparison"
+        for sub in (*common_substrings, *host_tokens):
+            assert sub in adv.message, f"Missing {sub!r} in {host} advisory"
+
+    # 2. Full EN & VI (accented + unaccented) drafting, planning, breakdown & map-out phrases
+    en_vi_prompts = [
+        "Draft out a new issue for the webhook retry pipeline",
+        "Plan out this feature across API routes and worker tasks",
+        "Break down the spec into implementation slices",
+        "Allocate subagents and split into slices for this epic",
+        "Map out this issue before coding",
+        "Map out an issue for the notification service",
+        "Soạn thảo issue mới và viết đặc tả cho hệ thống",
+        "soan issue va tao dac ta cho module thanh toan",
+        "Lên kế hoạch tính năng mới và chia nhỏ công việc",
+        "len ke hoach issue va phan bo subagent theo slice",
+        "Chia nhỏ task cho các module backend và frontend",
+        "chia nho viec va phan bo tasks",
+    ]
+    for prompt in en_vi_prompts:
+        adv = classify_user_prompt(prompt, invocation_num=1, host="antigravity")
+        assert adv.should_inject is True, f"Missed orchestration prompt: {prompt!r}"
+        assert adv.reason == "parallel_issue_map_or_comparison"
+        assert "7-stage v2" in adv.message
+
+    # 3. Lower-tier inline tags on safe Turn-1 prompts STILL inject the 7-Stage v2 advisory (Q2 / FR-005)
+    for tag in (
+        "@low",
+        "@medium",
+        "@lite",
+        "@flash_lite",
+        "@haiku",
+        "@fast",
+        "@flash",
+        "@sonnet",
+        "@downshift",
+    ):
+        tagged = classify_user_prompt(
+            f"Plan out this feature and break down tasks {tag}",
+            invocation_num=1,
+            host="codex",
+        )
+        assert tagged.should_inject is True, f"Lower-tier tag {tag} suppressed advisory"
+        assert tagged.reason == "parallel_issue_map_or_comparison"
+
+    # 4. @high/frontier tags, built-in/custom high-risk terms, Turn 2+, empty, and trivial prompts stay silent (FR-005)
+    for frontier_tag in ("@high", "@frontier", "@pro", "@opus", "@inherit"):
+        suppressed_tag = classify_user_prompt(
+            f"Plan out this feature {frontier_tag}",
+            invocation_num=1,
+            host="antigravity",
+        )
+        assert suppressed_tag.should_inject is False
+        assert suppressed_tag.reason == "high_risk_or_frontier_tag"
+
+    custom_cfg = DownshiftConfig(high_risk_keywords=("vietmoney_vault",))
+    for risky_prompt in (
+        "Draft an issue and plan alembic migration for RBAC permissions",
+        "Lập kế hoạch phân quyền và khóa bảng cho worker",
+        "Plan out this feature for vietmoney_vault settlement",
+    ):
+        suppressed_risk = classify_user_prompt(
+            risky_prompt,
+            invocation_num=1,
+            host="claude",
+            config=custom_cfg,
+        )
+        assert suppressed_risk.should_inject is False
+        assert suppressed_risk.reason == "high_risk_or_frontier_tag"
+
+    assert (
+        classify_user_prompt("Plan out this feature", invocation_num=2).reason
+        == "not_first_turn_or_empty"
+    )
+    assert (
+        classify_user_prompt("   ", invocation_num=1).reason
+        == "not_first_turn_or_empty"
+    )
+    assert classify_user_prompt("hello", invocation_num=1).reason == "no_nudge_needed"
+    assert (
+        classify_user_prompt("fix typo in README.md", invocation_num=1).reason
+        == "no_nudge_needed"
+    )
+
+    # 5. Single-purpose routine log/caller search prompts retain routine_search_or_log_task (FR-006)
+    routine = classify_user_prompt(
+        "Kiểm tra toàn bộ log lỗi timeout",
+        invocation_num=1,
+        host="antigravity",
+    )
+    assert routine.should_inject is True
+    assert routine.reason == "routine_search_or_log_task"

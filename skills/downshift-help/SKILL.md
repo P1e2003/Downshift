@@ -23,12 +23,15 @@ Display this compact reference card in a fenced `text` block:
     alembic · migration · deadlock · race condition · advisory lock · for update · savepoint
     rollback · security · auth · permission · idor · phân quyền · bảo mật · khóa bảng · di trú dữ liệu
 
-  4-Step Parallel Multi-Subagent Fan-Out (Issue Mapping & Comparison)
-    1. Decompose   Split multi-layer issue/spec into 2-4 disjoint slices on the main agent
-    2. Map         Spawn 2-4 read-only subagents in 1 turn (<600 chars & <3 paths -> Tier 1 lite)
-    3. Compare     Each subagent compares its slice vs baseline & extracts exact boundary contracts
-    4. Verdict     Main (frontier) agent reconciles cross-layer contracts (snake_case/camelCase, auth)
-    Guardrails     Cap at 2-4 subagents/turn (enforced at runtime: 5th+ fast -> lite) · 1-2 known files stay direct · read-only fan-out only
+  7-Stage v2 Subagent Orchestration & Effort Hand-Out
+    1. Triage & Gate     <=2 known files -> 0 subagents (read/edit/verify directly on main agent)
+    2. Decompose         Split 3+-file / multi-layer scope into 2-4 disjoint slices in 1 turn
+    3. Effort Hand-Out   @low (<3-file/<600-char lookup) · @medium (3+-file survey/test/lint) · @high (arch/edits/migrations/locks/auth)
+    4. Parallel Fan-Out  Spawn 2-4 subagents in 1 turn (inherit = read-only; branch/share required for parallel @high edits)
+    5. Hand-Back (<=15L) 4 fields (Files & Lines, Exists vs Missing, Boundary Contract, Risks) -> frontier cross-layer synthesis
+    6. Adaptive Check    1-2 file checks direct; full test/lint/build via @medium · max 2-retry circuit breaker on failures
+    7. Clean Release     Verify clean git status/diff, update progress tracker, and report verification steps
+    Guardrails           Cap 2-4 subagents/turn (runtime: 5th+ fast -> lite) · <=2 known files direct · read-only shared workspace · boundary contract check
 
   Inline @tag Overrides (highest tier wins: @high > @medium > @low; safety guardrails block lower-tier tags)
     @high / @pro / @opus / @frontier / @inherit        Force Tier 3 (frontier · high effort)
