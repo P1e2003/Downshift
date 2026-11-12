@@ -148,13 +148,13 @@ $ python ./scripts/stats_cli.py
   │  Credit cost     all-frontier  ████████████████████  100.0%
   │                  with router   ████████············   41.6%   ▼ 58.4% saved
   │
-  │  ├── Routed to lite (Tier 1) :  5 (25.0%)  ███·········  [flash_lite / haiku / gpt-6-luna · 0.04x cost]
-  │  ├── Routed to fast (Tier 2) :  9 (45.0%)  █████·······  [flash / sonnet / gpt-6.1-sol · 0.20x cost]
-  │  └── Kept on frontier        :  6 (30.0%)  ████········  [safety guardrail / stateful mutation · 1.00x]
+  │  ├── Routed to lite (Tier 1) :  5 (25.0%) ███······· [flash_lite/haiku/luna 0.04x]
+  │  ├── Routed to fast (Tier 2) :  9 (45.0%) █████····· [flash/sonnet/sol · 0.20x]
+  │  └── Kept on frontier        :  6 (30.0%) ███······· [guardrail/stateful · 1.00x]
   │
-  │  Hosts & guardrails          : antigravity: 16, codex: 4 · 4 high-risk call(s) protected by guardrails
-  │  Top routing reasons         : read_only_research_survey: 9, read_only_simple_lookup: 4, safety_guardrail:security_or_auth: 4, burst_cap_downgraded_to_lite: 1
-  ╰───────────────────────────────────────────────────────────────────────────────────────
+  │  Hosts & guardrails          : antigravity: 16, codex: 4 · 4 guardrail(s)
+  │  Top routing reasons         : read_only_research_survey: 9, read_only_simple_looku…
+  ╰─────────────────────────────────────────────────────────────────────────────────────
 ```
 
 Flags:

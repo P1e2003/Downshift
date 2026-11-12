@@ -412,13 +412,18 @@ def test_stats_cli_aggregates_hosts_reasons_and_guardrail_count(
     board = render_ascii_scoreboard(summary, ledger)
     assert "╭─ ⚡ downshift stats" in board
     assert "Credit cost     all-frontier  ████████████████████  100.0%" in board
-    assert "[flash_lite / haiku / gpt-6-luna · 0.04x cost]" in board
-    assert "[flash / sonnet / gpt-6.1-sol · 0.20x cost]" in board
+    assert "[flash_lite/haiku/luna 0.04x]" in board
+    assert "[flash/sonnet/sol · 0.20x]" in board
+    assert "[guardrail/stateful · 1.00x]" in board
     assert (
-        "Hosts & guardrails          : antigravity: 3, claude: 3, codex: 2 · 3 high-risk call(s) protected by guardrails\n"
+        "Hosts & guardrails          : antigravity: 3, claude: 3, codex: 2 · 3 guardrail(s)\n"
         in board
     )
     assert "Top routing reasons         : workspace_config:pinned_role: 2" in board
+    body_lines = board.splitlines()[1:]
+    assert all(len(line) <= 88 for line in body_lines), [
+        (len(line), line) for line in body_lines if len(line) > 88
+    ]
 
     html_out = tmp_path / "scoreboard.html"
     ledger.write_text(
@@ -444,6 +449,8 @@ def test_stats_cli_aggregates_hosts_reasons_and_guardrail_count(
     html_text = html_out.read_text(encoding="utf-8")
     assert "Downshift Scoreboard 2.0" in html_text
     assert "antigravity: 3, claude: 3, codex: 2" in html_text
+    assert "Top routing reasons" in html_text
+    assert "workspace_config:pinned_role: 2" in html_text
 
 
 def test_stats_cli_clean_removes_only_zero_char_roleless_and_corrupted_rows(

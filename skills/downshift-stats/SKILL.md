@@ -9,19 +9,21 @@ description: >
 
 # Downshift Stats
 
-1. **Default (1 tool call)**: Run the scoreboard CLI once and display its box-drawn output verbatim in a fenced `text` block (do **not** generate or write an HTML file unless requested):
-
-```bash
-"./scripts/run_hook.cmd" ./scripts/stats_cli.py
-```
-
-2. **Optional HTML widget (`generative_ui`)**: Only if the user explicitly asks for an interactive HTML widget/card on Google Antigravity, generate and embed it:
+1. **On Google Antigravity (`generative_ui` / `<agent-embed>` available — Default UI)**: Run the scoreboard CLI from the Downshift plugin directory with `--html`, register `<artifact_dir>/downshift_scoreboard.html` via `write_file` (`Overwrite: true`, `ArtifactMetadata` with `UserFacing: true`, `RequestFeedback: false`), and embed the interactive HTML scoreboard card inline **by default** (do **not** paste the raw `text` box unless the user asks for plain text):
 
 ```bash
 "./scripts/run_hook.cmd" ./scripts/stats_cli.py --html "<artifact_dir>/downshift_scoreboard.html"
 ```
 
-Then include `<agent-embed src="file:///<artifact_dir>/downshift_scoreboard.html"></agent-embed>` in your response (after calling `write_file` with `UserFacing: true` if required by the host).
+```markdown
+<agent-embed src="file:///<artifact_dir>/downshift_scoreboard.html"></agent-embed>
+```
+
+2. **On Terminal CLI Hosts (`Claude Code`, `OpenAI Codex`, `Gemini CLI` — no `<agent-embed>`)**: Run the scoreboard CLI once from the Downshift plugin directory and display its box-drawn output verbatim in a fenced `text` block:
+
+```bash
+"./scripts/run_hook.cmd" ./scripts/stats_cli.py
+```
 
 3. If the user asks to clean synthetic empty or corrupted rows from the ledger (preserving all valid routing events), run:
 
