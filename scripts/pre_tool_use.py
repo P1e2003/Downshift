@@ -142,25 +142,31 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         prompt_chars=len(prompt_text),
         config=config,
     )
-    if config.mode == "active" and decision.should_overwrite:
-        updated_input = dict(tool_input)
-        updated_input["model"] = decision.target_model
-        if host == "codex":
-            effort = CODEX_TIER_REASONING_EFFORT.get(decision.tier)
-            cur_effort = (
-                str(updated_input.get("reasoning_effort") or "").strip().lower()
-            )
-            if effort and cur_effort not in ("low", "medium"):
-                updated_input["reasoning_effort"] = effort
-            elif decision.tier == "frontier" and cur_effort in ("low", "medium"):
-                updated_input["reasoning_effort"] = "high"
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
-                "updatedInput": updated_input,
+    if config.mode == "active":
+        updated_input: dict[str, Any] | None = None
+        if decision.should_overwrite:
+            updated_input = dict(tool_input)
+            updated_input["model"] = decision.target_model
+        if host == "codex" and not (
+            decision.tier == "frontier"
+            and decision.reason == "caller_explicit_model_preserved"
+        ):
+            target_effort = CODEX_TIER_REASONING_EFFORT.get(decision.tier)
+            cur_effort = str(tool_input.get("reasoning_effort") or "").strip().lower()
+            if target_effort and (
+                updated_input is not None or cur_effort != target_effort
+            ):
+                if updated_input is None:
+                    updated_input = dict(tool_input)
+                updated_input["reasoning_effort"] = target_effort
+        if updated_input is not None:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "updatedInput": updated_input,
+                }
             }
-        }
     return {}
 
 

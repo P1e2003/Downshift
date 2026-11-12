@@ -968,3 +968,486 @@ def test_concurrent_6_subagent_storm_caps_excess_to_lite(tmp_path: Path) -> None
         "lite",
     ]
     assert sum(1 for e in entries if e["reason"] == "burst_cap_downgraded_to_lite") == 2
+
+
+def test_codex_frontier_default_and_guardrail_enforce_high_reasoning_effort(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "codex_frontier_effort.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+
+    # 1. Default omitted-model stateful mutation injects reasoning_effort="high" without touching model
+    rc_mut, out_mut = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-f-1",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "message": "Implement webhook retry handler in message_service.py",
+            },
+        },
+        extra_env=env,
+    )
+    assert rc_mut == 0
+    assert out_mut == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": {
+                "message": "Implement webhook retry handler in message_service.py",
+                "reasoning_effort": "high",
+            },
+        }
+    }
+
+    # 2. High-risk prompt tagged @low with model="inherit" and reasoning_effort="low" -> safety guardrail enforces "high"
+    rc_hr, out_hr = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-f-2",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "message": "Audit alembic migration head and FOR UPDATE locking @low",
+                "model": "inherit",
+                "reasoning_effort": "low",
+            },
+        },
+        extra_env=env,
+    )
+    assert rc_hr == 0
+    assert out_hr == {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "updatedInput": {
+                "message": "Audit alembic migration head and FOR UPDATE locking @low",
+                "model": "inherit",
+                "reasoning_effort": "high",
+            },
+        }
+    }
+
+    # 3. @high upgrades explicit lower-tier model gpt-6-luna -> inherit + reasoning_effort="high"
+    rc_high_tag, out_high_tag = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-f-3",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "message": "Locate resolve_contact definition @high",
+                "model": "gpt-6-luna",
+                "reasoning_effort": "low",
+            },
+        },
+        extra_env=env,
+    )
+    assert rc_high_tag == 0
+    assert out_high_tag["hookSpecificOutput"]["updatedInput"] == {
+        "message": "Locate resolve_contact definition @high",
+        "model": "inherit",
+        "reasoning_effort": "high",
+    }
+
+    # 4. Already matching frontier (omitted model + reasoning_effort="high") -> {} no-op
+    rc_noop, out_noop = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-f-4",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "message": "Implement webhook retry handler in message_service.py",
+                "reasoning_effort": "high",
+            },
+        },
+        extra_env=env,
+    )
+    assert rc_noop == 0
+    assert out_noop == {}
+
+    # 5. Custom non-lower-tier model ("o3-pro") on safe task -> {} preserved untouched (FR-006)
+    rc_custom, out_custom = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-f-5",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "message": "Find file where resolve_contact is defined",
+                "model": "o3-pro",
+                "reasoning_effort": "medium",
+            },
+        },
+        extra_env=env,
+    )
+    assert rc_custom == 0
+    assert out_custom == {}
+
+    # 6. shadow and off modes never mutate reasoning_effort (FR-006)
+    for non_active_mode in ("shadow", "off"):
+        rc_na, out_na = _run_hook(
+            PRE_TOOL_USE,
+            {
+                "session_id": f"sess-{non_active_mode}",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "spawn_agent",
+                "tool_input": {
+                    "message": "Implement webhook retry handler in message_service.py",
+                    "reasoning_effort": "low",
+                },
+            },
+            extra_env={
+                "DOWNSHIFT_MODE": non_active_mode,
+                "DOWNSHIFT_LEDGER_PATH": str(tmp_path / f"{non_active_mode}.jsonl"),
+            },
+        )
+        assert rc_na == 0
+        assert out_na == {}
+
+
+def test_codex_lite_and_burst_cap_overwrite_medium_effort_to_low(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "codex_lite_effort.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+
+    # 1. @low overwrites caller reasoning_effort="medium" -> "low"
+    rc_low, out_low = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-lite-1",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "role": "Slice Locator @low",
+                "message": "Inspect module structure",
+                "reasoning_effort": "medium",
+            },
+        },
+        extra_env=env,
+    )
+    assert rc_low == 0
+    assert out_low["hookSpecificOutput"]["updatedInput"] == {
+        "role": "Slice Locator @low",
+        "message": "Inspect module structure",
+        "model": "gpt-6-luna",
+        "reasoning_effort": "low",
+    }
+
+    # 2. Burst-cap downgrade on 5th fast call overwrites caller reasoning_effort="medium" -> "low"
+    for idx in range(4):
+        rc_b, out_b = _run_hook(
+            PRE_TOOL_USE,
+            {
+                "session_id": "sess-burst-effort",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "spawn_agent",
+                "tool_input": {
+                    "role": f"Slice {idx + 1} Mapper",
+                    "message": "Survey all callers across scripts/ and summarize the routing flow",
+                    "reasoning_effort": "medium",
+                },
+            },
+            extra_env=env,
+        )
+        assert rc_b == 0
+        assert out_b["hookSpecificOutput"]["updatedInput"]["model"] == "gpt-6.1-sol"
+        assert (
+            out_b["hookSpecificOutput"]["updatedInput"]["reasoning_effort"] == "medium"
+        )
+
+    rc_5th, out_5th = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-burst-effort",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "role": "Slice 5 Mapper",
+                "message": "Survey all callers across scripts/ and summarize the routing flow",
+                "reasoning_effort": "medium",
+            },
+        },
+        extra_env=env,
+    )
+    assert rc_5th == 0
+    assert out_5th["hookSpecificOutput"]["updatedInput"]["model"] == "gpt-6-luna"
+    assert out_5th["hookSpecificOutput"]["updatedInput"]["reasoning_effort"] == "low"
+
+    # 3. Explicit @medium is exempt from burst-cap downgrade and overwrites "low" -> "medium"
+    rc_med_immune, out_med_immune = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-burst-effort",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "role": "Slice 6 Comparator @medium",
+                "message": "Survey all callers across scripts/ and summarize the routing flow",
+                "reasoning_effort": "low",
+            },
+        },
+        extra_env=env,
+    )
+    assert rc_med_immune == 0
+    assert (
+        out_med_immune["hookSpecificOutput"]["updatedInput"]["model"] == "gpt-6.1-sol"
+    )
+    assert (
+        out_med_immune["hookSpecificOutput"]["updatedInput"]["reasoning_effort"]
+        == "medium"
+    )
+
+    # 4. Gap 3: explicit model="gpt-6-luna" on safe untagged task missing effort -> injects "low" (and {} when already "low")
+    rc_gap3_lite, out_gap3_lite = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-gap3-lite",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "message": "Summarize helper constants",
+                "model": "gpt-6-luna",
+            },
+        },
+        extra_env=env,
+    )
+    assert rc_gap3_lite == 0
+    assert out_gap3_lite["hookSpecificOutput"]["updatedInput"] == {
+        "message": "Summarize helper constants",
+        "model": "gpt-6-luna",
+        "reasoning_effort": "low",
+    }
+
+    rc_gap3_noop, out_gap3_noop = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-gap3-noop",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "message": "Summarize helper constants",
+                "model": "gpt-6-luna",
+                "reasoning_effort": "low",
+            },
+        },
+        extra_env=env,
+    )
+    assert rc_gap3_noop == 0
+    assert out_gap3_noop == {}
+
+
+def test_codex_fast_overwrites_low_effort_to_medium(tmp_path: Path) -> None:
+    ledger = tmp_path / "codex_fast_effort.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+
+    # 1. multi_agent_v1__spawn_agent routed to fast overwrites caller reasoning_effort="low" -> "medium"
+    rc_fast, out_fast = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-fast-1",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "multi_agent_v1__spawn_agent",
+            "tool_input": {
+                "message": "Survey all callers of NotificationService across the backend and summarize the flow",
+                "reasoning_effort": "low",
+            },
+        },
+        extra_env=env,
+    )
+    assert rc_fast == 0
+    assert out_fast["hookSpecificOutput"]["updatedInput"] == {
+        "message": "Survey all callers of NotificationService across the backend and summarize the flow",
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "medium",
+    }
+
+    # 2. Gap 3: explicit model="gpt-6.1-sol" on safe untagged task with "low" effort -> enforces "medium" (and {} when already "medium")
+    rc_gap3_fast, out_gap3_fast = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-gap3-fast",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "message": "Find file where resolve_contact is defined",
+                "model": "gpt-6.1-sol",
+                "reasoning_effort": "low",
+            },
+        },
+        extra_env=env,
+    )
+    assert rc_gap3_fast == 0
+    assert out_gap3_fast["hookSpecificOutput"]["updatedInput"] == {
+        "message": "Find file where resolve_contact is defined",
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "medium",
+    }
+
+    rc_gap3_fast_noop, out_gap3_fast_noop = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-gap3-fast-noop",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "message": "Find file where resolve_contact is defined",
+                "model": "gpt-6.1-sol",
+                "reasoning_effort": "medium",
+            },
+        },
+        extra_env=env,
+    )
+    assert rc_gap3_fast_noop == 0
+    assert out_gap3_fast_noop == {}
+
+
+def test_antigravity_and_claude_never_emit_reasoning_effort(tmp_path: Path) -> None:
+    schema_ledger = tmp_path / "schema_cleanliness.jsonl"
+    schema_env = {"DOWNSHIFT_LEDGER_PATH": str(schema_ledger)}
+
+    # 1. Google Antigravity never emits reasoning_effort across @low, @medium, @high (FR-007, SC-004)
+    for tag, orig_model, expected in (
+        (
+            "@low",
+            "inherit",
+            {"decision": "allow", "overwrite": {"Model": "flash_lite"}},
+        ),
+        (
+            "@medium",
+            "inherit",
+            {"decision": "allow", "overwrite": {"Model": "flash"}},
+        ),
+        ("@high", "inherit", {"decision": "allow"}),
+        (
+            "@high",
+            "flash_lite",
+            {"decision": "allow", "overwrite": {"Model": "inherit"}},
+        ),
+    ):
+        rc_agy, out_agy = _run_hook(
+            PRE_TOOL_USE,
+            {
+                "conversationId": f"conv-agy-{tag}-{orig_model}",
+                "toolCall": {
+                    "name": "invoke_subagent",
+                    "args": {
+                        "TypeName": "self",
+                        "Role": f"Worker {tag}",
+                        "Prompt": "Inspect module interfaces",
+                        "Model": orig_model,
+                    },
+                },
+            },
+            extra_env=schema_env,
+        )
+        assert rc_agy == 0
+        assert out_agy == expected
+        assert "reasoning_effort" not in json.dumps(out_agy)
+
+    # 2. Claude Code never emits reasoning_effort across @low, @medium, @high (FR-007, SC-004)
+    for tag, orig_model, expected_model in (
+        ("@low", "", "haiku"),
+        ("@medium", "", "sonnet"),
+        ("@high", "", None),
+        ("@high", "haiku", "inherit"),
+    ):
+        tool_input: dict[str, str] = {
+            "subagent_type": "general-purpose",
+            "description": f"Worker {tag}",
+            "prompt": "Inspect module interfaces",
+        }
+        if orig_model:
+            tool_input["model"] = orig_model
+        rc_claude, out_claude = _run_hook(
+            PRE_TOOL_USE,
+            {
+                "session_id": f"sess-claude-{tag}-{orig_model}",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Task",
+                "tool_input": tool_input,
+            },
+            extra_env=schema_env,
+        )
+        assert rc_claude == 0
+        assert "reasoning_effort" not in json.dumps(out_claude)
+        if expected_model is None:
+            assert out_claude == {}
+        else:
+            assert (
+                out_claude["hookSpecificOutput"]["updatedInput"]["model"]
+                == expected_model
+            )
+
+    # 3. Effort-only OpenAI Codex normalization keeps overwritten=False and saved=0 (FR-007, SC-004)
+    effort_only_ledger = tmp_path / "effort_only_ledger.jsonl"
+    effort_env = {"DOWNSHIFT_LEDGER_PATH": str(effort_only_ledger)}
+    effort_only_inputs = [
+        {
+            "message": "Implement webhook retry handler in message_service.py",
+        },
+        {
+            "message": "Audit alembic migration head @low",
+            "model": "inherit",
+            "reasoning_effort": "low",
+        },
+        {
+            "message": "Summarize helper constants",
+            "model": "gpt-6-luna",
+        },
+        {
+            "message": "Find file where resolve_contact is defined",
+            "model": "gpt-6.1-sol",
+            "reasoning_effort": "low",
+        },
+    ]
+    for idx, ti in enumerate(effort_only_inputs):
+        rc_eo, out_eo = _run_hook(
+            PRE_TOOL_USE,
+            {
+                "session_id": f"sess-eo-{idx}",
+                "hook_event_name": "PreToolUse",
+                "tool_name": "spawn_agent",
+                "tool_input": ti,
+            },
+            extra_env=effort_env,
+        )
+        assert rc_eo == 0
+        assert "reasoning_effort" in out_eo["hookSpecificOutput"]["updatedInput"]
+
+    entries = [
+        json.loads(line)
+        for line in effort_only_ledger.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(entries) == 4
+    assert all(entry["overwritten"] is False for entry in entries)
+
+    stats_proc = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "stats_cli.py"),
+            "--ledger",
+            str(effort_only_ledger),
+            "--json",
+        ],
+        text=True,
+        capture_output=True,
+        timeout=5,
+        check=False,
+    )
+    assert stats_proc.returncode == 0
+    summary = json.loads(stats_proc.stdout)
+    assert summary["total"] == 4
+    assert summary["saved"] == 0
+    assert summary["saved_pct"] == 0.0
+    assert summary["tiers"] == {"frontier": 2, "lite": 1, "fast": 1}
+
+    # 4. Rules, /downshift-help, and README.md document @high, @medium, and @low (FR-008)
+    for doc_rel in ("rules/AGENTS.md", "skills/downshift-help/SKILL.md", "README.md"):
+        doc_text = (ROOT / doc_rel).read_text(encoding="utf-8")
+        for effort_tag in ("@high", "@medium", "@low"):
+            assert effort_tag in doc_text, f"Missing {effort_tag} in {doc_rel}"

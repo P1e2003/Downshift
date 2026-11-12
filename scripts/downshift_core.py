@@ -17,16 +17,15 @@ VALID_MODES = frozenset({"active", "shadow", "off"})
 VALID_TIERS = frozenset({"lite", "fast", "frontier"})
 
 READ_ONLY_SUBAGENTS = frozenset({"research", "explore"})
-LOWER_TIER_MODELS = frozenset(
-    {
-        "flash_lite",
-        "flash",
-        "haiku",
-        "sonnet",
-        "gpt-6-luna",
-        "gpt-6.1-sol",
-    }
-)
+LOWER_TIER_MODEL_TIERS: dict[str, str] = {
+    "flash_lite": "lite",
+    "haiku": "lite",
+    "gpt-6-luna": "lite",
+    "flash": "fast",
+    "sonnet": "fast",
+    "gpt-6.1-sol": "fast",
+}
+LOWER_TIER_MODELS = frozenset(LOWER_TIER_MODEL_TIERS)
 GENERAL_SUBAGENTS = frozenset(
     {
         "self",
@@ -74,9 +73,13 @@ HIGH_RISK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
 )
 
-FRONTIER_TAG_RE = re.compile(r"(?:^|\s)@(pro|opus|frontier|inherit)\b", re.IGNORECASE)
-LITE_TAG_RE = re.compile(r"(?:^|\s)@(flash_lite|lite|haiku)\b", re.IGNORECASE)
-FAST_TAG_RE = re.compile(r"(?:^|\s)@(flash|sonnet|fast|downshift)\b", re.IGNORECASE)
+FRONTIER_TAG_RE = re.compile(
+    r"(?:^|\s)@(pro|opus|frontier|inherit|high)\b", re.IGNORECASE
+)
+LITE_TAG_RE = re.compile(r"(?:^|\s)@(flash_lite|lite|haiku|low)\b", re.IGNORECASE)
+FAST_TAG_RE = re.compile(
+    r"(?:^|\s)@(flash|sonnet|fast|downshift|medium)\b", re.IGNORECASE
+)
 
 READ_ONLY_ROLE_RE = re.compile(
     r"\b(research(?:er)?|explor(?:e|er)|map(?:per|ping)|slice\s+\d+|"
@@ -191,6 +194,7 @@ HOST_MODEL_MAP: dict[str, dict[str, str]] = {
 CODEX_TIER_REASONING_EFFORT: dict[str, str] = {
     "lite": "low",
     "fast": "medium",
+    "frontier": "high",
 }
 
 DEFAULT_MAX_BURST_SUBAGENTS = 4
@@ -477,41 +481,27 @@ def classify_subagent_call(
     norm_model = (current_model or "").strip()
     cfg = config if config is not None else DownshiftConfig()
 
-    # 1. Explicit inline @tag overrides take highest precedence
+    is_explicit_non_default = bool(
+        norm_model and norm_model.lower() not in ("inherit", "default")
+    )
+    explicit_lower_tier = (
+        LOWER_TIER_MODEL_TIERS.get(norm_model.lower())
+        if is_explicit_non_default
+        else None
+    )
+    is_explicit_lower_tier = explicit_lower_tier is not None
+
+    # 1. Explicit frontier inline @tag overrides take highest precedence
     if FRONTIER_TAG_RE.search(combined):
         return RoutingDecision(
             host=host,
             tier="frontier",
             target_model="inherit",
-            should_overwrite=False,
+            should_overwrite=is_explicit_lower_tier,
             reason="inline_override:frontier",
-        )
-    if LITE_TAG_RE.search(combined):
-        target = _resolve_target_model(host, "lite")
-        return RoutingDecision(
-            host=host,
-            tier="lite",
-            target_model=target,
-            should_overwrite=(norm_model != target),
-            reason="inline_override:lite",
-        )
-    if FAST_TAG_RE.search(combined):
-        target = _resolve_target_model(host, "fast")
-        return RoutingDecision(
-            host=host,
-            tier="fast",
-            target_model=target,
-            should_overwrite=(norm_model != target),
-            reason="inline_override:fast",
         )
 
     # 2. Preserve caller's explicit non-default model unless a safety guardrail upgrades a lower-tier model
-    is_explicit_non_default = bool(
-        norm_model and norm_model.lower() not in ("inherit", "default")
-    )
-    is_explicit_lower_tier = is_explicit_non_default and (
-        norm_model.lower() in LOWER_TIER_MODELS
-    )
     if is_explicit_non_default and not is_explicit_lower_tier:
         return RoutingDecision(
             host=host,
@@ -577,10 +567,31 @@ def classify_subagent_call(
             reason=f"safety_guardrail:{risk_match}",
         )
 
-    if is_explicit_non_default:
+    # 6. Lower-tier inline @tag overrides on safe prompts (@high > @medium > @low, FR-001/FR-002)
+    if FAST_TAG_RE.search(combined):
+        target = _resolve_target_model(host, "fast")
         return RoutingDecision(
             host=host,
-            tier="frontier",
+            tier="fast",
+            target_model=target,
+            should_overwrite=(norm_model.lower() != target.lower()),
+            reason="inline_override:fast",
+        )
+    if LITE_TAG_RE.search(combined):
+        target = _resolve_target_model(host, "lite")
+        return RoutingDecision(
+            host=host,
+            tier="lite",
+            target_model=target,
+            should_overwrite=(norm_model.lower() != target.lower()),
+            reason="inline_override:lite",
+        )
+
+    # 7. Preserve caller's explicit lower-tier model under its native tier on safe untagged tasks (FR-004)
+    if explicit_lower_tier is not None:
+        return RoutingDecision(
+            host=host,
+            tier=explicit_lower_tier,
             target_model=norm_model,
             should_overwrite=False,
             reason="caller_explicit_model_preserved",

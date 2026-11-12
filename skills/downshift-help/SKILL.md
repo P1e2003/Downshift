@@ -30,10 +30,10 @@ Display this compact reference card in a fenced `text` block:
     4. Verdict     Main (frontier) agent reconciles cross-layer contracts (snake_case/camelCase, auth)
     Guardrails     Cap at 2-4 subagents/turn (enforced at runtime: 5th+ fast -> lite) · 1-2 known files stay direct · read-only fan-out only
 
-  Inline @tag Overrides
-    @pro / @opus / @frontier / @inherit   Force Tier 3 (frontier)
-    @flash / @sonnet / @fast / @downshift Force Tier 2 (fast)
-    @flash_lite / @lite / @haiku          Force Tier 1 (lite)
+  Inline @tag Overrides (highest tier wins: @high > @medium > @low; safety guardrails block lower-tier tags)
+    @high / @pro / @opus / @frontier / @inherit        Force Tier 3 (frontier · high effort)
+    @medium / @flash / @sonnet / @fast / @downshift    Route safe tasks to Tier 2 (fast · medium effort)
+    @low / @flash_lite / @lite / @haiku                Route safe tasks to Tier 1 (lite · low effort)
 
   Modes & Workspace Config (.downshift.json / DOWNSHIFT_MODE / DOWNSHIFT_MAX_BURST)
     active (default)   Enforce model routing + record telemetry
