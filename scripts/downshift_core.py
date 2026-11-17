@@ -59,6 +59,8 @@ HIGH_RISK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "security_or_auth",
         re.compile(
             r"\b(security|auth(?:entication|orization)?|permissions?|idor|cryptograph(?:y|ic)|jwt|csrf|xss|secrets?|"
+            r"malware|backdoors?|obfuscat\w*|steganograph\w*|vulnerabilit(?:y|ies)|exploits?|"
+            r"lỗ\s+hổng|lo\s+hong|mã\s+độc|ma\s+doc|"
             r"phân\s+quyền|phan\s+quyen|bảo\s+mật|bao\s+mat|xác\s+thực|xac\s+thuc)\b",
             re.IGNORECASE,
         ),
@@ -168,6 +170,12 @@ FILE_PATH_TOKEN_RE = re.compile(
     r"\b[\w./\\-]+?\.(?:py|ts|tsx|js|jsx|json|sql|md|yml|yaml|sh|cmd|toml|ini|cfg|env|lock)\b",
     re.IGNORECASE,
 )
+DIR_OR_ROUTE_PATH_RE = re.compile(
+    r"(?<!\w)/[\w.-]+(?:/[\w.:*-]+)+/?|\b[\w.-]+(?:/[\w.:*-]+){2,}/?|\b[\w.-]+/[\w.:*-]+/"
+)
+HTTP_ROUTE_METHOD_RE = re.compile(
+    r"(?:\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+`?/\S*|\b(?:GET|POST|PUT)/PATCH(?:/DELETE)?\b)"
+)
 GLOB_PATH_RE = re.compile(r"\b[\w.-]+(?:/[\w.*-]+)+\b")
 CODE_IDENTIFIER_RE = re.compile(
     r"\b[a-zA-Z0-9]+(?:_[a-zA-Z0-9]+)+\b|\b[a-z]+(?:[A-Z][a-z0-9]+)+\b|\b(?:[A-Z]+[a-z0-9]+){2,}[A-Z]*\b"
@@ -179,6 +187,13 @@ AUDIT_OR_MUTATION_INTENT_RE = re.compile(
     r"\b(audit|investigate|debug|fix|patch|refactor|implement|vulnerability|exploit|bypass|review|"
     r"kiểm\s+toán|kiem\s+toan|kiểm\s+tra\s+lỗi|kiem\s+tra\s+loi|phân\s+tích\s+lỗi|phan\s+tich\s+loi|"
     r"điều\s+tra|dieu\s+tra|rà\s+soát|ra\s+soat|sửa\s+lỗi|sua\s+loi)\b",
+    re.IGNORECASE,
+)
+READONLY_AUDIT_RISK_RE = re.compile(
+    r"\b(malware|obfuscat\w*|steganograph\w*|vulnerabilit(?:y|ies)|exploits?|bypass(?:es|ing)?|"
+    r"idor|csrf|xss|cryptograph(?:y|ic)|penetration|audit(?:or|ing|s)?|security\s+review|"
+    r"head\s+conflicts?|ddl\s+rollback|lỗ\s+hổng|lo\s+hong|mã\s+độc|ma\s+doc|"
+    r"kiểm\s+toán|kiem\s+toan|rà\s+soát\s+bảo\s+mật|ra\s+soat\s+bao\s+mat)\b",
     re.IGNORECASE,
 )
 
@@ -453,11 +468,22 @@ def _match_high_risk(combined_text: str) -> str | None:
     return None
 
 
+def _match_strict_readonly_risk(text: str) -> str | None:
+    for label, pattern in HIGH_RISK_PATTERNS:
+        if label in (
+            "concurrency_or_locking",
+            "production_incident",
+        ) and pattern.search(text):
+            return label
+    return None
+
+
 def strip_benign_code_identifiers(text: str) -> str:
-    """Mask explicit file-path tokens and compound code identifiers during pure read-only lookups."""
+    """Mask explicit file/directory/route path tokens and compound code identifiers during read-only lookups."""
     if not text:
         return ""
     masked = FILE_PATH_TOKEN_RE.sub(" <path> ", text)
+    masked = DIR_OR_ROUTE_PATH_RE.sub(" <path> ", masked)
     return CODE_IDENTIFIER_RE.sub(" <id> ", masked)
 
 
@@ -543,11 +569,20 @@ def classify_subagent_call(
             reason="workspace_config:high_risk_keyword",
         )
 
-    # 5. Hard safety guardrail blocklist (with benign identifier disambiguation on pure read-only lookups, FR-001/FR-002)
-    is_readonly = norm_type in READ_ONLY_SUBAGENTS or (
+    # 5. Hard safety guardrail blocklist (with benign identifier & effort-tagged read-only slice disambiguation)
+    intent_text = (
+        HTTP_ROUTE_METHOD_RE.sub(" <route> ", combined) if "/" in combined else combined
+    )
+    has_mutation_intent = bool(CODE_MUTATION_RE.search(intent_text))
+    has_audit_or_mutation_intent = bool(AUDIT_OR_MUTATION_INTENT_RE.search(intent_text))
+    is_sandboxed_readonly = norm_type in READ_ONLY_SUBAGENTS
+    has_lower_effort_tag = bool(
+        FAST_TAG_RE.search(combined) or LITE_TAG_RE.search(combined)
+    )
+    is_readonly = is_sandboxed_readonly or (
         norm_type in GENERAL_SUBAGENTS
-        and not CODE_MUTATION_RE.search(combined)
-        and not AUDIT_OR_MUTATION_INTENT_RE.search(combined)
+        and not has_mutation_intent
+        and not has_audit_or_mutation_intent
         and not VERIFICATION_RUNNER_RE.search(combined)
         and bool(
             SIMPLE_LOOKUP_RE.search(combined)
@@ -565,10 +600,18 @@ def classify_subagent_call(
         )
         if (
             is_simple_lookup
-            and not AUDIT_OR_MUTATION_INTENT_RE.search(combined)
-            and not CODE_MUTATION_RE.search(combined)
+            and not has_audit_or_mutation_intent
+            and not has_mutation_intent
         ):
-            risk_match = _match_high_risk(strip_benign_code_identifiers(combined))
+            risk_match = _match_high_risk(strip_benign_code_identifiers(intent_text))
+        if (
+            risk_match is not None
+            and is_sandboxed_readonly
+            and has_lower_effort_tag
+            and not has_mutation_intent
+            and not READONLY_AUDIT_RISK_RE.search(intent_text)
+        ):
+            risk_match = _match_strict_readonly_risk(intent_text)
     if risk_match is not None:
         return RoutingDecision(
             host=host,
@@ -662,7 +705,7 @@ def classify_subagent_call(
     if (
         norm_type in GENERAL_SUBAGENTS
         and VERIFICATION_RUNNER_RE.search(combined)
-        and not CODE_MUTATION_RE.search(combined)
+        and not has_mutation_intent
     ):
         target = _resolve_target_model(host, "fast")
         return RoutingDecision(
@@ -720,7 +763,7 @@ def classify_user_prompt(
             "[Downshift] Multi-part issue drafting, planning, or mapping task detected. "
             "Use the 7-stage v2 workflow: (1) fast-path <=2 known files directly (0 subagents), "
             "(2) decompose 3+-file scope into 2-4 disjoint slices in 1 turn, "
-            "(3) hand out effort tags (@low <3-file lookup, @medium 3+-file survey/test/lint, @high architecture/mutations/migrations/locking/auth), "
+            "(3) hand out effort tags (@low unknown-file discovery or 1-4-file contract lookup, @medium 3+-file survey/test/lint, @high architecture/mutations/migrations/locking/auth), "
             f"(4) spawn parallel {delegation}, "
             "(5) require <=15-line 4-field hand-backs (Files & Lines, Exists vs Missing, Boundary Contract, Risks) and reconcile cross-layer boundary contracts on the frontier main agent, "
             "(6) run <=2-file checks directly or heavy suites via @medium with a 2-retry circuit breaker, and "

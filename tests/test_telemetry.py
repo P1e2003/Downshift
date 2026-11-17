@@ -706,3 +706,90 @@ def test_run_hook_launcher_preserves_paths_with_spaces(tmp_path: Path) -> None:
     html_text = html_out.read_text(encoding="utf-8")
     assert "Downshift Scoreboard 2.0" in html_text
     assert "codex: 1" in html_text
+
+
+def test_stats_cli_counts_compliant_effort_tagged_calls_as_saved_and_tracks_overwritten(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "compliant_saved.jsonl"
+    rows = [
+        # 1. Hook rewrote inherit -> flash (@medium): overwritten=True, saved=True
+        {
+            "timestamp": "2026-11-18T00:00:01Z",
+            "host": "antigravity",
+            "mode": "active",
+            "subagent_type": "research",
+            "role": "Slice 1 @medium",
+            "prompt_chars": 400,
+            "original_model": "inherit",
+            "target_model": "flash",
+            "tier": "fast",
+            "reason": "inline_override:fast",
+            "overwritten": True,
+        },
+        # 2. Caller already passed flash + @medium: overwritten=False, still saved=True!
+        {
+            "timestamp": "2026-11-18T00:00:02Z",
+            "host": "antigravity",
+            "mode": "active",
+            "subagent_type": "research",
+            "role": "Slice 2 @medium",
+            "prompt_chars": 420,
+            "original_model": "flash",
+            "target_model": "flash",
+            "tier": "fast",
+            "reason": "inline_override:fast",
+            "overwritten": False,
+        },
+        # 3. Caller already passed flash_lite + @low: overwritten=False, still saved=True!
+        {
+            "timestamp": "2026-11-18T00:00:03Z",
+            "host": "antigravity",
+            "mode": "active",
+            "subagent_type": "research",
+            "role": "Locator @low",
+            "prompt_chars": 210,
+            "original_model": "flash_lite",
+            "target_model": "flash_lite",
+            "tier": "lite",
+            "reason": "inline_override:lite",
+            "overwritten": False,
+        },
+        # 4. Untagged caller_explicit_model_preserved (Spec 010 Gap-3): overwritten=False, saved=False
+        {
+            "timestamp": "2026-11-18T00:00:04Z",
+            "host": "codex",
+            "mode": "active",
+            "subagent_type": "spawn_agent",
+            "role": "Helper",
+            "prompt_chars": 120,
+            "original_model": "gpt-6-luna",
+            "target_model": "gpt-6-luna",
+            "tier": "lite",
+            "reason": "caller_explicit_model_preserved",
+            "overwritten": False,
+        },
+        # 5. Shadow-mode non-overwritten row: saved=False
+        {
+            "timestamp": "2026-11-18T00:00:05Z",
+            "host": "antigravity",
+            "mode": "shadow",
+            "subagent_type": "research",
+            "role": "Shadow @medium",
+            "prompt_chars": 300,
+            "original_model": "flash",
+            "target_model": "flash",
+            "tier": "fast",
+            "reason": "inline_override:fast",
+            "overwritten": False,
+        },
+    ]
+    ledger.write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n",
+        encoding="utf-8",
+    )
+    summary = compute_summary(load_events(ledger))
+    assert summary["total"] == 5
+    assert summary["saved"] == 3
+    assert summary["overwritten_calls"] == 1
+    assert summary["saved_pct"] == 60.0

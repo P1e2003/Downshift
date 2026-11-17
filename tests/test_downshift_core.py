@@ -1607,3 +1607,198 @@ def test_classify_user_prompt_7_stage_v2_draft_plan_and_allocate_en_vi() -> None
     )
     assert routine.should_inject is True
     assert routine.reason == "routine_search_or_log_task"
+
+
+def test_effort_tagged_readonly_slice_mapper_avoids_false_positive_guardrail_upgrade() -> (
+    None
+):
+    # 1. Directory paths without file extensions are masked by strip_benign_code_identifiers
+    masked = strip_benign_code_identifiers(
+        "Inspect apps/lang-api/src/migrations/ and /api/v1/auth/permissions routes"
+    )
+    assert "migrations" not in masked
+    assert "auth" not in masked
+    assert "permissions" not in masked
+
+    # 2. Real @medium research slice mappers mentioning migrations/, auth, permission, and HTTP PATCH stay fast
+    slice_db = classify_subagent_call(
+        type_name="research",
+        role="Slice 1 Docs Infra & DB Scanner @medium",
+        prompt=(
+            "Inspect apps/lang-api/src/migrations/ and summarize existing migration "
+            "filenames, table columns, and Boundary Contract: DB/auth invariants."
+        ),
+        current_model="flash",
+        host="antigravity",
+    )
+    assert slice_db.tier == "fast"
+    assert slice_db.target_model == "flash"
+    assert slice_db.should_overwrite is False
+    assert slice_db.reason == "inline_override:fast"
+
+    slice_ui = classify_subagent_call(
+        type_name="research",
+        role="Slice 2 Dashboard Exams & Editor UI Mapper @medium",
+        prompt=(
+            "Map frontend auth hooks, role permission badges, and JWT header forwarding "
+            "across apps/lang-app/src/."
+        ),
+        current_model="inherit",
+        host="antigravity",
+    )
+    assert slice_ui.tier == "fast"
+    assert slice_ui.target_model == "flash"
+    assert slice_ui.should_overwrite is True
+    assert slice_ui.reason == "inline_override:fast"
+
+    # 3. @low 4-file contract lookup with uppercase HTTP PATCH /... stays lite
+    wire_lookup = classify_subagent_call(
+        type_name="Explore",
+        role="API Wire Contract Lookup @low",
+        prompt=(
+            "Extract request/response DTO fields for GET /api/exams, POST /api/exams, "
+            "PATCH /api/exams/:id, and DELETE /api/exams/:id across "
+            "a.ts, b.ts, c.ts, and d.ts including auth guard decorator names."
+        ),
+        current_model="",
+        host="claude",
+    )
+    assert wire_lookup.tier == "lite"
+    assert wire_lookup.target_model == "haiku"
+    assert wire_lookup.should_overwrite is True
+    assert wire_lookup.reason == "inline_override:lite"
+
+    # 4. Uppercase HTTP PATCH route on general read-only role is not misclassified as code mutation
+    http_patch_slice = classify_subagent_call(
+        type_name="spawn_agent",
+        role="Slice 1 Route Extractor",
+        prompt="Extract route signature for PATCH /api/v1/contacts/:id in contacts.py",
+        current_model="inherit",
+        host="codex",
+    )
+    assert http_patch_slice.tier == "lite"
+    assert http_patch_slice.target_model == "gpt-6-luna"
+
+    # But lowercase/verb 'patch the bug' still stays on frontier
+    verb_patch = classify_subagent_call(
+        type_name="spawn_agent",
+        role="Slice 1 Route Extractor",
+        prompt="Read contacts.py and patch the validation bug",
+        current_model="inherit",
+        host="codex",
+    )
+    assert verb_patch.tier == "frontier"
+
+
+def test_effort_tagged_readonly_security_audit_locking_and_incidents_still_force_frontier() -> (
+    None
+):
+    cfg = DownshiftConfig(
+        high_risk_keywords=("tenant_isolation",),
+        pinned_roles={"Security Auditor": "frontier"},
+    )
+    must_stay_frontier = [
+        (
+            "research",
+            "Backend Malware Auditor @medium",
+            "Scan apps/lang-api for obfuscated payloads",
+            "flash",
+            "antigravity",
+        ),
+        (
+            "Explore",
+            "Security Slice @medium",
+            "Audit JWT auth bypass vulnerability and IDOR in tenants.py",
+            "sonnet",
+            "claude",
+        ),
+        (
+            "research",
+            "Migration Checker @low",
+            "Audit alembic migration head conflicts and DDL rollback risk",
+            "flash_lite",
+            "antigravity",
+        ),
+        (
+            "research",
+            "Lock Tracer @medium",
+            "Investigate PostgreSQL deadlock and race condition in for update lock",
+            "flash",
+            "antigravity",
+        ),
+        (
+            "research",
+            "Incident Reader @medium",
+            "Check production incident logs for data corruption",
+            "flash",
+            "antigravity",
+        ),
+        (
+            "research",
+            "Vi Security @low",
+            "Rà soát bảo mật và lỗ hổng phân quyền trong hệ thống",
+            "flash_lite",
+            "antigravity",
+        ),
+        (
+            "research",
+            "Slice Mapper @medium",
+            "Extract tenant_isolation headers across routes",
+            "flash",
+            "antigravity",
+        ),
+        (
+            "research",
+            "Security Auditor @medium",
+            "List files in backend/app",
+            "flash",
+            "antigravity",
+        ),
+        (
+            "self",
+            "Backend Helper @medium",
+            "Inspect migrations and auth middleware in backend/",
+            "flash",
+            "antigravity",
+        ),
+        (
+            "spawn_agent",
+            "Worker @low",
+            "Check auth permission middleware in api.py",
+            "gpt-6-luna",
+            "codex",
+        ),
+        (
+            "research",
+            "Mixed Migration + Deadlock @medium",
+            "Inspect migrations folder and trace PostgreSQL deadlock on table",
+            "flash",
+            "antigravity",
+        ),
+        (
+            "research",
+            "Stego Checker @medium",
+            "Scan for steganography and obfuscated JS",
+            "flash",
+            "antigravity",
+        ),
+        (
+            "research",
+            "Advisory Lock @medium",
+            "Inspect advisory_lock ordering in contact creation",
+            "flash",
+            "antigravity",
+        ),
+    ]
+    for sub_type, role, prompt, cur_model, host in must_stay_frontier:
+        decision = classify_subagent_call(
+            type_name=sub_type,
+            role=role,
+            prompt=prompt,
+            current_model=cur_model,
+            host=host,
+            config=cfg,
+        )
+        assert decision.tier == "frontier", f"Unsafe downgrade on: {role} | {prompt}"
+        assert decision.target_model == "inherit"
+        assert decision.should_overwrite is True

@@ -24,9 +24,9 @@ Display this compact reference card in a fenced `text` block:
     rollback · security · auth · permission · idor · phân quyền · bảo mật · khóa bảng · di trú dữ liệu
 
   7-Stage v2 Subagent Orchestration & Effort Hand-Out
-    1. Triage & Gate     <=2 known files -> 0 subagents (read/edit/verify directly on main agent)
+    1. Triage & Gate     <=2 already-known files -> 0 subagents (read/edit/verify directly on main agent)
     2. Decompose         Split 3+-file / multi-layer scope into 2-4 disjoint slices in 1 turn
-    3. Effort Hand-Out   @low (<3-file/<600-char lookup) · @medium (3+-file survey/test/lint) · @high (arch/edits/migrations/locks/auth)
+    3. Effort Hand-Out   @low (unknown-file discovery & 1-4-file contract lookup) · @medium (3+-file survey/test/lint) · @high (arch/security audits/edits/migrations/locks)
     4. Parallel Fan-Out  Spawn 2-4 subagents in 1 turn (inherit = read-only; branch/share required for parallel @high edits)
     5. Hand-Back (<=15L) 4 fields (Files & Lines, Exists vs Missing, Boundary Contract, Risks) -> frontier cross-layer synthesis
     6. Adaptive Check    1-2 file checks direct; full test/lint/build via @medium · max 2-retry circuit breaker on failures
@@ -37,6 +37,7 @@ Display this compact reference card in a fenced `text` block:
     @high / @pro / @opus / @frontier / @inherit        Force Tier 3 (frontier · high effort)
     @medium / @flash / @sonnet / @fast / @downshift    Route safe tasks to Tier 2 (fast · medium effort)
     @low / @flash_lite / @lite / @haiku                Route safe tasks to Tier 1 (lite · low effort)
+    Host Effort          Antigravity: flash_lite/flash/inherit aliases (keep main chat on Carbon/Argon) · Claude: haiku/sonnet/inherit · Codex: model + low/medium/high reasoning_effort
 
   Modes & Workspace Config (.downshift.json / DOWNSHIFT_MODE / DOWNSHIFT_MAX_BURST)
     active (default)   Enforce model routing + record telemetry
