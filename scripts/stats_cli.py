@@ -73,6 +73,7 @@ def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     hosts: dict[str, int] = {}
     reasons: dict[str, int] = {}
     saved = 0
+    overwritten_calls = 0
     active_count = 0
     shadow_count = 0
     guardrail_count = 0
@@ -87,8 +88,6 @@ def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         actual_weighted_cost += TIER_COST_WEIGHT.get(tier, 1.00)
         model = str(ev.get("target_model") or "inherit")
         models[model] = models.get(model, 0) + 1
-        if tier in ("lite", "fast") and bool(ev.get("overwritten", True)):
-            saved += 1
 
         host = str(ev.get("host") or "antigravity").strip().lower() or "antigravity"
         hosts[host] = hosts.get(host, 0) + 1
@@ -108,6 +107,16 @@ def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         else:
             active_count += 1
 
+        is_overwritten = bool(ev.get("overwritten", True))
+        if is_overwritten:
+            overwritten_calls += 1
+        is_downshift_delegated = is_overwritten or (
+            mode != "shadow"
+            and reason.startswith(("inline_override:", "workspace_config:"))
+        )
+        if tier in ("lite", "fast") and is_downshift_delegated:
+            saved += 1
+
         raw_chars = ev.get("prompt_chars", 0)
         try:
             total_prompt_chars += max(0, int(raw_chars or 0))
@@ -121,6 +130,7 @@ def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "total": total,
         "saved": saved,
+        "overwritten_calls": overwritten_calls,
         "saved_pct": saved_pct,
         "est_cost_saved_pct": est_cost_saved_pct,
         "active_count": active_count,

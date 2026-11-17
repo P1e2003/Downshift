@@ -19,15 +19,15 @@ Always follow these model-tier delegation rules when spawning subagents (`invoke
 
 When drafting an issue, planning a feature/spec, mapping an issue against `main` / `develop`, or executing multi-module work, follow this deterministic 7-stage lifecycle instead of running 10–15 sequential tool calls on the frontier model or spawning an oversized subagent:
 
-1. **Stage 1 — Triage & Fast-Path Gate (`<= 2` Known Files):** Read the issue or spec first. If the task touches **`<= 2` known files**, allocate **`0` subagents** and read, edit, and verify directly on the main agent to avoid subagent startup overhead.
+1. **Stage 1 — Triage & Fast-Path Gate (`<= 2` Known Files):** Read the issue or spec first. If `1–2` exact file paths are **already known** in context, allocate **`0` subagents** and read, edit, and verify directly on the main agent to avoid subagent startup overhead.
 2. **Stage 2 — Plan & Decompose Slices (`Main Agent, 1 Turn`):** For `3+`-file or multi-layer tasks, partition the work into **`2–4` disjoint slices** in a single turn (for example: Slice 1 = Backend Models/Migrations, Slice 2 = API Routes/Services, Slice 3 = Frontend UI/Hooks).
 3. **Stage 3 — Deterministic Effort Hand-Out (`@low` / `@medium` / `@high`):** Assign an explicit effort tag to each slice based on scope and risk:
 
 | Effort Tag | Resolved Tier | Host Models (`Antigravity` / `Claude` / `Codex`) | Slice Scope & Assignment Criteria |
 | :--- | :---: | :--- | :--- |
-| **`@low`** | **Tier 1 (`lite` · `0.04x`)** | `flash_lite` / `haiku` / `gpt-6-luna` (`low`) | Bounded `< 3`-file read-only lookups (`< 600` chars): locating files/symbols, extracting exact route/type signatures, `git status` / `git branch`, line counts. |
+| **`@low`** | **Tier 1 (`lite` · `0.04x`)** | `flash_lite` / `haiku` / `gpt-6-luna` (`low`) | Unknown-path file/symbol discovery, `git status` / `git branch`, config/manifest checks, and bounded `1–4`-file (`<= 1,200`-char) read-only route/DTO/type signature extraction. |
 | **`@medium`** | **Tier 2 (`fast` · `0.20x`)** | `flash` / `sonnet` / `gpt-6.1-sol` (`medium`) | `3+`-file read-only module surveys, cross-module caller tracing, log scanning, baseline comparisons, and pure test/lint/build suite execution (`pytest`, `vitest`, `ruff`, `eslint`, `npm run build`). |
-| **`@high`** | **Tier 3 (`frontier` · `1.00x`)** | `inherit` (`Pro` / `Opus` / `gpt-6-astra`, `high`) | Architecture audits, multi-file stateful code mutations, `alembic` migrations, `FOR UPDATE`/advisory locks, and security/auth/RBAC logic. |
+| **`@high`** | **Tier 3 (`frontier` · `1.00x`)** | `inherit` (`Pro` / `Opus` / `gpt-6-astra`, `high`) | Architecture design, security/malware/vulnerability audits, multi-file stateful code mutations, `alembic` migrations, `FOR UPDATE`/advisory locks, and RBAC/auth implementation. |
 
 4. **Stage 4 — Parallel Subagent Fan-Out (`Single-Turn Delegation`):** Spawn **`2–4` subagents concurrently in the same tool-call turn** (`invoke_subagent` on Antigravity, `Task`/`Explore` on Claude Code, `spawn_agent` on OpenAI Codex; $T_{\text{parallel}} \approx \max(T_i)$) with their `@low` / `@medium` / `@high` tag and target boundary questions. Keep shared `Workspace="inherit"` strictly read-only; any parallel mutating `@high` workers MUST use isolated `branch` / `share` worktrees.
 5. **Stage 5 — Compact 4-Field Hand-Back (`<= 15` Lines) & Frontier Synthesis:** Require each subagent reply to stay **`<= 15` lines** covering four structured fields:
@@ -54,4 +54,9 @@ Include any of these inline tags in a prompt or subagent `Role`/`Prompt` to over
 - `@low`, `@flash_lite`, `@lite`, `@haiku` — Route safe tasks to **Tier 1 (`lite` / `low` effort)**; blocked by high-risk safety guardrails.
 
 When multiple inline tags appear in the same subagent call, the highest tier wins (`@high` > `@medium` > `@low`).
+
+**Host Effort Semantics:**
+- **Google Antigravity:** `@low` / `@medium` / `@high` select `invoke_subagent` `Model` aliases (`flash_lite` / `flash` / `inherit`; Antigravity's `invoke_subagent` has no thinking-effort slider, so keep the main session on a `Carbon` / `Argon` frontier model so `inherit` stays Tier 3). Sandboxed read-only `research` slice mappers tagged `@low` / `@medium` stay on `lite` / `fast` across routine `migrations/` or `auth/` slices unless explicit security/malware/vulnerability audit, concurrency/locking, or incident signals appear.
+- **Claude Code:** `@low` / `@medium` / `@high` select `haiku` / `sonnet` / `inherit` on `Task` / `Agent` / `Explore`.
+- **OpenAI Codex:** `@low` / `@medium` / `@high` set both `spawn_agent` `model` (`gpt-6-luna` / `gpt-6.1-sol` / `inherit`) and `reasoning_effort` (`low` / `medium` / `high`).
 
