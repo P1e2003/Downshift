@@ -68,7 +68,7 @@ def test_hooks_json_references_existing_scripts() -> None:
         assert (ROOT / match.group(1)).exists()
 
     assert isinstance(spec["PreToolUse"], list)
-    assert spec["PreToolUse"][0]["matcher"] == "invoke_subagent"
+    assert spec["PreToolUse"][0]["matcher"] == "invoke_subagent|swarm|run_workflow"
     for matcher_group in spec["PreToolUse"]:
         for hook in matcher_group["hooks"]:
             assert hook["type"] == "command"

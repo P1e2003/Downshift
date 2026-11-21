@@ -15,9 +15,11 @@ from downshift_core import (
     DownshiftConfig,
     RoutingDecision,
     classify_subagent_call,
+    classify_swarm_add,
     classify_user_prompt,
     detect_host,
     extract_workspace_dir,
+    inspect_workflow_script,
     load_config,
     record_and_apply_burst_cap,
     record_routing_event,
@@ -1802,3 +1804,160 @@ def test_effort_tagged_readonly_security_audit_locking_and_incidents_still_force
         assert decision.tier == "frontier", f"Unsafe downgrade on: {role} | {prompt}"
         assert decision.target_model == "inherit"
         assert decision.should_overwrite is True
+
+
+def test_load_config_parses_swarm_models_and_env_overrides(tmp_path: Path) -> None:
+    cfg_file = tmp_path / ".downshift.json"
+    cfg_file.write_text(
+        json.dumps(
+            {
+                "mode": "active",
+                "swarm_models": {
+                    "lite": "Gemini 3 Flash-Lite",
+                    "fast": "Gemini 3 Flash",
+                    "frontier": "ignored-key",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(workspace_dir=tmp_path, env={})
+    assert cfg.swarm_models == {
+        "lite": "Gemini 3 Flash-Lite",
+        "fast": "Gemini 3 Flash",
+    }
+
+    overridden = load_config(
+        workspace_dir=tmp_path,
+        env={"DOWNSHIFT_SWARM_FAST_MODEL": "Gemini 3.5 Flash"},
+    )
+    assert overridden.swarm_models == {
+        "lite": "Gemini 3 Flash-Lite",
+        "fast": "Gemini 3.5 Flash",
+    }
+
+
+def test_classify_swarm_add_handles_option_a_workspaces_fork_and_counts() -> None:
+    unconf = DownshiftConfig()
+    dec_safe, count_n = classify_swarm_add(
+        name="verifier",
+        brief="Run pytest and eslint across packages/",
+        workspace="inherit",
+        n=3,
+        config=unconf,
+    )
+    assert count_n == 3
+    assert dec_safe.tier == "frontier"
+    assert dec_safe.should_overwrite is False
+    assert dec_safe.reason == "swarm_models_unconfigured:fast"
+
+    conf = DownshiftConfig(
+        swarm_models={"lite": "Gemini 3 Flash-Lite", "fast": "Gemini 3 Flash"}
+    )
+    dec_lite, count_tasks = classify_swarm_add(
+        name="locator",
+        brief="Find file where resolve_contact is defined",
+        workspace="inherit",
+        tasks=["a.py", "b.py"],
+        config=conf,
+    )
+    assert count_tasks == 2
+    assert dec_lite.tier == "lite"
+    assert dec_lite.target_model == "Gemini 3 Flash-Lite"
+    assert dec_lite.should_overwrite is True
+
+    dec_fork, _ = classify_swarm_add(
+        name="verifier",
+        brief="Run pytest across tests/",
+        workspace="inherit",
+        fork="coordinator",
+        config=conf,
+    )
+    assert dec_fork.tier == "frontier"
+    assert dec_fork.should_overwrite is False
+    assert dec_fork.reason == "swarm_isolated_workspace_worker"
+
+    dec_branch, _ = classify_swarm_add(
+        name="author",
+        brief="Survey files in src/",
+        workspace="branch",
+        config=conf,
+    )
+    assert dec_branch.tier == "frontier"
+    assert dec_branch.should_overwrite is False
+
+
+def test_sharded_swarm_spawn_count_feeds_cross_tool_burst_window(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "cross_burst.jsonl"
+    cfg = DownshiftConfig(max_burst_subagents=4, burst_window_seconds=5)
+    t0 = datetime(2026, 11, 21, 16, 0, 0, tzinfo=UTC)
+
+    # 1. Unconfigured 4-worker swarm call records spawn_count=4 in window
+    swarm_dec, spawn_count = classify_swarm_add(
+        name="scanner",
+        brief="Survey callers across backend modules",
+        workspace="inherit",
+        tasks=["m1", "m2", "m3", "m4"],
+        config=cfg,
+    )
+    record_and_apply_burst_cap(
+        decision=swarm_dec,
+        conversation_id="conv-cross-burst",
+        subagent_type="swarm",
+        role="scanner",
+        ledger_path=ledger,
+        config=cfg,
+        now_utc=t0,
+        tool="swarm",
+        spawn_count=spawn_count,
+    )
+
+    # 2. Next invoke_subagent fast survey within 5s sees recent_count=4 -> burst cap downgrades to lite!
+    sub_dec = classify_subagent_call(
+        type_name="research",
+        role="Extra Surveyor",
+        prompt="Survey callers across frontend hooks",
+        host="antigravity",
+        config=cfg,
+    )
+    capped = record_and_apply_burst_cap(
+        decision=sub_dec,
+        conversation_id="conv-cross-burst",
+        subagent_type="research",
+        role="Extra Surveyor",
+        ledger_path=ledger,
+        config=cfg,
+        now_utc=t0 + timedelta(seconds=1),
+        tool="invoke_subagent",
+    )
+    assert capped.tier == "lite"
+    assert capped.target_model == "flash_lite"
+    assert capped.reason == "burst_cap_downgraded_to_lite"
+
+
+def test_inspect_workflow_script_infers_tiers_and_unpinned_parallel() -> None:
+    unpinned_dec, unpinned_count = inspect_workflow_script(
+        script=(
+            "res = await parallel(files, lambda f: agent(f'Check {f}', schema={'type':'string'}))\n"
+            "final = await agent('Aggregate results', schema={'type':'string'})\n"
+        ),
+        description="Audit files",
+    )
+    assert unpinned_count == 2
+    assert unpinned_dec.tier == "frontier"
+    assert unpinned_dec.should_overwrite is False
+    assert unpinned_dec.reason == "workflow_dispatch_unpinned_parallel"
+
+    pinned_dec, pinned_count = inspect_workflow_script(
+        script=(
+            "res = await parallel(files, lambda f: agent(f'Check {f}', model='flash', schema={'type':'string'}))\n"
+        ),
+        description="Fast fanout",
+    )
+    assert pinned_count == 1
+    assert pinned_dec.tier == "fast"
+    assert pinned_dec.target_model == "flash"
+    assert pinned_dec.should_overwrite is False
+    assert pinned_dec.reason == "workflow_dispatch_observed"

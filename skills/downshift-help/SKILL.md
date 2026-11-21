@@ -43,7 +43,8 @@ Display this compact reference card in a fenced `text` block:
     active (default)   Enforce model routing + record telemetry
     shadow             Dry-run: record telemetry without overwriting models
     off                Disable routing, telemetry, and hints
-    .downshift.json    mode, hints, high_risk_keywords, pinned_roles, max_burst_subagents (4), burst_window_seconds (5)
+    .downshift.json    mode, hints, high_risk_keywords, pinned_roles, max_burst_subagents (4), burst_window_seconds (5), swarm_models ({lite, fast})
+    Antigravity Hooks  invoke_subagent (auto-route), swarm(action="add") (safe-by-default unless swarm_models set + sharded burst cap), run_workflow (read-only telemetry)
 
   Commands
     /downshift-stats   Show live routing scoreboard from ~/.gemini/downshift_ledger.jsonl

@@ -71,6 +71,7 @@ def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     tiers = {"lite": 0, "fast": 0, "frontier": 0}
     models: dict[str, int] = {}
     hosts: dict[str, int] = {}
+    tools: dict[str, int] = {}
     reasons: dict[str, int] = {}
     saved = 0
     overwritten_calls = 0
@@ -78,6 +79,7 @@ def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     shadow_count = 0
     guardrail_count = 0
     total_prompt_chars = 0
+    total_workers = 0
     actual_weighted_cost = 0.0
 
     for ev in events:
@@ -91,6 +93,18 @@ def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
 
         host = str(ev.get("host") or "antigravity").strip().lower() or "antigravity"
         hosts[host] = hosts.get(host, 0) + 1
+
+        default_tool = (
+            "spawn_agent"
+            if host == "codex"
+            else ("Task" if host == "claude" else "invoke_subagent")
+        )
+        tool_name = str(ev.get("tool") or "").strip() or default_tool
+        tools[tool_name] = tools.get(tool_name, 0) + 1
+        try:
+            total_workers += max(1, int(ev.get("spawn_count") or 1))
+        except (ValueError, TypeError):
+            total_workers += 1
 
         reason = str(ev.get("reason") or "unknown").strip() or "unknown"
         reasons[reason] = reasons.get(reason, 0) + 1
@@ -136,9 +150,11 @@ def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         "active_count": active_count,
         "shadow_count": shadow_count,
         "total_prompt_chars": total_prompt_chars,
+        "total_workers": total_workers,
         "tiers": tiers,
         "models": models,
         "hosts": hosts,
+        "tools": tools,
         "reasons": reasons,
         "guardrail_count": guardrail_count,
     }
@@ -168,6 +184,13 @@ def render_ascii_scoreboard(summary: dict[str, Any], ledger_path: Path) -> str:
     hosts = summary.get("hosts") or {}
     host_summary = ", ".join(f"{h}: {c}" for h, c in sorted(hosts.items())) or "none"
     guardrail_count = int(summary.get("guardrail_count", 0))
+    tools = summary.get("tools") or {}
+    has_extra_tools = any(k in tools for k in ("swarm", "run_workflow"))
+    tool_line = (
+        f"  │  Orchestrators               : {_truncate_cell(', '.join(f'{t}: {c}' for t, c in sorted(tools.items())))}\n"
+        if has_extra_tools
+        else ""
+    )
     host_line = _truncate_cell(f"{host_summary} · {guardrail_count} guardrail(s)")
     top_reasons = _truncate_cell(_format_top_reasons(summary.get("reasons") or {}))
 
@@ -195,6 +218,7 @@ def render_ascii_scoreboard(summary: dict[str, Any], ledger_path: Path) -> str:
         f"  │  └── Kept on frontier        : {frontier:2d} ({frontier_pct:.1f}%) {frontier_bar} [guardrail/stateful · 1.00x]\n"
         "  │\n"
         f"  │  Hosts & guardrails          : {host_line}\n"
+        f"{tool_line}"
         f"  │  Top routing reasons         : {top_reasons}\n"
         "  ╰─────────────────────────────────────────────────────────────────────────────────────\n"
     )
@@ -219,6 +243,10 @@ def render_html_widget(summary: dict[str, Any], ledger_path: Path) -> str:
     frontier_pct = round((frontier / total) * 100.0, 1) if total > 0 else 0.0
     hosts = summary.get("hosts") or {}
     host_summary = ", ".join(f"{h}: {c}" for h, c in sorted(hosts.items())) or "none"
+    tools = summary.get("tools") or {}
+    if any(k in tools for k in ("swarm", "run_workflow")):
+        tool_summary = ", ".join(f"{t}: {c}" for t, c in sorted(tools.items()))
+        host_summary = f"{host_summary} · {tool_summary}"
     guardrail_count = int(summary.get("guardrail_count", 0))
     esc_path = html.escape(str(ledger_path))
     esc_hosts = html.escape(host_summary)

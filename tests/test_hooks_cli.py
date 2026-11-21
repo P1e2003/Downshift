@@ -1567,3 +1567,246 @@ def test_pre_invocation_cli_7_stage_v2_orchestration_advisory(tmp_path: Path) ->
             "2-retry circuit breaker",
         ):
             assert required_term in doc_plain, f"Missing {required_term!r} in {doc_rel}"
+
+
+def test_swarm_non_add_actions_pass_through_without_ledger_write(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "swarm_noop_ledger.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+    for action in ("status", "models", "model", "kill", "title"):
+        code, data = _run_hook(
+            PRE_TOOL_USE,
+            {
+                "conversationId": "conv-swarm-noop",
+                "toolCall": {
+                    "name": "swarm",
+                    "args": {"action": action, "name": "worker-1"},
+                },
+            },
+            extra_env=env,
+        )
+        assert code == 0
+        assert data == {"decision": "allow"}
+    assert not ledger.exists()
+
+
+def test_swarm_add_option_a_safe_default_vs_configured_swarm_models(
+    tmp_path: Path,
+) -> None:
+    # 1. Without swarm_models configured (Option A safe default): no overwrite, honest frontier telemetry
+    ledger_unconf = tmp_path / "swarm_unconfigured.jsonl"
+    code_u, data_u = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-swarm-safe",
+            "cwd": str(tmp_path),
+            "toolCall": {
+                "name": "swarm",
+                "args": {
+                    "action": "add",
+                    "name": "verifier",
+                    "brief": "Run pytest and ruff lint across tests/ @medium",
+                    "workspace": "inherit",
+                },
+            },
+        },
+        extra_env={"DOWNSHIFT_LEDGER_PATH": str(ledger_unconf)},
+    )
+    assert code_u == 0
+    assert data_u == {"decision": "allow"}
+    row_u = json.loads(ledger_unconf.read_text(encoding="utf-8").strip())
+    assert row_u["tool"] == "swarm"
+    assert row_u["tier"] == "frontier"
+    assert row_u["overwritten"] is False
+    assert row_u["reason"] == "swarm_models_unconfigured:fast"
+
+    # 2. With swarm_models configured in .downshift.json: overwrites lowercase `model`
+    ws_cfg = tmp_path / "ws_swarm_cfg"
+    ws_cfg.mkdir()
+    (ws_cfg / ".downshift.json").write_text(
+        json.dumps(
+            {
+                "mode": "active",
+                "swarm_models": {
+                    "lite": "Gemini 3 Flash-Lite",
+                    "fast": "Gemini 3 Flash",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    ledger_conf = tmp_path / "swarm_configured.jsonl"
+    code_c, data_c = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-swarm-cfg",
+            "cwd": str(ws_cfg),
+            "toolCall": {
+                "name": "swarm",
+                "args": {
+                    "action": "add",
+                    "name": "verifier",
+                    "brief": "Run pytest and ruff lint across tests/",
+                    "workspace": "inherit",
+                },
+            },
+        },
+        extra_env={"DOWNSHIFT_LEDGER_PATH": str(ledger_conf)},
+    )
+    assert code_c == 0
+    assert data_c == {
+        "decision": "allow",
+        "overwrite": {"model": "Gemini 3 Flash"},
+    }
+    row_c = json.loads(ledger_conf.read_text(encoding="utf-8").strip())
+    assert row_c["tool"] == "swarm"
+    assert row_c["tier"] == "fast"
+    assert row_c["target_model"] == "Gemini 3 Flash"
+    assert row_c["overwritten"] is True
+
+
+def test_swarm_share_author_and_high_risk_upgrade_stay_frontier(
+    tmp_path: Path,
+) -> None:
+    ws_cfg = tmp_path / "ws_swarm_guard"
+    ws_cfg.mkdir()
+    (ws_cfg / ".downshift.json").write_text(
+        json.dumps(
+            {
+                "mode": "active",
+                "swarm_models": {
+                    "lite": "Gemini 3 Flash-Lite",
+                    "fast": "Gemini 3 Flash",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    ledger = tmp_path / "swarm_guard.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+
+    # Isolated worktree author (`workspace="share"`) stays on frontier even if brief sounds read-only
+    code_share, data_share = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-swarm-share",
+            "cwd": str(ws_cfg),
+            "toolCall": {
+                "name": "swarm",
+                "args": {
+                    "action": "add",
+                    "name": "author-1",
+                    "brief": "Inspect and survey module structure @medium",
+                    "workspace": "share",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert code_share == 0
+    assert data_share == {"decision": "allow"}
+
+    # High-risk brief with explicit lower-tier swarm model clears `model` to "" (frontier fallback)
+    code_risk, data_risk = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-swarm-risk",
+            "cwd": str(ws_cfg),
+            "toolCall": {
+                "name": "swarm",
+                "args": {
+                    "action": "add",
+                    "name": "auditor",
+                    "brief": "Audit alembic migration and JWT auth bypass vulnerability",
+                    "workspace": "inherit",
+                    "model": "Gemini 3 Flash",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert code_risk == 0
+    assert data_risk == {"decision": "allow", "overwrite": {"model": ""}}
+
+
+def test_swarm_sharded_tasks_counts_against_burst_cap(tmp_path: Path) -> None:
+    ws_cfg = tmp_path / "ws_swarm_burst"
+    ws_cfg.mkdir()
+    (ws_cfg / ".downshift.json").write_text(
+        json.dumps(
+            {
+                "mode": "active",
+                "max_burst_subagents": 4,
+                "swarm_models": {
+                    "lite": "Gemini 3 Flash-Lite",
+                    "fast": "Gemini 3 Flash",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    ledger = tmp_path / "swarm_burst.jsonl"
+    code, data = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-swarm-burst",
+            "cwd": str(ws_cfg),
+            "toolCall": {
+                "name": "swarm",
+                "args": {
+                    "action": "add",
+                    "name": "scanner",
+                    "brief": "Survey callers across assigned module",
+                    "workspace": "inherit",
+                    "tasks": ["mod-1", "mod-2", "mod-3", "mod-4", "mod-5"],
+                },
+            },
+        },
+        extra_env={"DOWNSHIFT_LEDGER_PATH": str(ledger)},
+    )
+    assert code == 0
+    assert data == {
+        "decision": "allow",
+        "overwrite": {"model": "Gemini 3 Flash-Lite"},
+    }
+    row = json.loads(ledger.read_text(encoding="utf-8").strip())
+    assert row["spawn_count"] == 5
+    assert row["reason"] == "burst_cap_downgraded_to_lite"
+
+
+def test_run_workflow_logs_privacy_safe_telemetry_without_rewriting_script(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "workflow_ledger.jsonl"
+    secret_marker = "SECRET_PY_TOKEN_NEVER_STORE_IN_LEDGER"
+    script_src = (
+        f"# {secret_marker}\n"
+        'await parallel(files, lambda f: agent(f"Inspect {f}", schema={"type": "string"}))\n'
+    )
+    code, data = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-wf-1",
+            "toolCall": {
+                "name": "run_workflow",
+                "args": {
+                    "Description": "Fan out lint audit across modules",
+                    "Script": script_src,
+                },
+            },
+        },
+        extra_env={"DOWNSHIFT_LEDGER_PATH": str(ledger)},
+    )
+    assert code == 0
+    assert data == {"decision": "allow"}
+    raw_ledger = ledger.read_text(encoding="utf-8")
+    assert secret_marker not in raw_ledger
+    row = json.loads(raw_ledger.strip())
+    assert row["tool"] == "run_workflow"
+    assert row["tier"] == "frontier"
+    assert row["overwritten"] is False
+    assert row["reason"] == "workflow_dispatch_unpinned_parallel"
+    assert row["prompt_chars"] == len(script_src) + len(
+        "Fan out lint audit across modules"
+    )

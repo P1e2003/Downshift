@@ -4,13 +4,17 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 from downshift_core import (
     CODEX_TIER_REASONING_EFFORT,
+    DownshiftConfig,
     classify_subagent_call,
+    classify_swarm_add,
     detect_host,
     extract_workspace_dir,
+    inspect_workflow_script,
     load_config,
     record_and_apply_burst_cap,
 )
@@ -51,6 +55,85 @@ def _extract_claude_or_codex_fields(
     return type_name, role, prompt_text
 
 
+def _handle_antigravity_swarm(
+    payload: dict[str, Any], args: dict[str, Any], config: DownshiftConfig
+) -> dict[str, Any]:
+    action = str(args.get("action") or "").strip().lower()
+    if action != "add":
+        return {"decision": "allow"}
+    name = str(args.get("name") or "")
+    brief = str(args.get("brief") or "")
+    tasks = args.get("tasks") if isinstance(args.get("tasks"), list) else None
+    if not name.strip() and not brief.strip() and not tasks:
+        return {"decision": "allow"}
+    workspace = str(args.get("workspace") or "inherit")
+    orig_model = str(args.get("model") or "")
+    fork = str(args.get("fork") or "")
+    raw_n = args.get("n")
+    n_val = raw_n if isinstance(raw_n, int) and not isinstance(raw_n, bool) else None
+    decision, spawn_count = classify_swarm_add(
+        name=name,
+        brief=brief,
+        workspace=workspace,
+        current_model=orig_model,
+        n=n_val,
+        tasks=tasks,
+        fork=fork,
+        config=config,
+    )
+    decision = record_and_apply_burst_cap(
+        decision=decision,
+        conversation_id=str(payload.get("conversationId") or ""),
+        subagent_type="swarm",
+        role=name,
+        original_model=orig_model or "inherit",
+        mode=config.mode,
+        prompt_chars=len(brief),
+        config=config,
+        tool="swarm",
+        spawn_count=spawn_count,
+    )
+    if config.mode == "active" and decision.should_overwrite:
+        return {
+            "decision": "allow",
+            "overwrite": {
+                "model": decision.target_model,
+            },
+        }
+    return {"decision": "allow"}
+
+
+def _handle_antigravity_workflow(
+    payload: dict[str, Any], args: dict[str, Any], config: DownshiftConfig
+) -> dict[str, Any]:
+    script = str(args.get("Script") or "")
+    script_path = str(args.get("ScriptPath") or "")
+    description = str(args.get("Description") or "")
+    if not script.strip() and not script_path.strip() and not description.strip():
+        return {"decision": "allow"}
+    decision, spawn_count = inspect_workflow_script(
+        script=script, description=description
+    )
+    role_label = (
+        description.strip()
+        or (Path(script_path).name if script_path.strip() else "")
+        or "workflow"
+    )
+    record_and_apply_burst_cap(
+        decision=decision,
+        conversation_id=str(payload.get("conversationId") or ""),
+        subagent_type="run_workflow",
+        role=role_label,
+        original_model="inherit",
+        mode=config.mode,
+        prompt_chars=len(script) + len(description),
+        config=config,
+        tool="run_workflow",
+        spawn_count=spawn_count,
+    )
+    return {"decision": "allow"}
+
+
 def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
     host = detect_host(payload)
     config = load_config(workspace_dir=extract_workspace_dir(payload))
@@ -60,12 +143,16 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
     if host == "antigravity":
         tool_call = _as_dict(payload.get("toolCall"))
         tool_name = str(tool_call.get("name") or "")
-        if tool_name != "invoke_subagent":
-            return {"decision": "allow"}
-
         raw_args = tool_call.get("args")
         if not isinstance(raw_args, dict):
             return {"decision": "allow"}
+        if tool_name == "swarm":
+            return _handle_antigravity_swarm(payload, raw_args, config)
+        if tool_name == "run_workflow":
+            return _handle_antigravity_workflow(payload, raw_args, config)
+        if tool_name != "invoke_subagent":
+            return {"decision": "allow"}
+
         args = raw_args
         type_name = str(args.get("TypeName") or "")
         role = str(args.get("Role") or "")
@@ -90,6 +177,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
             mode=config.mode,
             prompt_chars=len(prompt_text),
             config=config,
+            tool="invoke_subagent",
         )
         if config.mode == "active" and decision.should_overwrite:
             return {
@@ -141,6 +229,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         mode=config.mode,
         prompt_chars=len(prompt_text),
         config=config,
+        tool=tool_name,
     )
     if config.mode == "active":
         updated_input: dict[str, Any] | None = None
