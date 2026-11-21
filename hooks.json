@@ -9,7 +9,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "invoke_subagent",
+        "matcher": "invoke_subagent|swarm|run_workflow",
         "hooks": [
           {
             "type": "command",

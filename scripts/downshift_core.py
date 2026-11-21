@@ -227,6 +227,10 @@ DEFAULT_MAX_BURST_SUBAGENTS = 4
 DEFAULT_BURST_WINDOW_SECONDS = 5
 BURST_TAIL_READ_BYTES = 65_536
 
+WORKFLOW_AGENT_CALL_RE = re.compile(r"\bagent\s*\(")
+WORKFLOW_PARALLEL_CALL_RE = re.compile(r"\bparallel\s*\(")
+WORKFLOW_MODEL_ARG_RE = re.compile(r"""\bmodel\s*=\s*["']([^"']+)["']""")
+
 BURST_ELIGIBLE_REASONS: frozenset[str] = frozenset(
     {
         "read_only_research_survey",
@@ -244,6 +248,7 @@ class DownshiftConfig:
     pinned_roles: dict[str, str] = field(default_factory=dict)
     max_burst_subagents: int = DEFAULT_MAX_BURST_SUBAGENTS
     burst_window_seconds: int = DEFAULT_BURST_WINDOW_SECONDS
+    swarm_models: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -356,6 +361,7 @@ def load_config(
     pinned_roles: dict[str, str] = {}
     max_burst_subagents = DEFAULT_MAX_BURST_SUBAGENTS
     burst_window_seconds = DEFAULT_BURST_WINDOW_SECONDS
+    swarm_models: dict[str, str] = {}
 
     cfg_path = _find_config_file(workspace_dir, env_map)
     if cfg_path is not None:
@@ -402,6 +408,12 @@ def load_config(
                     and raw_burst_window >= 1
                 ):
                     burst_window_seconds = raw_burst_window
+                raw_swarm_models = raw_data.get("swarm_models")
+                if isinstance(raw_swarm_models, dict):
+                    for tier_key in ("lite", "fast"):
+                        raw_val = raw_swarm_models.get(tier_key)
+                        if isinstance(raw_val, str) and raw_val.strip():
+                            swarm_models[tier_key] = raw_val.strip()
 
     env_mode = (env_map.get("DOWNSHIFT_MODE") or "").strip().lower()
     if env_mode in VALID_MODES:
@@ -423,6 +435,13 @@ def load_config(
             if parsed_burst >= 0:
                 max_burst_subagents = parsed_burst
 
+    env_swarm_lite = (env_map.get("DOWNSHIFT_SWARM_LITE_MODEL") or "").strip()
+    if env_swarm_lite:
+        swarm_models["lite"] = env_swarm_lite
+    env_swarm_fast = (env_map.get("DOWNSHIFT_SWARM_FAST_MODEL") or "").strip()
+    if env_swarm_fast:
+        swarm_models["fast"] = env_swarm_fast
+
     return DownshiftConfig(
         mode=mode,
         hints=hints,
@@ -430,6 +449,7 @@ def load_config(
         pinned_roles=pinned_roles,
         max_burst_subagents=max_burst_subagents,
         burst_window_seconds=burst_window_seconds,
+        swarm_models=swarm_models,
     )
 
 
@@ -823,6 +843,184 @@ def should_nudge_pre_invocation(
     return advisory.message if advisory.should_inject else None
 
 
+def classify_swarm_add(
+    name: str,
+    brief: str,
+    workspace: str = "inherit",
+    current_model: str = "",
+    n: int | None = None,
+    tasks: list[Any] | None = None,
+    fork: str = "",
+    config: DownshiftConfig | None = None,
+) -> tuple[RoutingDecision, int]:
+    """Classify an Antigravity swarm(action='add') call using Option A (safe-by-default swarm_models)."""
+    cfg = config if config is not None else load_config()
+    task_items = (
+        [str(t).strip() for t in tasks if isinstance(t, str) and t.strip()]
+        if isinstance(tasks, list)
+        else []
+    )
+    if task_items:
+        spawn_count = len(task_items)
+    elif isinstance(n, int) and not isinstance(n, bool) and n > 0:
+        spawn_count = n
+    else:
+        spawn_count = 1
+
+    orig_model = (current_model or "").strip()
+    lower_orig = orig_model.lower()
+    configured_lower_tier: str | None = LOWER_TIER_MODEL_TIERS.get(lower_orig)
+    if configured_lower_tier is None and lower_orig:
+        for tier_key, configured_name in cfg.swarm_models.items():
+            if configured_name.strip().lower() == lower_orig:
+                configured_lower_tier = tier_key
+                break
+    probe_model = (
+        _resolve_target_model("antigravity", configured_lower_tier)
+        if configured_lower_tier is not None
+        else (orig_model or "inherit")
+    )
+
+    effective_prompt = (brief or "").strip()
+    if task_items:
+        joined_tasks = "\n".join(task_items)
+        effective_prompt = (
+            f"{effective_prompt}\n{joined_tasks}" if effective_prompt else joined_tasks
+        )
+
+    base = classify_subagent_call(
+        type_name="self",
+        role=name,
+        prompt=effective_prompt,
+        current_model=probe_model,
+        host="antigravity",
+        config=cfg,
+    )
+
+    if base.tier == "frontier":
+        if configured_lower_tier is not None and base.should_overwrite:
+            # Clear lower-tier pin so swarm falls back to the coordinator's frontier model
+            return (
+                RoutingDecision(
+                    host="antigravity",
+                    tier="frontier",
+                    target_model="",
+                    should_overwrite=True,
+                    reason=base.reason,
+                ),
+                spawn_count,
+            )
+        return (
+            RoutingDecision(
+                host="antigravity",
+                tier="frontier",
+                target_model=orig_model or "inherit",
+                should_overwrite=False,
+                reason=base.reason,
+            ),
+            spawn_count,
+        )
+
+    norm_ws = (workspace or "inherit").strip().lower() or "inherit"
+    if norm_ws in ("share", "branch") or bool((fork or "").strip()):
+        if configured_lower_tier is not None:
+            return (
+                RoutingDecision(
+                    host="antigravity",
+                    tier=configured_lower_tier,
+                    target_model=orig_model,
+                    should_overwrite=False,
+                    reason="caller_explicit_model_preserved",
+                ),
+                spawn_count,
+            )
+        return (
+            RoutingDecision(
+                host="antigravity",
+                tier="frontier",
+                target_model=orig_model or "inherit",
+                should_overwrite=False,
+                reason="swarm_isolated_workspace_worker",
+            ),
+            spawn_count,
+        )
+
+    configured_target = cfg.swarm_models.get(base.tier)
+    if configured_target:
+        return (
+            RoutingDecision(
+                host="antigravity",
+                tier=base.tier,
+                target_model=configured_target,
+                should_overwrite=(lower_orig != configured_target.lower()),
+                reason=base.reason,
+            ),
+            spawn_count,
+        )
+
+    if configured_lower_tier is not None:
+        return (
+            RoutingDecision(
+                host="antigravity",
+                tier=configured_lower_tier,
+                target_model=orig_model,
+                should_overwrite=False,
+                reason="caller_explicit_model_preserved",
+            ),
+            spawn_count,
+        )
+
+    # Option A safe default: never guess unconfigured swarm model names; record honest frontier execution
+    return (
+        RoutingDecision(
+            host="antigravity",
+            tier="frontier",
+            target_model=orig_model or "inherit",
+            should_overwrite=False,
+            reason=f"swarm_models_unconfigured:{base.tier}",
+        ),
+        spawn_count,
+    )
+
+
+def inspect_workflow_script(
+    script: str = "",
+    description: str = "",
+) -> tuple[RoutingDecision, int]:
+    """Read-only static telemetry inspection for Antigravity run_workflow (never rewrites Python)."""
+    text = script or ""
+    agent_calls = len(WORKFLOW_AGENT_CALL_RE.findall(text))
+    parallel_calls = len(WORKFLOW_PARALLEL_CALL_RE.findall(text))
+    explicit_models = [
+        m.strip().lower() for m in WORKFLOW_MODEL_ARG_RE.findall(text) if m.strip()
+    ]
+    spawn_count = max(1, agent_calls)
+
+    if explicit_models and all(m in LOWER_TIER_MODEL_TIERS for m in explicit_models):
+        tiers = {LOWER_TIER_MODEL_TIERS[m] for m in explicit_models}
+        inferred_tier = "fast" if "fast" in tiers else "lite"
+        target_model = _resolve_target_model("antigravity", inferred_tier)
+    else:
+        inferred_tier = "frontier"
+        target_model = "inherit"
+
+    reason = (
+        "workflow_dispatch_unpinned_parallel"
+        if parallel_calls > 0 and not explicit_models
+        else "workflow_dispatch_observed"
+    )
+    return (
+        RoutingDecision(
+            host="antigravity",
+            tier=inferred_tier,
+            target_model=target_model,
+            should_overwrite=False,
+            reason=reason,
+        ),
+        spawn_count,
+    )
+
+
 def get_ledger_path(override: str | Path | None = None) -> Path:
     """Resolve the local JSONL telemetry ledger path."""
     if override is not None:
@@ -948,7 +1146,12 @@ def _count_recent_burst_in_locked_fd(
                 entry_ts = entry_ts.replace(tzinfo=UTC)
             delta = (now_ts - entry_ts).total_seconds()
             if 0.0 <= delta <= float(window_seconds):
-                count += 1
+                raw_spawn = obj.get("spawn_count", 1)
+                try:
+                    spawn_weight = max(1, int(raw_spawn or 1))
+                except (ValueError, TypeError):
+                    spawn_weight = 1
+                count += spawn_weight
         except (ValueError, TypeError):
             continue
     return count
@@ -966,12 +1169,19 @@ def _record_event_locked(
     prompt_chars: int = 0,
     config: DownshiftConfig | None = None,
     now_utc: datetime | None = None,
+    tool: str = "",
+    spawn_count: int = 1,
 ) -> tuple[RoutingDecision, bool]:
     """Atomically evaluate the burst cap and append the routing event inside the OS file lock."""
     cfg = config if config is not None else load_config()
     now_ts = now_utc if now_utc is not None else datetime.now(UTC)
     if now_ts.tzinfo is None:
         now_ts = now_ts.replace(tzinfo=UTC)
+    try:
+        norm_spawn = max(1, int(spawn_count or 1))
+    except (ValueError, TypeError):
+        norm_spawn = 1
+    norm_tool = str(tool or "").strip()
     try:
         path = get_ledger_path(ledger_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1011,16 +1221,30 @@ def _record_event_locked(
                     now_ts=now_ts,
                     window_seconds=cfg.burst_window_seconds,
                 )
-                if recent_count >= cfg.max_burst_subagents:
-                    effective_decision = RoutingDecision(
-                        host=decision.host,
-                        tier="lite",
-                        target_model=_resolve_target_model(decision.host, "lite"),
-                        should_overwrite=True,
-                        reason="burst_cap_downgraded_to_lite",
-                    )
+                if recent_count + norm_spawn > cfg.max_burst_subagents:
+                    if norm_tool == "swarm":
+                        swarm_lite = cfg.swarm_models.get("lite")
+                        if swarm_lite:
+                            effective_decision = RoutingDecision(
+                                host=decision.host,
+                                tier="lite",
+                                target_model=swarm_lite,
+                                should_overwrite=(
+                                    str(original_model or "").strip().lower()
+                                    != swarm_lite.lower()
+                                ),
+                                reason="burst_cap_downgraded_to_lite",
+                            )
+                    else:
+                        effective_decision = RoutingDecision(
+                            host=decision.host,
+                            tier="lite",
+                            target_model=_resolve_target_model(decision.host, "lite"),
+                            should_overwrite=True,
+                            reason="burst_cap_downgraded_to_lite",
+                        )
 
-            entry = {
+            entry: dict[str, Any] = {
                 "timestamp": now_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "conversation_id": str(conversation_id or ""),
                 "host": effective_decision.host,
@@ -1034,6 +1258,10 @@ def _record_event_locked(
                 "reason": effective_decision.reason,
                 "overwritten": effective_decision.should_overwrite,
             }
+            if norm_tool:
+                entry["tool"] = norm_tool
+            if norm_spawn > 1:
+                entry["spawn_count"] = norm_spawn
             line_bytes = (json.dumps(entry, separators=(",", ":")) + "\n").encode(
                 "utf-8"
             )
@@ -1093,6 +1321,8 @@ def record_and_apply_burst_cap(
     prompt_chars: int = 0,
     config: DownshiftConfig | None = None,
     now_utc: datetime | None = None,
+    tool: str = "",
+    spawn_count: int = 1,
 ) -> RoutingDecision:
     """Atomically apply the dynamic burst cap and append the event to the JSONL ledger."""
     effective_decision, _ = _record_event_locked(
@@ -1106,6 +1336,8 @@ def record_and_apply_burst_cap(
         prompt_chars=prompt_chars,
         config=config,
         now_utc=now_utc,
+        tool=tool,
+        spawn_count=spawn_count,
     )
     return effective_decision
 
@@ -1121,6 +1353,8 @@ def record_routing_event(
     prompt_chars: int = 0,
     config: DownshiftConfig | None = None,
     now_utc: datetime | None = None,
+    tool: str = "",
+    spawn_count: int = 1,
 ) -> bool:
     """Append a privacy-safe routing event (never storing raw Prompt text) to the JSONL ledger."""
     _, ok = _record_event_locked(
@@ -1134,6 +1368,8 @@ def record_routing_event(
         prompt_chars=prompt_chars,
         config=config,
         now_utc=now_utc,
+        tool=tool,
+        spawn_count=spawn_count,
     )
     return ok
 

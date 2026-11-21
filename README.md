@@ -102,9 +102,17 @@ Example `.downshift.json` at the workspace root:
     "Log Reader": "lite"
   },
   "max_burst_subagents": 4,
-  "burst_window_seconds": 5
+  "burst_window_seconds": 5,
+  "swarm_models": {
+    "lite": "<exact lite model name from swarm(action='models')>",
+    "fast": "<exact fast model name from swarm(action='models')>"
+  }
 }
 ```
+
+- **Antigravity `/swarm` & `run_workflow` Hooks:** Downshift's Antigravity `PreToolUse` hook matches `invoke_subagent|swarm|run_workflow`:
+  - `swarm(action="add")` enforces identical safety guardrails, keeps isolated `share`/`branch`/`fork` authors on Frontier, counts sharded `n` / `len(tasks)` spawns against `max_burst_subagents`, and uses **safe-by-default** routing (only overwriting `model` when `swarm_models` is configured in `.downshift.json` or via `DOWNSHIFT_SWARM_LITE_MODEL` / `DOWNSHIFT_SWARM_FAST_MODEL`, and clearing lower-tier pins to `""` on high-risk briefs; non-`add` swarm actions pass through untouched with zero ledger noise).
+  - `run_workflow` logs privacy-safe dispatch telemetry (`tool="run_workflow"`, inferred agent count, zero raw Python stored) without ever rewriting workflow scripts.
 
 - **Precedence:** Frontier `@high` / `@frontier` tag > explicit custom non-lower-tier model > `pinned_roles` mapped to `"frontier"` > built-in & custom `high_risk_keywords` safety guardrails > lower-tier `@medium` / `@low` inline tags (`@high` > `@medium` > `@low`) > explicit lower-tier model preservation > `pinned_roles` mapped to `"lite"` / `"fast"` > heuristic classification.
 - **Portable Hook Launcher:** `hooks.json` and `hooks/claude-codex-hooks.json` invoke `./scripts/run_hook.cmd` (which delegates to `scripts/run_hook.sh` on POSIX), resolving the plugin's `scripts/` directory relative to the launcher location and automatically discovering `uv`, `python3`, `python`, or `py -3` with fail-open fallback.

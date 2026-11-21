@@ -793,3 +793,55 @@ def test_stats_cli_counts_compliant_effort_tagged_calls_as_saved_and_tracks_over
     assert summary["saved"] == 3
     assert summary["overwritten_calls"] == 1
     assert summary["saved_pct"] == 60.0
+
+
+def test_stats_cli_aggregates_swarm_and_workflow_tools_within_88_cols(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "tools_ledger.jsonl"
+    record_routing_event(
+        decision=RoutingDecision(
+            host="antigravity",
+            tier="fast",
+            target_model="Gemini 3 Flash",
+            should_overwrite=True,
+            reason="verification_test_or_lint_runner",
+        ),
+        conversation_id="conv-tools-1",
+        subagent_type="swarm",
+        role="verifier",
+        original_model="inherit",
+        ledger_path=ledger,
+        prompt_chars=180,
+        tool="swarm",
+        spawn_count=3,
+    )
+    record_routing_event(
+        decision=RoutingDecision(
+            host="antigravity",
+            tier="frontier",
+            target_model="inherit",
+            should_overwrite=False,
+            reason="workflow_dispatch_unpinned_parallel",
+        ),
+        conversation_id="conv-tools-1",
+        subagent_type="run_workflow",
+        role="Batch audit",
+        original_model="inherit",
+        ledger_path=ledger,
+        prompt_chars=240,
+        tool="run_workflow",
+        spawn_count=4,
+    )
+
+    summary = compute_summary(load_events(ledger))
+    assert summary["total"] == 2
+    assert summary["total_workers"] == 7
+    assert summary["tools"] == {"swarm": 1, "run_workflow": 1}
+    assert summary["saved"] == 1
+
+    board = render_ascii_scoreboard(summary, ledger)
+    assert "swarm: 1" in board
+    for line in board.splitlines():
+        if not line.startswith("  ╭─"):
+            assert len(line) <= 88, f"Line exceeded 88 cols ({len(line)}): {line!r}"
