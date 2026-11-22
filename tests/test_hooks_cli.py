@@ -10,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PRE_TOOL_USE = ROOT / "scripts" / "pre_tool_use.py"
+POST_TOOL_USE = ROOT / "scripts" / "post_tool_use.py"
 PRE_INVOCATION = ROOT / "scripts" / "pre_invocation.py"
 
 
@@ -1810,3 +1811,250 @@ def test_run_workflow_logs_privacy_safe_telemetry_without_rewriting_script(
     assert row["prompt_chars"] == len(script_src) + len(
         "Fan out lint audit across modules"
     )
+
+
+def test_closed_loop_antigravity_cli_upshift_and_circuit_breaker(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "cli_closed_loop_agy.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+
+    # 1. Initial lookup -> flash_lite
+    c1, d1 = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-cli-agy",
+            "toolCall": {
+                "id": "call-a1",
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Role": "File Locator",
+                    "Prompt": "Locate routes.py in backend",
+                    "Model": "inherit",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert c1 == 0
+    assert d1 == {"decision": "allow", "overwrite": {"Model": "flash_lite"}}
+
+    # 2. PostToolUse records failure outcome
+    cp1, dp1 = _run_hook(
+        POST_TOOL_USE,
+        {
+            "conversationId": "conv-cli-agy",
+            "toolCall": {
+                "id": "call-a1",
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Role": "File Locator",
+                    "Prompt": "Locate routes.py in backend",
+                },
+            },
+            "error": "timeout waiting for subagent",
+        },
+        extra_env=env,
+    )
+    assert cp1 == 0
+    assert dp1 == {}
+
+    # 3. Retry #1 -> promotes flash_lite -> flash
+    c2, d2 = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-cli-agy",
+            "toolCall": {
+                "id": "call-a2",
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Role": "File Locator",
+                    "Prompt": "Locate routes.py in backend",
+                    "Model": "inherit",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert c2 == 0
+    assert d2 == {"decision": "allow", "overwrite": {"Model": "flash"}}
+
+    # 4. PostToolUse error on retry #1 -> Retry #2 with explicit Model="flash_lite" & @low trips circuit breaker -> inherit
+    _run_hook(
+        POST_TOOL_USE,
+        {
+            "conversationId": "conv-cli-agy",
+            "toolCall": {
+                "id": "call-a2",
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Role": "File Locator",
+                    "Prompt": "Locate routes.py in backend",
+                },
+            },
+            "error": "tool crashed",
+        },
+        extra_env=env,
+    )
+    c3, d3 = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-cli-agy",
+            "toolCall": {
+                "id": "call-a3",
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "research",
+                    "Role": "File Locator @low",
+                    "Prompt": "Locate routes.py in backend",
+                    "Model": "flash_lite",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert c3 == 0
+    assert d3 == {"decision": "allow", "overwrite": {"Model": "inherit"}}
+
+    rows = [json.loads(ln) for ln in ledger.read_text(encoding="utf-8").splitlines()]
+    routes = [r for r in rows if r.get("event_type", "route") != "outcome"]
+    assert [r["reason"] for r in routes] == [
+        "read_only_simple_lookup",
+        "auto_upshift_on_retry",
+        "circuit_breaker_frontier_lock",
+    ]
+    assert routes[1]["upshifted_from"] == "lite"
+    assert routes[2]["upshifted_from"] == "fast"
+
+
+def test_closed_loop_claude_codex_reasoning_effort_and_shadow_non_mutation(
+    tmp_path: Path,
+) -> None:
+    # 1. OpenAI Codex: lite (low) -> error -> fast (medium) -> error -> frontier (high)
+    cx_ledger = tmp_path / "cli_closed_loop_codex.jsonl"
+    cx_env = {"DOWNSHIFT_LEDGER_PATH": str(cx_ledger)}
+    c1, d1 = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-cx-loop",
+            "tool_use_id": "cx-1",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "role": "Locator",
+                "message": "Locate settings.py",
+            },
+        },
+        extra_env=cx_env,
+    )
+    assert c1 == 0
+    assert d1["hookSpecificOutput"]["updatedInput"]["model"] == "gpt-6-luna"
+    assert d1["hookSpecificOutput"]["updatedInput"]["reasoning_effort"] == "low"
+
+    _run_hook(
+        POST_TOOL_USE,
+        {
+            "session_id": "sess-cx-loop",
+            "tool_use_id": "cx-1",
+            "tool_name": "spawn_agent",
+            "tool_input": {"role": "Locator", "message": "Locate settings.py"},
+            "tool_response": {"is_error": True, "error": "timeout"},
+        },
+        extra_env=cx_env,
+    )
+    c2, d2 = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-cx-loop",
+            "tool_use_id": "cx-2",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "role": "Locator",
+                "message": "Locate settings.py",
+            },
+        },
+        extra_env=cx_env,
+    )
+    assert c2 == 0
+    assert d2["hookSpecificOutput"]["updatedInput"]["model"] == "gpt-6.1-sol"
+    assert d2["hookSpecificOutput"]["updatedInput"]["reasoning_effort"] == "medium"
+
+    _run_hook(
+        POST_TOOL_USE,
+        {
+            "session_id": "sess-cx-loop",
+            "tool_use_id": "cx-2",
+            "tool_name": "spawn_agent",
+            "tool_input": {"role": "Locator", "message": "Locate settings.py"},
+            "tool_response": {"is_error": True, "error": "failed"},
+        },
+        extra_env=cx_env,
+    )
+    c3, d3 = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-cx-loop",
+            "tool_use_id": "cx-3",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "role": "Locator @medium",
+                "message": "Locate settings.py",
+                "model": "gpt-6.1-sol",
+                "reasoning_effort": "medium",
+            },
+        },
+        extra_env=cx_env,
+    )
+    assert c3 == 0
+    assert d3["hookSpecificOutput"]["updatedInput"]["model"] == "inherit"
+    assert d3["hookSpecificOutput"]["updatedInput"]["reasoning_effort"] == "high"
+
+    # 2. Shadow mode (Q2 -> A): logs circuit_breaker_frontier_lock without mutating tool input
+    sh_ledger = tmp_path / "cli_closed_loop_shadow.jsonl"
+    sh_env = {"DOWNSHIFT_LEDGER_PATH": str(sh_ledger), "DOWNSHIFT_MODE": "shadow"}
+    for idx in range(3):
+        cs, ds = _run_hook(
+            PRE_TOOL_USE,
+            {
+                "session_id": "sess-sh-loop",
+                "tool_use_id": f"cl-{idx}",
+                "tool_name": "Task",
+                "tool_input": {
+                    "subagent_type": "Explore",
+                    "description": "Find routes @low",
+                    "prompt": "Find routes.py",
+                    "model": "haiku",
+                },
+            },
+            extra_env=sh_env,
+        )
+        assert cs == 0
+        assert ds == {}
+        if idx < 2:
+            _run_hook(
+                POST_TOOL_USE,
+                {
+                    "session_id": "sess-sh-loop",
+                    "tool_use_id": f"cl-{idx}",
+                    "tool_name": "Task",
+                    "tool_input": {
+                        "subagent_type": "Explore",
+                        "description": "Find routes @low",
+                    },
+                    "tool_response": {"is_error": True, "error": "boom"},
+                },
+                extra_env=sh_env,
+            )
+    sh_routes = [
+        r
+        for r in (
+            json.loads(ln) for ln in sh_ledger.read_text(encoding="utf-8").splitlines()
+        )
+        if r.get("event_type", "route") != "outcome"
+    ]
+    assert sh_routes[2]["reason"] == "circuit_breaker_frontier_lock"
+    assert sh_routes[2]["mode"] == "shadow"
+    assert sh_routes[2]["tier"] == "frontier"

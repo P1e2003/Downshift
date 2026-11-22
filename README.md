@@ -103,6 +103,9 @@ Example `.downshift.json` at the workspace root:
   },
   "max_burst_subagents": 4,
   "burst_window_seconds": 5,
+  "auto_upshift": true,
+  "retry_window_seconds": 120,
+  "max_auto_retries": 2,
   "swarm_models": {
     "lite": "<exact lite model name from swarm(action='models')>",
     "fast": "<exact fast model name from swarm(action='models')>"
@@ -113,6 +116,7 @@ Example `.downshift.json` at the workspace root:
 - **Antigravity `/swarm` & `run_workflow` Hooks:** Downshift's Antigravity `PreToolUse` hook matches `invoke_subagent|swarm|run_workflow`:
   - `swarm(action="add")` enforces identical safety guardrails, keeps isolated `share`/`branch`/`fork` authors on Frontier, counts sharded `n` / `len(tasks)` spawns against `max_burst_subagents`, and uses **safe-by-default** routing (only overwriting `model` when `swarm_models` is configured in `.downshift.json` or via `DOWNSHIFT_SWARM_LITE_MODEL` / `DOWNSHIFT_SWARM_FAST_MODEL`, and clearing lower-tier pins to `""` on high-risk briefs; non-`add` swarm actions pass through untouched with zero ledger noise).
   - `run_workflow` logs privacy-safe dispatch telemetry (`tool="run_workflow"`, inferred agent count, zero raw Python stored) without ever rewriting workflow scripts.
+- **Closed-Loop `PostToolUse` Auto-Upshift & Deterministic 2-Retry Circuit Breaker:** `hooks.json` (`invoke_subagent|swarm`) and `hooks/claude-codex-hooks.json` (`Task|Agent|spawn_agent|multi_agent_v1__spawn_agent`) run fail-open `scripts/post_tool_use.py` (always emitting `{}` with zero raw prompt/error text stored). When a lower-tier call records a `PostToolUse` error, repeats the same task fingerprint, or carries an explicit retry cue for the same normalized role within `retry_window_seconds` (`120s`, env `DOWNSHIFT_RETRY_WINDOW`), Downshift auto-upshifts one tier (`lite -> fast -> frontier`, `reason="auto_upshift_on_retry"`), locks to Frontier at `max_auto_retries` (`2`, env `DOWNSHIFT_MAX_AUTO_RETRIES`, `reason="circuit_breaker_frontier_lock"`, overriding `@low`/`@medium` in `active` mode while staying log-only in `shadow` mode), and always takes precedence over burst-cap downgrades without false upshifts on concurrent parallel slices or unrelated reused generic roles. Disable via `"auto_upshift": false` or `DOWNSHIFT_AUTO_UPSHIFT=0`.
 
 - **Precedence:** Frontier `@high` / `@frontier` tag > explicit custom non-lower-tier model > `pinned_roles` mapped to `"frontier"` > built-in & custom `high_risk_keywords` safety guardrails > lower-tier `@medium` / `@low` inline tags (`@high` > `@medium` > `@low`) > explicit lower-tier model preservation > `pinned_roles` mapped to `"lite"` / `"fast"` > heuristic classification.
 - **Portable Hook Launcher:** `hooks.json` and `hooks/claude-codex-hooks.json` invoke `./scripts/run_hook.cmd` (which delegates to `scripts/run_hook.sh` on POSIX), resolving the plugin's `scripts/` directory relative to the launcher location and automatically discovering `uv`, `python3`, `python`, or `py -3` with fail-open fallback.
@@ -168,9 +172,9 @@ $ python ./scripts/stats_cli.py
 ```
 
 Flags:
-- `python ./scripts/stats_cli.py --json` — Emit machine-readable JSON summary (`hosts`, `reasons`, `guardrail_count`, `tiers`, `models`)
+- `python ./scripts/stats_cli.py --json` — Emit machine-readable JSON summary (`hosts`, `tools`, `reasons`, `guardrail_count`, `tiers`, `models`, plus rework & net ROI fields `outcome_count`, `upshift_count`, `circuit_breaker_count`, `error_outcome_count`, `rework_rate_pct`, `net_cost_saved_pct`)
 - `python ./scripts/stats_cli.py --html <path.html>` — Write a theme-aware HTML scoreboard widget for Google Antigravity `generative_ui` (`<agent-embed>`)
-- `python ./scripts/stats_cli.py --clean` — Non-destructively remove corrupted lines and synthetic empty (`prompt_chars == 0` and empty `role`) entries under an exclusive OS file lock
+- `python ./scripts/stats_cli.py --clean` — Non-destructively remove corrupted lines and synthetic empty routing entries while preserving valid `PostToolUse` outcome events under an exclusive OS file lock
 - `python ./scripts/stats_cli.py --reset` — Truncate/reset the local ledger under an exclusive OS file lock
 - `python ./scripts/stats_cli.py --limit 50` — Aggregate the most recent `N` events
 

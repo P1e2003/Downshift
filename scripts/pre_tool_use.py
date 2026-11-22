@@ -12,11 +12,14 @@ from downshift_core import (
     DownshiftConfig,
     classify_subagent_call,
     classify_swarm_add,
+    compute_prompt_fingerprint,
+    compute_role_fingerprint,
     detect_host,
     extract_workspace_dir,
+    has_explicit_retry_cue,
     inspect_workflow_script,
     load_config,
-    record_and_apply_burst_cap,
+    record_and_evaluate_session_guards,
 )
 
 CLAUDE_SUBAGENT_TOOLS = frozenset(
@@ -56,7 +59,10 @@ def _extract_claude_or_codex_fields(
 
 
 def _handle_antigravity_swarm(
-    payload: dict[str, Any], args: dict[str, Any], config: DownshiftConfig
+    payload: dict[str, Any],
+    args: dict[str, Any],
+    config: DownshiftConfig,
+    tool_call_id: str = "",
 ) -> dict[str, Any]:
     action = str(args.get("action") or "").strip().lower()
     if action != "add":
@@ -81,7 +87,8 @@ def _handle_antigravity_swarm(
         fork=fork,
         config=config,
     )
-    decision = record_and_apply_burst_cap(
+    prompt_body = f"{brief}\n" + "\n".join(str(t) for t in tasks) if tasks else brief
+    decision = record_and_evaluate_session_guards(
         decision=decision,
         conversation_id=str(payload.get("conversationId") or ""),
         subagent_type="swarm",
@@ -92,6 +99,10 @@ def _handle_antigravity_swarm(
         config=config,
         tool="swarm",
         spawn_count=spawn_count,
+        tool_call_id=tool_call_id,
+        role_fp=compute_role_fingerprint("swarm", name),
+        prompt_fp=compute_prompt_fingerprint(prompt_body),
+        has_retry_cue=has_explicit_retry_cue(name, prompt_body),
     )
     if config.mode == "active" and decision.should_overwrite:
         return {
@@ -119,7 +130,7 @@ def _handle_antigravity_workflow(
         or (Path(script_path).name if script_path.strip() else "")
         or "workflow"
     )
-    record_and_apply_burst_cap(
+    record_and_evaluate_session_guards(
         decision=decision,
         conversation_id=str(payload.get("conversationId") or ""),
         subagent_type="run_workflow",
@@ -143,11 +154,14 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
     if host == "antigravity":
         tool_call = _as_dict(payload.get("toolCall"))
         tool_name = str(tool_call.get("name") or "")
+        tool_call_id = str(tool_call.get("id") or "")
         raw_args = tool_call.get("args")
         if not isinstance(raw_args, dict):
             return {"decision": "allow"}
         if tool_name == "swarm":
-            return _handle_antigravity_swarm(payload, raw_args, config)
+            return _handle_antigravity_swarm(
+                payload, raw_args, config, tool_call_id=tool_call_id
+            )
         if tool_name == "run_workflow":
             return _handle_antigravity_workflow(payload, raw_args, config)
         if tool_name != "invoke_subagent":
@@ -168,7 +182,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
             host="antigravity",
             config=config,
         )
-        decision = record_and_apply_burst_cap(
+        decision = record_and_evaluate_session_guards(
             decision=decision,
             conversation_id=str(payload.get("conversationId") or ""),
             subagent_type=type_name,
@@ -178,6 +192,10 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
             prompt_chars=len(prompt_text),
             config=config,
             tool="invoke_subagent",
+            tool_call_id=tool_call_id,
+            role_fp=compute_role_fingerprint(type_name, role),
+            prompt_fp=compute_prompt_fingerprint(prompt_text),
+            has_retry_cue=has_explicit_retry_cue(role, prompt_text),
         )
         if config.mode == "active" and decision.should_overwrite:
             return {
@@ -220,7 +238,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         host=host,
         config=config,
     )
-    decision = record_and_apply_burst_cap(
+    decision = record_and_evaluate_session_guards(
         decision=decision,
         conversation_id=str(payload.get("session_id") or ""),
         subagent_type=type_name,
@@ -230,6 +248,10 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         prompt_chars=len(prompt_text),
         config=config,
         tool=tool_name,
+        tool_call_id=str(payload.get("tool_use_id") or ""),
+        role_fp=compute_role_fingerprint(type_name, role),
+        prompt_fp=compute_prompt_fingerprint(prompt_text),
+        has_retry_cue=has_explicit_retry_cue(role, prompt_text),
     )
     if config.mode == "active":
         updated_input: dict[str, Any] | None = None

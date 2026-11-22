@@ -18,6 +18,18 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "invoke_subagent|swarm",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"./scripts/run_hook.cmd\" ./scripts/post_tool_use.py",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
