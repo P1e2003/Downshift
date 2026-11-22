@@ -14,14 +14,21 @@ from downshift_core import (
     CODEX_TIER_REASONING_EFFORT,
     DownshiftConfig,
     RoutingDecision,
+    classify_error_kind,
     classify_subagent_call,
     classify_swarm_add,
     classify_user_prompt,
+    compute_prompt_fingerprint,
+    compute_role_fingerprint,
     detect_host,
     extract_workspace_dir,
+    has_explicit_retry_cue,
     inspect_workflow_script,
     load_config,
+    normalize_role,
     record_and_apply_burst_cap,
+    record_and_evaluate_session_guards,
+    record_outcome_event,
     record_routing_event,
     score_prompt_complexity,
     should_nudge_pre_invocation,
@@ -1961,3 +1968,379 @@ def test_inspect_workflow_script_infers_tiers_and_unpinned_parallel() -> None:
     assert pinned_dec.target_model == "flash"
     assert pinned_dec.should_overwrite is False
     assert pinned_dec.reason == "workflow_dispatch_observed"
+
+
+def test_load_config_parses_retry_auto_upshift_settings_and_env_overrides(
+    tmp_path: Path,
+) -> None:
+    ws = tmp_path / "ws_retry_cfg"
+    ws.mkdir()
+    (ws / ".downshift.json").write_text(
+        json.dumps(
+            {
+                "auto_upshift": False,
+                "retry_window_seconds": 90,
+                "max_auto_retries": 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = load_config(workspace_dir=ws, env={})
+    assert cfg.auto_upshift is False
+    assert cfg.retry_window_seconds == 90
+    assert cfg.max_auto_retries == 3
+
+    # Environment overrides take precedence
+    cfg_env = load_config(
+        workspace_dir=ws,
+        env={
+            "DOWNSHIFT_AUTO_UPSHIFT": "true",
+            "DOWNSHIFT_RETRY_WINDOW": "180",
+            "DOWNSHIFT_MAX_AUTO_RETRIES": "4",
+        },
+    )
+    assert cfg_env.auto_upshift is True
+    assert cfg_env.retry_window_seconds == 180
+    assert cfg_env.max_auto_retries == 4
+
+    # Invalid booleans / zero ints fall back safely to defaults
+    ws_bad = tmp_path / "ws_retry_bad"
+    ws_bad.mkdir()
+    (ws_bad / ".downshift.json").write_text(
+        json.dumps(
+            {
+                "auto_upshift": "yes",
+                "retry_window_seconds": True,
+                "max_auto_retries": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg_bad = load_config(workspace_dir=ws_bad, env={})
+    assert cfg_bad.auto_upshift is True
+    assert cfg_bad.retry_window_seconds == 120
+    assert cfg_bad.max_auto_retries == 2
+
+
+def test_fingerprinting_role_normalization_retry_cues_and_error_kinds() -> None:
+    assert normalize_role("Test Runner @medium #2 (retry)") == "test runner"
+    assert normalize_role("Test Runner") == "test runner"
+    assert compute_role_fingerprint("research", "Test Runner #2") == (
+        compute_role_fingerprint("research", "Test Runner @low (retry)")
+    )
+    # Numbered slices stay distinct
+    assert compute_role_fingerprint("research", "Slice 1 Mapper") != (
+        compute_role_fingerprint("research", "Slice 2 Mapper")
+    )
+    assert compute_role_fingerprint("", "") == ""
+
+    assert compute_prompt_fingerprint("Locate   auth.py @low") == (
+        compute_prompt_fingerprint("locate auth.py @medium")
+    )
+    assert compute_prompt_fingerprint("") == ""
+
+    assert has_explicit_retry_cue("Test Runner #2", "Run pytest") is True
+    assert has_explicit_retry_cue("Test Runner", "Retry running pytest") is True
+    assert has_explicit_retry_cue("Test Runner", "Chạy lại kiểm tra") is True
+    assert has_explicit_retry_cue("Test Runner", "Fix the failed test check") is True
+    assert has_explicit_retry_cue("Codebase Researcher", "Inspect billing.py") is False
+
+    assert classify_error_kind("deadline exceeded after 30s") == "timeout"
+    assert classify_error_kind("HTTP 429 too many requests") == "rate_limit"
+    assert classify_error_kind("401 unauthorized token") == "auth_error"
+    assert classify_error_kind("EACCES permission denied") == "permission_denied"
+    assert classify_error_kind("invalid argument: unknown model") == "invalid_args"
+    assert classify_error_kind("ENOENT file not found") == "not_found"
+    assert classify_error_kind("unexpected crash") == "tool_error"
+    assert classify_error_kind("") is None
+
+
+def test_auto_upshift_and_two_retry_circuit_breaker_with_q1_q2_guardrails(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "upshift_core.jsonl"
+    cfg = DownshiftConfig(
+        max_burst_subagents=2,
+        burst_window_seconds=5,
+        auto_upshift=True,
+        retry_window_seconds=120,
+        max_auto_retries=2,
+    )
+    t0 = datetime(2026, 11, 22, 10, 0, 0, tzinfo=UTC)
+    role_fp = compute_role_fingerprint("research", "File Locator")
+    prompt_fp = compute_prompt_fingerprint("Find where login.py is defined")
+
+    base_lite = RoutingDecision(
+        host="antigravity",
+        tier="lite",
+        target_model="flash_lite",
+        should_overwrite=True,
+        reason="read_only_simple_lookup",
+    )
+    # Attempt 1 -> lite
+    d1 = record_and_evaluate_session_guards(
+        base_lite,
+        conversation_id="conv-up-1",
+        subagent_type="research",
+        role="File Locator",
+        original_model="inherit",
+        ledger_path=ledger,
+        config=cfg,
+        now_utc=t0,
+        tool="invoke_subagent",
+        tool_call_id="call-1",
+        role_fp=role_fp,
+        prompt_fp=prompt_fp,
+    )
+    assert d1.tier == "lite"
+
+    # Confirmed PostToolUse error on call-1
+    assert record_outcome_event(
+        host="antigravity",
+        conversation_id="conv-up-1",
+        tool="invoke_subagent",
+        tool_call_id="call-1",
+        role_fp=role_fp,
+        failed=True,
+        error_kind="timeout",
+        ledger_path=ledger,
+        now_utc=t0 + timedelta(seconds=1),
+    )
+
+    # Retry #1 -> promotes lite -> fast (and beats burst cap even if burst window is full!)
+    d2 = record_and_evaluate_session_guards(
+        base_lite,
+        conversation_id="conv-up-1",
+        subagent_type="research",
+        role="File Locator #2",
+        original_model="flash_lite",
+        ledger_path=ledger,
+        config=cfg,
+        now_utc=t0 + timedelta(seconds=2),
+        tool="invoke_subagent",
+        tool_call_id="call-2",
+        role_fp=role_fp,
+        prompt_fp=prompt_fp,
+    )
+    assert d2.tier == "fast"
+    assert d2.target_model == "flash"
+    assert d2.should_overwrite is True
+    assert d2.reason == "auto_upshift_on_retry"
+
+    # Confirmed error on call-2
+    assert record_outcome_event(
+        host="antigravity",
+        conversation_id="conv-up-1",
+        tool="invoke_subagent",
+        tool_call_id="call-2",
+        role_fp=role_fp,
+        failed=True,
+        error_kind="tool_error",
+        ledger_path=ledger,
+        now_utc=t0 + timedelta(seconds=3),
+    )
+
+    # Retry #2 (even with explicit @low tag!) -> trips 2-retry circuit breaker to frontier
+    low_tagged = RoutingDecision(
+        host="antigravity",
+        tier="lite",
+        target_model="flash_lite",
+        should_overwrite=False,
+        reason="inline_override:lite",
+    )
+    d3 = record_and_evaluate_session_guards(
+        low_tagged,
+        conversation_id="conv-up-1",
+        subagent_type="research",
+        role="File Locator @low",
+        original_model="flash_lite",
+        ledger_path=ledger,
+        config=cfg,
+        now_utc=t0 + timedelta(seconds=4),
+        tool="invoke_subagent",
+        tool_call_id="call-3",
+        role_fp=role_fp,
+        prompt_fp=prompt_fp,
+    )
+    assert d3.tier == "frontier"
+    assert d3.target_model == "inherit"
+    assert d3.should_overwrite is True
+    assert d3.reason == "circuit_breaker_frontier_lock"
+
+    # Cross-conversation isolation: different conversation starts fresh at lite
+    d_other = record_and_evaluate_session_guards(
+        base_lite,
+        conversation_id="conv-up-other",
+        subagent_type="research",
+        role="File Locator",
+        original_model="inherit",
+        ledger_path=ledger,
+        config=cfg,
+        now_utc=t0 + timedelta(seconds=5),
+        tool="invoke_subagent",
+        role_fp=role_fp,
+        prompt_fp=prompt_fp,
+    )
+    assert d_other.tier == "lite"
+
+    # After retry_window_seconds expires -> starts fresh at lite
+    d_expired = record_and_evaluate_session_guards(
+        base_lite,
+        conversation_id="conv-up-1",
+        subagent_type="research",
+        role="File Locator",
+        original_model="inherit",
+        ledger_path=ledger,
+        config=cfg,
+        now_utc=t0 + timedelta(seconds=200),
+        tool="invoke_subagent",
+        role_fp=role_fp,
+        prompt_fp=prompt_fp,
+    )
+    assert d_expired.tier == "lite"
+
+    # Swarm Option A: upshift from lite -> fast when swarm_models["fast"] is unconfigured falls back safely to frontier
+    sw_ledger = tmp_path / "swarm_up.jsonl"
+    sw_cfg = DownshiftConfig(
+        swarm_models={"lite": "Gemini 3 Flash-Lite"},
+        auto_upshift=True,
+        retry_window_seconds=120,
+        max_auto_retries=2,
+    )
+    sw_role_fp = compute_role_fingerprint("swarm", "finder")
+    sw_prompt_fp = compute_prompt_fingerprint("Locate config.py")
+    sw_lite, _ = classify_swarm_add(
+        name="finder",
+        brief="Locate config.py",
+        workspace="inherit",
+        config=sw_cfg,
+    )
+    record_and_evaluate_session_guards(
+        sw_lite,
+        conversation_id="conv-sw-opt-a",
+        subagent_type="swarm",
+        role="finder",
+        original_model="Gemini 3 Flash-Lite",
+        ledger_path=sw_ledger,
+        config=sw_cfg,
+        now_utc=t0,
+        tool="swarm",
+        role_fp=sw_role_fp,
+        prompt_fp=sw_prompt_fp,
+    )
+    sw_retry = record_and_evaluate_session_guards(
+        sw_lite,
+        conversation_id="conv-sw-opt-a",
+        subagent_type="swarm",
+        role="finder",
+        original_model="Gemini 3 Flash-Lite",
+        ledger_path=sw_ledger,
+        config=sw_cfg,
+        now_utc=t0 + timedelta(seconds=10),
+        tool="swarm",
+        role_fp=sw_role_fp,
+        prompt_fp=sw_prompt_fp,
+    )
+    assert sw_retry.tier == "frontier"
+    assert sw_retry.target_model == ""
+    assert sw_retry.should_overwrite is True
+    assert sw_retry.reason == "auto_upshift_on_retry"
+
+
+def test_parallel_fanout_and_reused_generic_roles_never_false_upshift_or_inflate_burst(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "no_false_upshift.jsonl"
+    cfg = DownshiftConfig(
+        max_burst_subagents=4,
+        burst_window_seconds=5,
+        auto_upshift=True,
+        retry_window_seconds=120,
+        max_auto_retries=2,
+    )
+    t0 = datetime(2026, 11, 22, 10, 5, 0, tzinfo=UTC)
+    fast_dec = RoutingDecision(
+        host="antigravity",
+        tier="fast",
+        target_model="flash",
+        should_overwrite=True,
+        reason="read_only_research_survey",
+    )
+    role_fp = compute_role_fingerprint("research", "Codebase Researcher")
+
+    # 3 concurrent parallel slices sharing generic role "Codebase Researcher" with distinct prompts -> 0 upshifts
+    for idx, mod in enumerate(("auth.py", "billing.py", "orders.py")):
+        eff = record_and_evaluate_session_guards(
+            fast_dec,
+            conversation_id="conv-par",
+            subagent_type="research",
+            role="Codebase Researcher",
+            ledger_path=ledger,
+            config=cfg,
+            now_utc=t0 + timedelta(milliseconds=idx * 100),
+            tool="invoke_subagent",
+            tool_call_id=f"par-{idx}",
+            role_fp=role_fp,
+            prompt_fp=compute_prompt_fingerprint(f"Survey module {mod}"),
+        )
+        assert eff.tier == "fast"
+        assert eff.reason == "read_only_research_survey"
+        # Clean PostToolUse outcomes MUST NOT inflate burst counts
+        assert record_outcome_event(
+            host="antigravity",
+            conversation_id="conv-par",
+            tool="invoke_subagent",
+            tool_call_id=f"par-{idx}",
+            role_fp=role_fp,
+            failed=False,
+            ledger_path=ledger,
+            now_utc=t0 + timedelta(milliseconds=idx * 100 + 50),
+        )
+
+    # 4th call within 5s still sees burst_count == 3 (not 6!), so stays fast
+    eff_4 = record_and_evaluate_session_guards(
+        fast_dec,
+        conversation_id="conv-par",
+        subagent_type="research",
+        role="Codebase Researcher",
+        ledger_path=ledger,
+        config=cfg,
+        now_utc=t0 + timedelta(seconds=1),
+        tool="invoke_subagent",
+        role_fp=role_fp,
+        prompt_fp=compute_prompt_fingerprint("Survey module reports.py"),
+    )
+    assert eff_4.tier == "fast"
+    assert eff_4.reason == "read_only_research_survey"
+
+    # Sequential reuse of "Codebase Researcher" 45s later on a different file -> 0 false upshifts (Q1 -> A)
+    eff_seq = record_and_evaluate_session_guards(
+        fast_dec,
+        conversation_id="conv-par",
+        subagent_type="research",
+        role="Codebase Researcher",
+        ledger_path=ledger,
+        config=cfg,
+        now_utc=t0 + timedelta(seconds=45),
+        tool="invoke_subagent",
+        role_fp=role_fp,
+        prompt_fp=compute_prompt_fingerprint("Survey module notifications.py"),
+    )
+    assert eff_seq.tier == "fast"
+    assert eff_seq.reason == "read_only_research_survey"
+
+    # Same prompt_fp retried after clean async launch DOES auto-upshift (Antigravity logical retry)
+    eff_retry = record_and_evaluate_session_guards(
+        fast_dec,
+        conversation_id="conv-par",
+        subagent_type="research",
+        role="Codebase Researcher",
+        ledger_path=ledger,
+        config=cfg,
+        now_utc=t0 + timedelta(seconds=50),
+        tool="invoke_subagent",
+        role_fp=role_fp,
+        prompt_fp=compute_prompt_fingerprint("Survey module notifications.py"),
+    )
+    assert eff_retry.tier == "frontier"
+    assert eff_retry.reason == "auto_upshift_on_retry"

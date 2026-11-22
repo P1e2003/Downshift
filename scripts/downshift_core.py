@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -227,6 +228,79 @@ DEFAULT_MAX_BURST_SUBAGENTS = 4
 DEFAULT_BURST_WINDOW_SECONDS = 5
 BURST_TAIL_READ_BYTES = 65_536
 
+DEFAULT_AUTO_UPSHIFT = True
+DEFAULT_RETRY_WINDOW_SECONDS = 120
+DEFAULT_MAX_AUTO_RETRIES = 2
+
+TIER_RANK: dict[str, int] = {"lite": 0, "fast": 1, "frontier": 2}
+HIGH_RISK_SAFETY_REASONS_PREFIX = (
+    "safety_guardrail:",
+    "swarm_isolated_workspace:",
+)
+HIGH_RISK_SAFETY_REASONS_EXACT = frozenset(
+    {
+        "workspace_config:high_risk_keyword",
+        "swarm_forked_worker",
+    }
+)
+
+INLINE_TAG_STRIP_RE = re.compile(
+    r"(?:^|\s)@(?:pro|opus|frontier|inherit|high|flash_lite|lite|haiku|low|flash|sonnet|fast|downshift|medium)\b",
+    re.IGNORECASE,
+)
+ROLE_RETRY_SUFFIX_RE = re.compile(
+    r"(?:\s*(?:\(|\[)\s*(?:retry|attempt|run|pass|try)\s*#?\s*\d*\s*(?:\)|\])"
+    r"|\s+(?:retry|attempt)\s*#?\s*\d*"
+    r"|\s*#\s*\d+)\s*$",
+    re.IGNORECASE,
+)
+RETRY_CUE_RE = re.compile(
+    r"\b(?:retry(?:ing)?|re-?run|try\s+again|run\s+again|again|"
+    r"second\s+attempt|attempt\s*#?\s*[2-9]|"
+    r"previous\s+attempt\s+failed|failed\s+earlier|"
+    r"fix\s+(?:the\s+)?(?:previous|prior|failed|failing|broken|error|regression|test|lint|build|check|it)|"
+    r"thử\s+lại|thu\s+lai|chạy\s+lại|chay\s+lai|sửa\s+lại|sua\s+lai|làm\s+lại|lam\s+lai)\b",
+    re.IGNORECASE,
+)
+ERROR_KIND_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "timeout",
+        re.compile(r"\b(timeout|timed?\s*out|deadline\s+exceeded)\b", re.IGNORECASE),
+    ),
+    (
+        "rate_limit",
+        re.compile(
+            r"\b(rate\s*limit|too\s+many\s+requests|429|quota\s+exceeded)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "auth_error",
+        re.compile(
+            r"\b(unauthorized|unauthenticated|invalid\s+token|401|auth(?:entication)?\s+fail\w*)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "permission_denied",
+        re.compile(
+            r"\b(permission\s+denied|forbidden|403|access\s+denied|eacces)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "invalid_args",
+        re.compile(
+            r"\b(invalid\s+(?:arg|argument|param|parameter|input|model|schema)|validation\s+error|bad\s+request|400)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "not_found",
+        re.compile(r"\b(not\s+found|404|enoent|no\s+such\s+file)\b", re.IGNORECASE),
+    ),
+)
+
 WORKFLOW_AGENT_CALL_RE = re.compile(r"\bagent\s*\(")
 WORKFLOW_PARALLEL_CALL_RE = re.compile(r"\bparallel\s*\(")
 WORKFLOW_MODEL_ARG_RE = re.compile(r"""\bmodel\s*=\s*["']([^"']+)["']""")
@@ -249,6 +323,9 @@ class DownshiftConfig:
     max_burst_subagents: int = DEFAULT_MAX_BURST_SUBAGENTS
     burst_window_seconds: int = DEFAULT_BURST_WINDOW_SECONDS
     swarm_models: dict[str, str] = field(default_factory=dict)
+    auto_upshift: bool = DEFAULT_AUTO_UPSHIFT
+    retry_window_seconds: int = DEFAULT_RETRY_WINDOW_SECONDS
+    max_auto_retries: int = DEFAULT_MAX_AUTO_RETRIES
 
 
 @dataclass(frozen=True)
@@ -362,6 +439,9 @@ def load_config(
     max_burst_subagents = DEFAULT_MAX_BURST_SUBAGENTS
     burst_window_seconds = DEFAULT_BURST_WINDOW_SECONDS
     swarm_models: dict[str, str] = {}
+    auto_upshift = DEFAULT_AUTO_UPSHIFT
+    retry_window_seconds = DEFAULT_RETRY_WINDOW_SECONDS
+    max_auto_retries = DEFAULT_MAX_AUTO_RETRIES
 
     cfg_path = _find_config_file(workspace_dir, env_map)
     if cfg_path is not None:
@@ -414,6 +494,23 @@ def load_config(
                         raw_val = raw_swarm_models.get(tier_key)
                         if isinstance(raw_val, str) and raw_val.strip():
                             swarm_models[tier_key] = raw_val.strip()
+                raw_auto_upshift = raw_data.get("auto_upshift")
+                if isinstance(raw_auto_upshift, bool):
+                    auto_upshift = raw_auto_upshift
+                raw_retry_window = raw_data.get("retry_window_seconds")
+                if (
+                    isinstance(raw_retry_window, int)
+                    and not isinstance(raw_retry_window, bool)
+                    and raw_retry_window >= 1
+                ):
+                    retry_window_seconds = raw_retry_window
+                raw_max_retries = raw_data.get("max_auto_retries")
+                if (
+                    isinstance(raw_max_retries, int)
+                    and not isinstance(raw_max_retries, bool)
+                    and raw_max_retries >= 1
+                ):
+                    max_auto_retries = raw_max_retries
 
     env_mode = (env_map.get("DOWNSHIFT_MODE") or "").strip().lower()
     if env_mode in VALID_MODES:
@@ -442,6 +539,26 @@ def load_config(
     if env_swarm_fast:
         swarm_models["fast"] = env_swarm_fast
 
+    env_auto_upshift = (env_map.get("DOWNSHIFT_AUTO_UPSHIFT") or "").strip().lower()
+    if env_auto_upshift in ("0", "false", "no", "off"):
+        auto_upshift = False
+    elif env_auto_upshift in ("1", "true", "yes", "on"):
+        auto_upshift = True
+
+    env_retry_window = (env_map.get("DOWNSHIFT_RETRY_WINDOW") or "").strip()
+    if env_retry_window:
+        with contextlib.suppress(ValueError):
+            parsed_rw = int(env_retry_window)
+            if parsed_rw >= 1:
+                retry_window_seconds = parsed_rw
+
+    env_max_retries = (env_map.get("DOWNSHIFT_MAX_AUTO_RETRIES") or "").strip()
+    if env_max_retries:
+        with contextlib.suppress(ValueError):
+            parsed_mr = int(env_max_retries)
+            if parsed_mr >= 1:
+                max_auto_retries = parsed_mr
+
     return DownshiftConfig(
         mode=mode,
         hints=hints,
@@ -450,6 +567,9 @@ def load_config(
         max_burst_subagents=max_burst_subagents,
         burst_window_seconds=burst_window_seconds,
         swarm_models=swarm_models,
+        auto_upshift=auto_upshift,
+        retry_window_seconds=retry_window_seconds,
+        max_auto_retries=max_auto_retries,
     )
 
 
@@ -1105,16 +1225,89 @@ def _append_line_locked(path: Path, line_bytes: bytes) -> None:
         os.close(fd)
 
 
-def _count_recent_burst_in_locked_fd(
-    fd: int,
-    st_size: int,
-    conversation_id: str,
-    now_ts: datetime,
-    window_seconds: int,
-) -> int:
-    """Count recent events for conversation_id within window_seconds from the last <= 64 KB of a locked fd."""
-    if st_size <= 0 or window_seconds <= 0:
-        return 0
+def normalize_role(role: str) -> str:
+    """Normalize a subagent role label by stripping inline @tags and trailing retry/attempt decorations."""
+    text = INLINE_TAG_STRIP_RE.sub(" ", str(role or ""))
+    text = " ".join(text.split())
+    while True:
+        stripped = ROLE_RETRY_SUFFIX_RE.sub("", text).strip()
+        if stripped == text:
+            break
+        text = stripped
+    return " ".join(text.lower().split())
+
+
+def compute_role_fingerprint(subagent_type: str, role: str) -> str:
+    """Compute a privacy-safe 12-char SHA-256 fingerprint for (subagent_type, normalized role)."""
+    norm_type = " ".join(str(subagent_type or "").strip().lower().split())
+    norm_role = normalize_role(role)
+    if not norm_type and not norm_role:
+        return ""
+    return hashlib.sha256(f"{norm_type}|{norm_role}".encode()).hexdigest()[:12]
+
+
+def compute_prompt_fingerprint(prompt: str) -> str:
+    """Compute a privacy-safe 12-char SHA-256 fingerprint for a normalized task prompt."""
+    text = INLINE_TAG_STRIP_RE.sub(" ", str(prompt or ""))
+    norm = " ".join(text.lower().split())
+    if not norm:
+        return ""
+    return hashlib.sha256(norm.encode()).hexdigest()[:12]
+
+
+def has_explicit_retry_cue(role: str = "", prompt: str = "") -> bool:
+    """Detect explicit retry phrasing or trailing retry/attempt role markers (EN/VI)."""
+    role_no_tags = " ".join(INLINE_TAG_STRIP_RE.sub(" ", str(role or "")).split())
+    if role_no_tags and ROLE_RETRY_SUFFIX_RE.search(role_no_tags):
+        return True
+    combined = f"{role or ''}\n{prompt or ''}"
+    return bool(RETRY_CUE_RE.search(combined))
+
+
+def classify_error_kind(error_text: str | None) -> str | None:
+    """Map a raw error message to a closed, privacy-safe error category enum."""
+    raw = str(error_text or "").strip()
+    if not raw:
+        return None
+    for kind, pattern in ERROR_KIND_PATTERNS:
+        if pattern.search(raw):
+            return kind
+    return "tool_error"
+
+
+def _is_frontier_safety_decision(decision: RoutingDecision) -> bool:
+    """Return True when a Frontier decision reflects an explicit safety guardrail or @high override."""
+    if decision.tier != "frontier":
+        return False
+    return (
+        decision.reason.startswith(HIGH_RISK_SAFETY_REASONS_PREFIX)
+        or decision.reason in HIGH_RISK_SAFETY_REASONS_EXACT
+        or decision.reason == "workspace_config:pinned_role"
+        or decision.reason == "inline_override:frontier"
+    )
+
+
+def _parse_entry_timestamp(raw_ts: str) -> datetime | None:
+    cleaned = raw_ts.strip()
+    if not cleaned:
+        return None
+    if cleaned.endswith("Z"):
+        cleaned = cleaned[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+def _read_tail_dicts_in_locked_fd(
+    fd: int, st_size: int
+) -> list[tuple[datetime, dict[str, Any]]]:
+    """Read and parse recent JSONL dict rows from the last <= 64 KB of an already-locked ledger fd."""
+    if st_size <= 0:
+        return []
     start_offset = max(0, st_size - BURST_TAIL_READ_BYTES)
     os.lseek(fd, start_offset, os.SEEK_SET)
     chunks: list[bytes] = []
@@ -1126,35 +1319,304 @@ def _count_recent_burst_in_locked_fd(
     lines = b"".join(chunks).splitlines()
     if start_offset > 0 and lines:
         lines = lines[1:]
-    count = 0
+    parsed: list[tuple[datetime, dict[str, Any]]] = []
     for raw_line in lines:
         if not raw_line.strip():
             continue
         try:
             obj = json.loads(raw_line.decode("utf-8", errors="replace"))
-            if not isinstance(obj, dict):
-                continue
-            if str(obj.get("conversation_id") or "").strip() != conversation_id:
-                continue
-            raw_ts = str(obj.get("timestamp") or "").strip()
-            if not raw_ts:
-                continue
-            if raw_ts.endswith("Z"):
-                raw_ts = raw_ts[:-1] + "+00:00"
-            entry_ts = datetime.fromisoformat(raw_ts)
-            if entry_ts.tzinfo is None:
-                entry_ts = entry_ts.replace(tzinfo=UTC)
-            delta = (now_ts - entry_ts).total_seconds()
-            if 0.0 <= delta <= float(window_seconds):
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        entry_ts = _parse_entry_timestamp(str(obj.get("timestamp") or ""))
+        if entry_ts is None:
+            continue
+        parsed.append((entry_ts, obj))
+    return parsed
+
+
+def _scan_recent_session_history_in_locked_fd(
+    fd: int,
+    st_size: int,
+    conversation_id: str,
+    now_ts: datetime,
+    burst_window_seconds: int,
+    retry_window_seconds: int,
+    role_fp: str = "",
+) -> tuple[
+    int, list[tuple[datetime, dict[str, Any]]], list[tuple[datetime, dict[str, Any]]]
+]:
+    """Single-pass locked tail scan returning (recent_burst_count, matching_routes, matching_outcomes)."""
+    if st_size <= 0 or not conversation_id:
+        return 0, [], []
+    tail_rows = _read_tail_dicts_in_locked_fd(fd, st_size)
+    burst_count = 0
+    matching_routes: list[tuple[datetime, dict[str, Any]]] = []
+    matching_outcomes: list[tuple[datetime, dict[str, Any]]] = []
+    matched_call_ids: set[str] = set()
+
+    for entry_ts, obj in tail_rows:
+        if str(obj.get("conversation_id") or "").strip() != conversation_id:
+            continue
+        delta = (now_ts - entry_ts).total_seconds()
+        if delta < 0.0:
+            continue
+        ev_type = str(obj.get("event_type") or "route").strip().lower()
+        if ev_type != "outcome":
+            if burst_window_seconds > 0 and delta <= float(burst_window_seconds):
                 raw_spawn = obj.get("spawn_count", 1)
                 try:
                     spawn_weight = max(1, int(raw_spawn or 1))
                 except (ValueError, TypeError):
                     spawn_weight = 1
-                count += spawn_weight
-        except (ValueError, TypeError):
-            continue
-    return count
+                burst_count += spawn_weight
+            if (
+                role_fp
+                and retry_window_seconds > 0
+                and delta <= float(retry_window_seconds)
+                and str(obj.get("mode") or "active").strip().lower() != "off"
+                and str(obj.get("role_fp") or "").strip() == role_fp
+            ):
+                matching_routes.append((entry_ts, obj))
+                cid = str(obj.get("tool_call_id") or "").strip()
+                if cid:
+                    matched_call_ids.add(cid)
+        elif (
+            role_fp
+            and retry_window_seconds > 0
+            and delta <= float(retry_window_seconds)
+        ):
+            out_role_fp = str(obj.get("role_fp") or "").strip()
+            out_call_id = str(obj.get("tool_call_id") or "").strip()
+            if out_role_fp == role_fp or (
+                out_call_id and out_call_id in matched_call_ids
+            ):
+                matching_outcomes.append((entry_ts, obj))
+
+    return burst_count, matching_routes, matching_outcomes
+
+
+def _count_recent_burst_in_locked_fd(
+    fd: int,
+    st_size: int,
+    conversation_id: str,
+    now_ts: datetime,
+    window_seconds: int,
+) -> int:
+    """Count recent routing events (excluding outcomes) for conversation_id within window_seconds."""
+    burst_count, _, _ = _scan_recent_session_history_in_locked_fd(
+        fd=fd,
+        st_size=st_size,
+        conversation_id=conversation_id,
+        now_ts=now_ts,
+        burst_window_seconds=window_seconds,
+        retry_window_seconds=0,
+    )
+    return burst_count
+
+
+def _build_promoted_decision(
+    decision: RoutingDecision,
+    *,
+    target_tier: str,
+    reason: str,
+    original_model: str,
+    norm_tool: str,
+    cfg: DownshiftConfig,
+) -> RoutingDecision:
+    """Build a host-aware promoted RoutingDecision honoring Option A /swarm safety."""
+    raw_orig = str(original_model or "").strip()
+    orig_lower = raw_orig.lower()
+    if norm_tool == "swarm":
+        if target_tier == "fast":
+            swarm_fast = cfg.swarm_models.get("fast")
+            if swarm_fast:
+                return RoutingDecision(
+                    host=decision.host,
+                    tier="fast",
+                    target_model=swarm_fast,
+                    should_overwrite=(orig_lower != swarm_fast.lower()),
+                    reason=reason,
+                )
+            # Option A safe default: never invent an unconfigured swarm fast alias; promote cleanly to Frontier.
+            target_tier = "frontier"
+        return RoutingDecision(
+            host=decision.host,
+            tier="frontier",
+            target_model="",
+            should_overwrite=bool(raw_orig and orig_lower != "inherit"),
+            reason=reason,
+        )
+
+    target_model = _resolve_target_model(decision.host, target_tier)
+    if target_tier == "frontier":
+        should_overwrite = bool(raw_orig and orig_lower != target_model.lower())
+    else:
+        should_overwrite = orig_lower != target_model.lower()
+    return RoutingDecision(
+        host=decision.host,
+        tier=target_tier,
+        target_model=target_model,
+        should_overwrite=should_overwrite,
+        reason=reason,
+    )
+
+
+def _evaluate_retry_guard(
+    decision: RoutingDecision,
+    *,
+    cfg: DownshiftConfig,
+    matching_routes: list[tuple[datetime, dict[str, Any]]],
+    matching_outcomes: list[tuple[datetime, dict[str, Any]]],
+    prompt_fp: str,
+    has_retry_cue: bool,
+    original_model: str,
+    norm_tool: str,
+) -> tuple[RoutingDecision, str]:
+    """Evaluate closed-loop auto-upshift and deterministic 2-retry circuit breaker (Q1 -> A, Q2 -> A)."""
+    if not cfg.auto_upshift or norm_tool == "run_workflow":
+        return decision, ""
+    if _is_frontier_safety_decision(decision):
+        return decision, ""
+    if decision.tier == "frontier" and not decision.reason.startswith(
+        "swarm_models_unconfigured:"
+    ):
+        return decision, ""
+    if not matching_routes and not matching_outcomes:
+        return decision, ""
+
+    failed_outcomes = [
+        (ts, obj) for ts, obj in matching_outcomes if obj.get("failed") is True
+    ]
+    ok_outcomes = [
+        (ts, obj) for ts, obj in matching_outcomes if obj.get("failed") is False
+    ]
+    latest_failed_ts = max((ts for ts, _ in failed_outcomes), default=None)
+    latest_ok_ts = max((ts for ts, _ in ok_outcomes), default=None)
+    has_unresolved_error = latest_failed_ts is not None and (
+        latest_ok_ts is None or latest_failed_ts >= latest_ok_ts
+    )
+    has_same_prompt = bool(prompt_fp) and any(
+        str(obj.get("prompt_fp") or "").strip() == prompt_fp
+        for _, obj in matching_routes
+    )
+    has_retry_cue_with_prior = bool(has_retry_cue and matching_routes)
+
+    if not (has_unresolved_error or has_same_prompt or has_retry_cue_with_prior):
+        return decision, ""
+
+    failed_call_ids = {
+        str(obj.get("tool_call_id") or "").strip()
+        for _, obj in failed_outcomes
+        if str(obj.get("tool_call_id") or "").strip()
+    }
+    upshift_reasons = {"auto_upshift_on_retry", "circuit_breaker_frontier_lock"}
+
+    if has_same_prompt:
+        relevant_routes = [
+            obj
+            for _, obj in matching_routes
+            if str(obj.get("prompt_fp") or "").strip() == prompt_fp
+            or str(obj.get("reason") or "") in upshift_reasons
+            or (
+                str(obj.get("tool_call_id") or "").strip()
+                and str(obj.get("tool_call_id") or "").strip() in failed_call_ids
+            )
+        ]
+    else:
+        relevant_routes = [
+            obj
+            for _, obj in matching_routes
+            if str(obj.get("reason") or "") in upshift_reasons
+            or (
+                str(obj.get("tool_call_id") or "").strip()
+                and str(obj.get("tool_call_id") or "").strip() in failed_call_ids
+            )
+        ]
+        if matching_routes and matching_routes[-1][1] not in relevant_routes:
+            relevant_routes.append(matching_routes[-1][1])
+
+    chain_attempts = max(len(relevant_routes), len(failed_outcomes))
+    if chain_attempts <= 0:
+        return decision, ""
+
+    last_tier = ""
+    if relevant_routes:
+        last_tier = str(relevant_routes[-1].get("tier") or "").strip().lower()
+    elif failed_outcomes:
+        last_tier = str(failed_outcomes[-1][1].get("routed_tier") or "").strip().lower()
+    if last_tier not in VALID_TIERS:
+        last_tier = decision.tier if decision.tier in VALID_TIERS else "lite"
+
+    incoming_effective_tier = (
+        decision.reason.split(":", 1)[1]
+        if decision.reason.startswith("swarm_models_unconfigured:")
+        and decision.reason.split(":", 1)[1] in VALID_TIERS
+        else decision.tier
+    )
+    upshifted_from = (
+        last_tier
+        if last_tier in ("lite", "fast")
+        else (
+            incoming_effective_tier
+            if incoming_effective_tier in ("lite", "fast")
+            else "fast"
+        )
+    )
+
+    if chain_attempts >= cfg.max_auto_retries:
+        promoted = _build_promoted_decision(
+            decision,
+            target_tier="frontier",
+            reason="circuit_breaker_frontier_lock",
+            original_model=original_model,
+            norm_tool=norm_tool,
+            cfg=cfg,
+        )
+        return promoted, upshifted_from
+
+    next_tier = "fast" if last_tier == "lite" else "frontier"
+    if TIER_RANK.get(incoming_effective_tier, 0) > TIER_RANK.get(next_tier, 0):
+        next_tier = incoming_effective_tier
+    promoted = _build_promoted_decision(
+        decision,
+        target_tier=next_tier,
+        reason="auto_upshift_on_retry",
+        original_model=original_model,
+        norm_tool=norm_tool,
+        cfg=cfg,
+    )
+    return promoted, upshifted_from
+
+
+def _write_line_with_rotation_in_locked_fd(
+    fd: int, st_size: int, line_bytes: bytes
+) -> None:
+    """Append line_bytes to an already-locked ledger fd with bounded size half-trim rotation."""
+    max_bytes = _get_max_ledger_bytes()
+    if st_size > 0 and (st_size + len(line_bytes) > max_bytes):
+        os.lseek(fd, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        existing_lines = [
+            ln for ln in b"".join(chunks).splitlines(keepends=True) if ln.strip()
+        ]
+        kept = existing_lines[len(existing_lines) // 2 :]
+        kept_size = sum(len(ln) for ln in kept)
+        while kept and (kept_size + len(line_bytes) > max_bytes):
+            removed = kept.pop(0)
+            kept_size -= len(removed)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, b"".join(kept) + line_bytes)
+    else:
+        os.lseek(fd, 0, os.SEEK_END)
+        os.write(fd, line_bytes)
 
 
 def _record_event_locked(
@@ -1171,8 +1633,12 @@ def _record_event_locked(
     now_utc: datetime | None = None,
     tool: str = "",
     spawn_count: int = 1,
+    tool_call_id: str = "",
+    role_fp: str = "",
+    prompt_fp: str = "",
+    has_retry_cue: bool = False,
 ) -> tuple[RoutingDecision, bool]:
-    """Atomically evaluate the burst cap and append the routing event inside the OS file lock."""
+    """Atomically evaluate retry auto-upshift, 2-retry circuit breaker, and burst cap inside the OS file lock."""
     cfg = config if config is not None else load_config()
     now_ts = now_utc if now_utc is not None else datetime.now(UTC)
     if now_ts.tzinfo is None:
@@ -1182,12 +1648,18 @@ def _record_event_locked(
     except (ValueError, TypeError):
         norm_spawn = 1
     norm_tool = str(tool or "").strip()
+    norm_call_id = str(tool_call_id or "").strip()[:64]
+    norm_role_fp = str(role_fp or "").strip() or compute_role_fingerprint(
+        subagent_type, role
+    )
+    norm_prompt_fp = str(prompt_fp or "").strip()
     try:
         path = get_ledger_path(ledger_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
         locked = False
         effective_decision = decision
+        upshifted_from = ""
         try:
             if os.name == "nt":
                 import msvcrt
@@ -1208,20 +1680,54 @@ def _record_event_locked(
 
             st_size = os.fstat(fd).st_size
             norm_conv = str(conversation_id or "").strip()
-            if (
+            need_burst = (
                 cfg.max_burst_subagents > 0
-                and norm_conv
+                and bool(norm_conv)
                 and decision.tier == "fast"
                 and decision.reason in BURST_ELIGIBLE_REASONS
-            ):
-                recent_count = _count_recent_burst_in_locked_fd(
-                    fd=fd,
-                    st_size=st_size,
-                    conversation_id=norm_conv,
-                    now_ts=now_ts,
-                    window_seconds=cfg.burst_window_seconds,
+            )
+            need_retry = (
+                cfg.auto_upshift
+                and bool(norm_conv)
+                and bool(norm_role_fp)
+                and norm_tool != "run_workflow"
+                and not _is_frontier_safety_decision(decision)
+            )
+            if need_burst or need_retry:
+                recent_count, matching_routes, matching_outcomes = (
+                    _scan_recent_session_history_in_locked_fd(
+                        fd=fd,
+                        st_size=st_size,
+                        conversation_id=norm_conv,
+                        now_ts=now_ts,
+                        burst_window_seconds=cfg.burst_window_seconds
+                        if need_burst
+                        else 0,
+                        retry_window_seconds=cfg.retry_window_seconds
+                        if need_retry
+                        else 0,
+                        role_fp=norm_role_fp if need_retry else "",
+                    )
                 )
-                if recent_count + norm_spawn > cfg.max_burst_subagents:
+                if need_retry:
+                    effective_decision, upshifted_from = _evaluate_retry_guard(
+                        decision,
+                        cfg=cfg,
+                        matching_routes=matching_routes,
+                        matching_outcomes=matching_outcomes,
+                        prompt_fp=norm_prompt_fp,
+                        has_retry_cue=has_retry_cue,
+                        original_model=original_model,
+                        norm_tool=norm_tool,
+                    )
+                # FR-009: auto-upshift / circuit breaker strictly beats burst-cap downgrades.
+                if (
+                    not upshifted_from
+                    and need_burst
+                    and effective_decision.tier == "fast"
+                    and effective_decision.reason in BURST_ELIGIBLE_REASONS
+                    and recent_count + norm_spawn > cfg.max_burst_subagents
+                ):
                     if norm_tool == "swarm":
                         swarm_lite = cfg.swarm_models.get("lite")
                         if swarm_lite:
@@ -1246,6 +1752,7 @@ def _record_event_locked(
 
             entry: dict[str, Any] = {
                 "timestamp": now_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "event_type": "route",
                 "conversation_id": str(conversation_id or ""),
                 "host": effective_decision.host,
                 "mode": str(mode or "active"),
@@ -1262,35 +1769,18 @@ def _record_event_locked(
                 entry["tool"] = norm_tool
             if norm_spawn > 1:
                 entry["spawn_count"] = norm_spawn
+            if norm_call_id:
+                entry["tool_call_id"] = norm_call_id
+            if norm_role_fp:
+                entry["role_fp"] = norm_role_fp
+            if norm_prompt_fp:
+                entry["prompt_fp"] = norm_prompt_fp
+            if upshifted_from:
+                entry["upshifted_from"] = upshifted_from
             line_bytes = (json.dumps(entry, separators=(",", ":")) + "\n").encode(
                 "utf-8"
             )
-
-            max_bytes = _get_max_ledger_bytes()
-            if st_size > 0 and (st_size + len(line_bytes) > max_bytes):
-                os.lseek(fd, 0, os.SEEK_SET)
-                chunks: list[bytes] = []
-                while True:
-                    chunk = os.read(fd, 65536)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
-                existing_lines = [
-                    ln
-                    for ln in b"".join(chunks).splitlines(keepends=True)
-                    if ln.strip()
-                ]
-                kept = existing_lines[len(existing_lines) // 2 :]
-                kept_size = sum(len(ln) for ln in kept)
-                while kept and (kept_size + len(line_bytes) > max_bytes):
-                    removed = kept.pop(0)
-                    kept_size -= len(removed)
-                os.lseek(fd, 0, os.SEEK_SET)
-                os.ftruncate(fd, 0)
-                os.write(fd, b"".join(kept) + line_bytes)
-            else:
-                os.lseek(fd, 0, os.SEEK_END)
-                os.write(fd, line_bytes)
+            _write_line_with_rotation_in_locked_fd(fd, st_size, line_bytes)
         finally:
             if locked:
                 with contextlib.suppress(OSError):
@@ -1310,7 +1800,7 @@ def _record_event_locked(
         return decision, False
 
 
-def record_and_apply_burst_cap(
+def record_and_evaluate_session_guards(
     decision: RoutingDecision,
     conversation_id: str = "",
     subagent_type: str = "",
@@ -1323,8 +1813,12 @@ def record_and_apply_burst_cap(
     now_utc: datetime | None = None,
     tool: str = "",
     spawn_count: int = 1,
+    tool_call_id: str = "",
+    role_fp: str = "",
+    prompt_fp: str = "",
+    has_retry_cue: bool = False,
 ) -> RoutingDecision:
-    """Atomically apply the dynamic burst cap and append the event to the JSONL ledger."""
+    """Atomically evaluate closed-loop auto-upshift, 2-retry circuit breaker, and burst cap and append the event."""
     effective_decision, _ = _record_event_locked(
         decision=decision,
         conversation_id=conversation_id,
@@ -1338,8 +1832,51 @@ def record_and_apply_burst_cap(
         now_utc=now_utc,
         tool=tool,
         spawn_count=spawn_count,
+        tool_call_id=tool_call_id,
+        role_fp=role_fp,
+        prompt_fp=prompt_fp,
+        has_retry_cue=has_retry_cue,
     )
     return effective_decision
+
+
+def record_and_apply_burst_cap(
+    decision: RoutingDecision,
+    conversation_id: str = "",
+    subagent_type: str = "",
+    role: str = "",
+    original_model: str = "inherit",
+    ledger_path: str | Path | None = None,
+    mode: str = "active",
+    prompt_chars: int = 0,
+    config: DownshiftConfig | None = None,
+    now_utc: datetime | None = None,
+    tool: str = "",
+    spawn_count: int = 1,
+    tool_call_id: str = "",
+    role_fp: str = "",
+    prompt_fp: str = "",
+    has_retry_cue: bool = False,
+) -> RoutingDecision:
+    """Backward-compatible alias for record_and_evaluate_session_guards()."""
+    return record_and_evaluate_session_guards(
+        decision=decision,
+        conversation_id=conversation_id,
+        subagent_type=subagent_type,
+        role=role,
+        original_model=original_model,
+        ledger_path=ledger_path,
+        mode=mode,
+        prompt_chars=prompt_chars,
+        config=config,
+        now_utc=now_utc,
+        tool=tool,
+        spawn_count=spawn_count,
+        tool_call_id=tool_call_id,
+        role_fp=role_fp,
+        prompt_fp=prompt_fp,
+        has_retry_cue=has_retry_cue,
+    )
 
 
 def record_routing_event(
@@ -1355,6 +1892,10 @@ def record_routing_event(
     now_utc: datetime | None = None,
     tool: str = "",
     spawn_count: int = 1,
+    tool_call_id: str = "",
+    role_fp: str = "",
+    prompt_fp: str = "",
+    has_retry_cue: bool = False,
 ) -> bool:
     """Append a privacy-safe routing event (never storing raw Prompt text) to the JSONL ledger."""
     _, ok = _record_event_locked(
@@ -1370,8 +1911,129 @@ def record_routing_event(
         now_utc=now_utc,
         tool=tool,
         spawn_count=spawn_count,
+        tool_call_id=tool_call_id,
+        role_fp=role_fp,
+        prompt_fp=prompt_fp,
+        has_retry_cue=has_retry_cue,
     )
     return ok
+
+
+def record_outcome_event(
+    *,
+    host: str,
+    conversation_id: str = "",
+    tool: str = "",
+    tool_call_id: str = "",
+    role_fp: str = "",
+    failed: bool = False,
+    error_kind: str | None = None,
+    ledger_path: str | Path | None = None,
+    now_utc: datetime | None = None,
+) -> bool:
+    """Append a privacy-safe PostToolUse outcome event under the OS file lock, stamping correlated routed_tier."""
+    now_ts = now_utc if now_utc is not None else datetime.now(UTC)
+    if now_ts.tzinfo is None:
+        now_ts = now_ts.replace(tzinfo=UTC)
+    norm_host = str(host or "antigravity").strip().lower() or "antigravity"
+    norm_conv = str(conversation_id or "").strip()
+    norm_tool = str(tool or "").strip()
+    norm_call_id = str(tool_call_id or "").strip()[:64]
+    norm_role_fp = str(role_fp or "").strip()
+    is_failed = bool(failed)
+    norm_error_kind = str(error_kind).strip() if (is_failed and error_kind) else None
+    try:
+        path = get_ledger_path(ledger_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
+        locked = False
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                for _ in range(250):
+                    try:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                        locked = True
+                        break
+                    except OSError:
+                        time.sleep(0.002)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                locked = True
+
+            st_size = os.fstat(fd).st_size
+            routed_tier: str | None = None
+            if st_size > 0 and (norm_call_id or (norm_conv and norm_role_fp)):
+                tail_rows = _read_tail_dicts_in_locked_fd(fd, st_size)
+                # Prefer exact tool_call_id correlation; fall back to latest matching (conversation_id, role_fp).
+                fallback_tier: str | None = None
+                for _, obj in reversed(tail_rows):
+                    if (
+                        str(obj.get("event_type") or "route").strip().lower()
+                        == "outcome"
+                    ):
+                        continue
+                    tier_val = str(obj.get("tier") or "").strip().lower()
+                    if tier_val not in VALID_TIERS:
+                        continue
+                    if (
+                        norm_call_id
+                        and str(obj.get("tool_call_id") or "").strip() == norm_call_id
+                    ):
+                        routed_tier = tier_val
+                        break
+                    if (
+                        fallback_tier is None
+                        and norm_conv
+                        and norm_role_fp
+                        and str(obj.get("conversation_id") or "").strip() == norm_conv
+                        and str(obj.get("role_fp") or "").strip() == norm_role_fp
+                    ):
+                        fallback_tier = tier_val
+                if routed_tier is None:
+                    routed_tier = fallback_tier
+
+            entry: dict[str, Any] = {
+                "timestamp": now_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "event_type": "outcome",
+                "host": norm_host,
+                "conversation_id": norm_conv,
+                "failed": is_failed,
+                "error_kind": norm_error_kind,
+            }
+            if norm_tool:
+                entry["tool"] = norm_tool
+            if norm_call_id:
+                entry["tool_call_id"] = norm_call_id
+            if norm_role_fp:
+                entry["role_fp"] = norm_role_fp
+            if routed_tier in VALID_TIERS:
+                entry["routed_tier"] = routed_tier
+
+            line_bytes = (json.dumps(entry, separators=(",", ":")) + "\n").encode(
+                "utf-8"
+            )
+            _write_line_with_rotation_in_locked_fd(fd, st_size, line_bytes)
+        finally:
+            if locked:
+                with contextlib.suppress(OSError):
+                    if os.name == "nt":
+                        import msvcrt
+
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        return True
+    except OSError:
+        return False
 
 
 def clean_ledger_file(ledger_path: str | Path | None = None) -> tuple[int, int]:
@@ -1419,6 +2081,15 @@ def clean_ledger_file(ledger_path: str | Path | None = None) -> tuple[int, int]:
                 continue
             if not isinstance(item, dict):
                 removed_count += 1
+                continue
+            if str(item.get("event_type") or "").strip().lower() == "outcome":
+                host_str = str(item.get("host") or "").strip()
+                if not host_str or not isinstance(item.get("failed"), bool):
+                    removed_count += 1
+                    continue
+                kept_lines.append(
+                    raw_line if raw_line.endswith(b"\n") else (raw_line + b"\n")
+                )
                 continue
             try:
                 p_chars = int(item.get("prompt_chars") or 0)

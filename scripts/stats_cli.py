@@ -66,8 +66,18 @@ def load_events(ledger_path: Path, limit: int | None = None) -> list[dict[str, A
 
 
 def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate total subagents intercepted, frontier calls saved, cost ROI, and mode/host/reason counts."""
-    total = len(events)
+    """Aggregate total subagents intercepted, frontier calls saved, cost ROI, rework, and mode/host/reason counts."""
+    route_events = [
+        ev
+        for ev in events
+        if str(ev.get("event_type") or "route").strip().lower() != "outcome"
+    ]
+    outcome_events = [
+        ev
+        for ev in events
+        if str(ev.get("event_type") or "route").strip().lower() == "outcome"
+    ]
+    total = len(route_events)
     tiers = {"lite": 0, "fast": 0, "frontier": 0}
     models: dict[str, int] = {}
     hosts: dict[str, int] = {}
@@ -78,11 +88,32 @@ def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     active_count = 0
     shadow_count = 0
     guardrail_count = 0
+    upshift_count = 0
+    circuit_breaker_count = 0
     total_prompt_chars = 0
     total_workers = 0
     actual_weighted_cost = 0.0
 
-    for ev in events:
+    # Pre-tally failed lower-tier outcome costs and deduplication credits (Q3 -> A).
+    error_outcome_count = 0
+    wasted_lower_tier_cost = 0.0
+    unconsumed_error_credits: dict[tuple[str, str], int] = {}
+    for ev in outcome_events:
+        if ev.get("failed") is not True:
+            continue
+        routed_tier = str(ev.get("routed_tier") or "").strip().lower()
+        if routed_tier == "frontier":
+            continue
+        error_outcome_count += 1
+        if routed_tier in ("lite", "fast"):
+            wasted_lower_tier_cost += TIER_COST_WEIGHT[routed_tier]
+            key = (
+                str(ev.get("conversation_id") or "").strip(),
+                str(ev.get("role_fp") or "").strip(),
+            )
+            unconsumed_error_credits[key] = unconsumed_error_credits.get(key, 0) + 1
+
+    for ev in route_events:
         tier = str(ev.get("tier") or "frontier")
         if tier not in tiers:
             tier = "frontier"
@@ -114,6 +145,20 @@ def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
             or (reason == "workspace_config:pinned_role" and tier == "frontier")
         ):
             guardrail_count += 1
+        if reason in ("auto_upshift_on_retry", "circuit_breaker_frontier_lock"):
+            upshift_count += 1
+            if reason == "circuit_breaker_frontier_lock":
+                circuit_breaker_count += 1
+            up_from = str(ev.get("upshifted_from") or "").strip().lower()
+            if up_from in ("lite", "fast"):
+                key = (
+                    str(ev.get("conversation_id") or "").strip(),
+                    str(ev.get("role_fp") or "").strip(),
+                )
+                if unconsumed_error_credits.get(key, 0) > 0:
+                    unconsumed_error_credits[key] -= 1
+                else:
+                    wasted_lower_tier_cost += TIER_COST_WEIGHT[up_from]
 
         mode = str(ev.get("mode") or "active").strip().lower()
         if mode == "shadow":
@@ -141,16 +186,38 @@ def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     est_cost_saved_pct = (
         round((1.0 - (actual_weighted_cost / total)) * 100.0, 1) if total > 0 else 0.0
     )
+    downshifted_total = tiers["lite"] + tiers["fast"]
+    rework_rate_pct = (
+        min(100.0, round((upshift_count / downshifted_total) * 100.0, 1))
+        if downshifted_total > 0
+        else 0.0
+    )
+    if total <= 0:
+        net_cost_saved_pct = 0.0
+    elif wasted_lower_tier_cost <= 0.0:
+        net_cost_saved_pct = est_cost_saved_pct
+    else:
+        net_saved_units = max(
+            0.0, (float(total) - actual_weighted_cost) - wasted_lower_tier_cost
+        )
+        net_cost_saved_pct = round((net_saved_units / total) * 100.0, 1)
+
     return {
         "total": total,
         "saved": saved,
         "overwritten_calls": overwritten_calls,
         "saved_pct": saved_pct,
         "est_cost_saved_pct": est_cost_saved_pct,
+        "net_cost_saved_pct": net_cost_saved_pct,
         "active_count": active_count,
         "shadow_count": shadow_count,
         "total_prompt_chars": total_prompt_chars,
         "total_workers": total_workers,
+        "outcome_count": len(outcome_events),
+        "upshift_count": upshift_count,
+        "circuit_breaker_count": circuit_breaker_count,
+        "error_outcome_count": error_outcome_count,
+        "rework_rate_pct": rework_rate_pct,
         "tiers": tiers,
         "models": models,
         "hosts": hosts,
@@ -193,6 +260,15 @@ def render_ascii_scoreboard(summary: dict[str, Any], ledger_path: Path) -> str:
     )
     host_line = _truncate_cell(f"{host_summary} · {guardrail_count} guardrail(s)")
     top_reasons = _truncate_cell(_format_top_reasons(summary.get("reasons") or {}))
+    upshift_count = int(summary.get("upshift_count", 0))
+    error_outcome_count = int(summary.get("error_outcome_count", 0))
+    rework_rate_pct = float(summary.get("rework_rate_pct", 0.0))
+    net_cost_saved_pct = float(summary.get("net_cost_saved_pct", est_cost_saved_pct))
+    rework_line = (
+        f"  │  Quality & rework            : {_truncate_cell(f'{upshift_count} upshift(s) · {error_outcome_count} err · {rework_rate_pct:.1f}% rework · Net {net_cost_saved_pct:.1f}%')}\n"
+        if (upshift_count > 0 or error_outcome_count > 0)
+        else ""
+    )
 
     lite_pct = round((lite / total) * 100.0, 1)
     fast_pct = round((fast / total) * 100.0, 1)
@@ -219,6 +295,7 @@ def render_ascii_scoreboard(summary: dict[str, Any], ledger_path: Path) -> str:
         "  │\n"
         f"  │  Hosts & guardrails          : {host_line}\n"
         f"{tool_line}"
+        f"{rework_line}"
         f"  │  Top routing reasons         : {top_reasons}\n"
         "  ╰─────────────────────────────────────────────────────────────────────────────────────\n"
     )
@@ -248,9 +325,24 @@ def render_html_widget(summary: dict[str, Any], ledger_path: Path) -> str:
         tool_summary = ", ".join(f"{t}: {c}" for t, c in sorted(tools.items()))
         host_summary = f"{host_summary} · {tool_summary}"
     guardrail_count = int(summary.get("guardrail_count", 0))
+    upshift_count = int(summary.get("upshift_count", 0))
+    error_outcome_count = int(summary.get("error_outcome_count", 0))
+    rework_rate_pct = float(summary.get("rework_rate_pct", 0.0))
+    net_cost_saved_pct = float(summary.get("net_cost_saved_pct", est_cost_saved_pct))
     esc_path = html.escape(str(ledger_path))
     esc_hosts = html.escape(host_summary)
     esc_reasons = html.escape(_format_top_reasons(summary.get("reasons") or {}))
+    rework_html = ""
+    if upshift_count > 0 or error_outcome_count > 0:
+        esc_rework = html.escape(
+            f"{upshift_count} upshift(s) · {error_outcome_count} err · {rework_rate_pct:.1f}% rework · Net {net_cost_saved_pct:.1f}% saved"
+        )
+        rework_html = (
+            '\n    <div class="pt-1.5 border-t border-[var(--border)] flex items-center justify-between gap-3 text-xs text-[var(--muted-foreground)]">\n'
+            '      <span class="shrink-0 font-medium">Quality &amp; rework</span>\n'
+            f'      <span class="font-mono truncate" title="{esc_rework}">{esc_rework}</span>\n'
+            "    </div>"
+        )
 
     return f"""<!DOCTYPE html>
 <html>
@@ -322,7 +414,7 @@ def render_html_widget(summary: dict[str, Any], ledger_path: Path) -> str:
     <div class="pt-2 border-t border-[var(--border)] flex items-center justify-between gap-3 text-xs text-[var(--muted-foreground)]">
       <span class="shrink-0 font-medium">Top routing reasons</span>
       <span class="font-mono truncate" title="{esc_reasons}">{esc_reasons}</span>
-    </div>
+    </div>{rework_html}
   </div>
 </body>
 </html>

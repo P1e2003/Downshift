@@ -15,6 +15,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from downshift_core import (
     RoutingDecision,
     _get_max_ledger_bytes,
+    clean_ledger_file,
+    record_outcome_event,
     record_routing_event,
 )
 from stats_cli import (
@@ -22,6 +24,7 @@ from stats_cli import (
     compute_summary,
     load_events,
     render_ascii_scoreboard,
+    render_html_widget,
 )
 
 STATS_CLI = ROOT / "scripts" / "stats_cli.py"
@@ -845,3 +848,180 @@ def test_stats_cli_aggregates_swarm_and_workflow_tools_within_88_cols(
     for line in board.splitlines():
         if not line.startswith("  ╭─"):
             assert len(line) <= 88, f"Line exceeded 88 cols ({len(line)}): {line!r}"
+
+
+def test_stats_cli_computes_net_cost_saved_rework_rate_and_preserves_outcomes_on_clean(
+    tmp_path: Path,
+) -> None:
+    # 1. Legacy zero-rework ledger: net_cost_saved_pct == est_cost_saved_pct, no Quality & rework line
+    legacy = tmp_path / "legacy.jsonl"
+    legacy_rows = [
+        {
+            "timestamp": "2026-11-10T00:00:01Z",
+            "host": "antigravity",
+            "mode": "active",
+            "subagent_type": "research",
+            "role": "Locator",
+            "prompt_chars": 80,
+            "original_model": "inherit",
+            "target_model": "flash_lite",
+            "tier": "lite",
+            "reason": "read_only_simple_lookup",
+            "overwritten": True,
+        }
+    ]
+    legacy.write_text(json.dumps(legacy_rows[0]) + "\n", encoding="utf-8")
+    leg_summary = compute_summary(load_events(legacy))
+    assert leg_summary["total"] == 1
+    assert leg_summary["outcome_count"] == 0
+    assert leg_summary["upshift_count"] == 0
+    assert leg_summary["error_outcome_count"] == 0
+    assert leg_summary["rework_rate_pct"] == 0.0
+    assert leg_summary["net_cost_saved_pct"] == leg_summary["est_cost_saved_pct"]
+    assert "Quality & rework" not in render_ascii_scoreboard(leg_summary, legacy)
+
+    # 2. Mixed ledger: route + outcome separation, frontier failure exclusion, rotated-out routed_tier=None,
+    # wasted-cost deduplication (error+upshift counted once vs implicit retry without error), <=88 cols, HTML, --clean
+    mixed = tmp_path / "mixed_rework.jsonl"
+    rows = [
+        # Route 1: lite (0.04) -> fails via outcome 1
+        {
+            "timestamp": "2026-11-22T10:00:00Z",
+            "event_type": "route",
+            "conversation_id": "conv-1",
+            "host": "antigravity",
+            "mode": "active",
+            "subagent_type": "research",
+            "role": "Locator",
+            "prompt_chars": 100,
+            "original_model": "inherit",
+            "target_model": "flash_lite",
+            "tier": "lite",
+            "reason": "read_only_simple_lookup",
+            "overwritten": True,
+            "role_fp": "aaaaaaaaaaaa",
+        },
+        # Outcome 1: failed lite (0.04 wasted, paired with Route 2 upshift -> deducted ONCE)
+        {
+            "timestamp": "2026-11-22T10:00:01Z",
+            "event_type": "outcome",
+            "conversation_id": "conv-1",
+            "host": "antigravity",
+            "tool": "invoke_subagent",
+            "role_fp": "aaaaaaaaaaaa",
+            "failed": True,
+            "error_kind": "timeout",
+            "routed_tier": "lite",
+        },
+        # Route 2: auto_upshift_on_retry (fast 0.20, upshifted_from=lite)
+        {
+            "timestamp": "2026-11-22T10:00:02Z",
+            "event_type": "route",
+            "conversation_id": "conv-1",
+            "host": "antigravity",
+            "mode": "active",
+            "subagent_type": "research",
+            "role": "Locator",
+            "prompt_chars": 100,
+            "original_model": "inherit",
+            "target_model": "flash",
+            "tier": "fast",
+            "reason": "auto_upshift_on_retry",
+            "overwritten": True,
+            "role_fp": "aaaaaaaaaaaa",
+            "upshifted_from": "lite",
+        },
+        # Route 3: implicit Antigravity retry circuit breaker (frontier 1.00, upshifted_from=fast -> deducts 0.20)
+        {
+            "timestamp": "2026-11-22T10:00:05Z",
+            "event_type": "route",
+            "conversation_id": "conv-2",
+            "host": "antigravity",
+            "mode": "active",
+            "subagent_type": "research",
+            "role": "Surveyor",
+            "prompt_chars": 200,
+            "original_model": "flash",
+            "target_model": "inherit",
+            "tier": "frontier",
+            "reason": "circuit_breaker_frontier_lock",
+            "overwritten": True,
+            "role_fp": "bbbbbbbbbbbb",
+            "upshifted_from": "fast",
+        },
+        # Outcome 2: frontier failure -> MUST NOT increment error_outcome_count or deduct lower-tier cost
+        {
+            "timestamp": "2026-11-22T10:00:06Z",
+            "event_type": "outcome",
+            "conversation_id": "conv-2",
+            "host": "antigravity",
+            "role_fp": "bbbbbbbbbbbb",
+            "failed": True,
+            "error_kind": "tool_error",
+            "routed_tier": "frontier",
+        },
+        # Outcome 3: rotated-out unlinked outcome (routed_tier absent/None) -> counted cleanly, no crash
+        {
+            "timestamp": "2026-11-22T10:00:07Z",
+            "event_type": "outcome",
+            "conversation_id": "conv-rotated",
+            "host": "claude",
+            "role_fp": "cccccccccccc",
+            "failed": True,
+            "error_kind": "rate_limit",
+        },
+        # Synthetic empty route row + malformed outcome row -> should be dropped by --clean
+        {"timestamp": "2026-11-22T10:00:08Z", "prompt_chars": 0, "role": ""},
+        {
+            "timestamp": "2026-11-22T10:00:09Z",
+            "event_type": "outcome",
+            "host": "claude",
+        },
+    ]
+    mixed.write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    removed, retained = clean_ledger_file(mixed)
+    assert removed == 2
+    assert retained == 6
+
+    summary = compute_summary(load_events(mixed))
+    assert summary["total"] == 3  # Only route rows counted!
+    assert summary["outcome_count"] == 3
+    assert summary["upshift_count"] == 2
+    assert summary["circuit_breaker_count"] == 1
+    assert (
+        summary["error_outcome_count"] == 2
+    )  # Outcome 1 (lite) + Outcome 3 (None); Outcome 2 (frontier) excluded
+    # downshifted_total = 1 lite + 1 fast = 2; upshift_count = 2 -> 100.0% (clamped <= 100.0%)
+    assert summary["rework_rate_pct"] == 100.0
+    # actual_weighted_cost = 0.04 + 0.20 + 1.00 = 1.24; gross_saved = 1.76 -> est = round(1.76/3*100, 1) = 58.7
+    # wasted_cost = 0.04 (Outcome 1 deduplicated with Route 2) + 0.20 (Route 3 implicit) = 0.24
+    # net_saved = 1.76 - 0.24 = 1.52 -> net = round(1.52/3*100, 1) = 50.7
+    assert summary["est_cost_saved_pct"] == 58.7
+    assert summary["net_cost_saved_pct"] == 50.7
+
+    board = render_ascii_scoreboard(summary, mixed)
+    assert "Quality & rework" in board
+    assert "Net 50.7%" in board
+    for line in board.splitlines():
+        if not line.startswith("  ╭─"):
+            assert len(line) <= 88, f"Line exceeded 88 cols ({len(line)}): {line!r}"
+
+    html_doc = render_html_widget(summary, tmp_path / "ledger_<script>.jsonl")
+    assert "Quality &amp; rework" in html_doc
+    assert "Net 50.7% saved" in html_doc
+    assert "ledger_<script>.jsonl" not in html_doc
+    assert "ledger_&lt;script&gt;.jsonl" in html_doc
+
+    # Verify direct record_outcome_event helper succeeds cleanly
+    assert record_outcome_event(
+        host="codex",
+        conversation_id="conv-direct",
+        tool="spawn_agent",
+        role_fp="dddddddddddd",
+        failed=False,
+        ledger_path=mixed,
+    )

@@ -43,11 +43,12 @@ Display this compact reference card in a fenced `text` block:
     active (default)   Enforce model routing + record telemetry
     shadow             Dry-run: record telemetry without overwriting models
     off                Disable routing, telemetry, and hints
-    .downshift.json    mode, hints, high_risk_keywords, pinned_roles, max_burst_subagents (4), burst_window_seconds (5), swarm_models ({lite, fast})
-    Antigravity Hooks  invoke_subagent (auto-route), swarm(action="add") (safe-by-default unless swarm_models set + sharded burst cap), run_workflow (read-only telemetry)
+    .downshift.json    mode, hints, high_risk_keywords, pinned_roles, max_burst_subagents (4), burst_window_seconds (5), swarm_models ({lite, fast}), auto_upshift (true), retry_window_seconds (120), max_auto_retries (2)
+    Antigravity Hooks  PreToolUse: invoke_subagent, swarm(action="add") (safe-by-default unless swarm_models set + sharded burst cap), run_workflow (read-only telemetry) · PostToolUse: invoke_subagent|swarm (privacy-safe outcome capture)
+    Closed-Loop Retry  Confirmed PostToolUse error, same prompt fingerprint, or explicit retry cue -> auto-upshift (lite->fast->frontier) & 2-retry circuit breaker (overrides @low/@medium in active; log-only in shadow; beats burst cap)
 
   Commands
-    /downshift-stats   Show live routing scoreboard from ~/.gemini/downshift_ledger.jsonl
+    /downshift-stats   Show live routing scoreboard (gross + net credit cost saved & Quality & rework) from ~/.gemini/downshift_ledger.jsonl
     /downshift-help    Show this reference card
 ```
 

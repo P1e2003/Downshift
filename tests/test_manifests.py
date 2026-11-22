@@ -78,12 +78,32 @@ def test_hooks_json_references_existing_scripts() -> None:
             assert match is not None, f"Could not parse script path from: {cmd}"
             assert (ROOT / match.group(1)).exists()
 
+    assert isinstance(spec["PostToolUse"], list)
+    assert spec["PostToolUse"][0]["matcher"] == "invoke_subagent|swarm"
+    for matcher_group in spec["PostToolUse"]:
+        for hook in matcher_group["hooks"]:
+            assert hook["type"] == "command"
+            assert hook["timeout"] == 5
+            cmd = hook["command"]
+            assert "run_hook.cmd" in cmd, f"Expected run_hook.cmd in: {cmd}"
+            match = re.search(r"\./(scripts/[a-zA-Z0-9_]+\.py)", cmd)
+            assert match is not None, f"Could not parse script path from: {cmd}"
+            assert match.group(1) == "scripts/post_tool_use.py"
+            assert (ROOT / match.group(1)).exists()
+
     claude_hooks_path = ROOT / "hooks" / "claude-codex-hooks.json"
     assert claude_hooks_path.exists()
     claude_hooks = json.loads(claude_hooks_path.read_text(encoding="utf-8"))
     pre_tool_matcher = claude_hooks["hooks"]["PreToolUse"][0]["matcher"]
     assert "spawn_agent" in pre_tool_matcher
     assert "multi_agent_v1__spawn_agent" in pre_tool_matcher
+    post_tool_group = claude_hooks["hooks"]["PostToolUse"][0]
+    assert (
+        post_tool_group["matcher"]
+        == "Task|Agent|spawn_agent|multi_agent_v1__spawn_agent"
+    )
+    assert post_tool_group["hooks"][0]["timeout"] == 5
+    assert "post_tool_use.py" in post_tool_group["hooks"][0]["command"]
     for event_list in claude_hooks["hooks"].values():
         for matcher_group in event_list:
             for hook in matcher_group["hooks"]:
