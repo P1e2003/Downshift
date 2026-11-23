@@ -9,7 +9,35 @@ description: >
 
 # Downshift Explain & Calibration Audit
 
-1. **Explain a specific subagent routing decision (100% pure dry-run, zero ledger I/O)**: Run `stats_cli.py explain` from the Downshift plugin directory via the portable launcher and display its box-drawn output in a fenced `text` block (or pass `--json` when summarizing programmatically):
+1. **On Google Antigravity (`generative_ui` / `<agent-embed>` available — Default UI)**: Run the diagnostic CLI from the Downshift plugin directory with `--html`, register the generated HTML file via `write_file` (`Overwrite: true`, `ArtifactMetadata` with `UserFacing: true`, `RequestFeedback: false`), and embed the interactive HTML card inline **by default** (do **not** paste the raw `text` box unless the user explicitly asks for plain text):
+
+- **Explain a specific subagent routing decision (100% pure dry-run, zero ledger I/O):**
+
+```bash
+"./scripts/run_hook.cmd" ./scripts/stats_cli.py explain \
+  --type research \
+  --role "<role>" \
+  --prompt "<prompt>" \
+  --workspace "." \
+  --host all \
+  --html "<artifact_dir>/downshift_explain.html"
+```
+
+```markdown
+<agent-embed src="file:///<artifact_dir>/downshift_explain.html"></agent-embed>
+```
+
+- **Audit the live ledger for guardrail hotspots & calibration candidates (strictly read-only):**
+
+```bash
+"./scripts/run_hook.cmd" ./scripts/stats_cli.py --audit-ledger --html "<artifact_dir>/downshift_audit.html"
+```
+
+```markdown
+<agent-embed src="file:///<artifact_dir>/downshift_audit.html"></agent-embed>
+```
+
+2. **On Terminal CLI Hosts (`Claude Code`, `OpenAI Codex`, `Gemini CLI` — no `<agent-embed>`)**: Run without `--html` from the Downshift plugin directory and display the `<= 88`-col box-drawn output verbatim in a fenced `text` block:
 
 ```bash
 "./scripts/run_hook.cmd" ./scripts/stats_cli.py explain \
@@ -19,8 +47,6 @@ description: >
   --workspace "." \
   --host all
 ```
-
-2. **Audit the live ledger for guardrail hotspots & false-positive calibration candidates (strictly read-only)**: When the user asks to calibrate Downshift or find read-only mappers hitting `frontier`, run:
 
 ```bash
 "./scripts/run_hook.cmd" ./scripts/stats_cli.py --audit-ledger

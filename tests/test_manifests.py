@@ -23,7 +23,7 @@ def test_all_manifests_parse_and_share_name_and_version() -> None:
         assert path.exists(), f"Missing manifest: {path}"
         data = json.loads(path.read_text(encoding="utf-8"))
         assert data["name"] == "downshift"
-        assert data["version"] == "0.4.0"
+        assert data["version"] == "0.4.1"
         assert data.get("description")
         loaded.append(data)
 
@@ -144,9 +144,12 @@ def test_skills_have_valid_frontmatter() -> None:
     assert "python ./scripts/stats_cli.py" not in explain_skill
     assert '"./scripts/run_hook.cmd" ./scripts/stats_cli.py explain' in explain_skill
     assert (
-        '"./scripts/run_hook.cmd" ./scripts/stats_cli.py --audit-ledger'
+        '"./scripts/run_hook.cmd" ./scripts/stats_cli.py --audit-ledger --html'
         in explain_skill
     )
+    assert "<agent-embed" in explain_skill
+    assert "userfacing: true" in explain_skill.lower()
+    assert "by default" in explain_skill.lower()
 
 
 def test_benchmark_suite_passes_100_percent_accuracy_and_zero_false_downgrades() -> (

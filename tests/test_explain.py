@@ -19,7 +19,7 @@ from downshift_core import (
     explain_subagent_call,
 )
 from run_benchmark import SCENARIOS
-from stats_cli import render_ascii_explain
+from stats_cli import render_ascii_explain, render_html_explain
 
 STATS_CLI = ROOT / "scripts" / "stats_cli.py"
 RUN_HOOK_CMD = ROOT / "scripts" / "run_hook.cmd"
@@ -372,3 +372,67 @@ def test_run_hook_cmd_forwards_explain_flags_on_windows(tmp_path: Path) -> None:
     assert set(data["hosts"].keys()) == {"antigravity", "claude", "codex"}
     assert data["hosts"]["codex"]["reasoning_effort"] == "medium"
     assert not isolated_ledger.exists()
+
+
+def test_explain_html_widget_renders_unwrapped_fields_escapes_xss_and_skips_ledger(
+    tmp_path: Path,
+) -> None:
+    ws_dir = tmp_path / "space ws"
+    ws_dir.mkdir()
+    out_dir = tmp_path / "html out"
+    html_out = out_dir / "downshift_explain.html"
+    unused_ledger = tmp_path / "explain_html_unused.jsonl"
+
+    proc = subprocess.run(
+        _launcher_args(
+            "explain",
+            "--type",
+            "research",
+            "--role",
+            "Slice 1 Migrations & Auth Mapper @medium",
+            "--prompt",
+            "Inspect src/migrations/ and PATCH /api/users",
+            "--workspace",
+            str(ws_dir),
+            "--host",
+            "all",
+            "--html",
+            str(html_out),
+        ),
+        cwd=str(ROOT),
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        env=_clean_env({"DOWNSHIFT_LEDGER_PATH": str(unused_ledger)}),
+        timeout=20,
+        check=False,
+    )
+    assert proc.returncode == 0, f"stderr={proc.stderr!r}, stdout={proc.stdout!r}"
+    assert html_out.is_file()
+    html_text = html_out.read_text(encoding="utf-8")
+    assert "Downshift Explain Trace" in html_text
+    assert "Stage 5" in html_text
+    assert "PATCH /api/users" in html_text
+    assert "src/migrations/" in html_text
+    assert "gpt-6.1-sol" in html_text
+    assert "antigravity" in html_text
+    assert "claude" in html_text
+    assert "codex" in html_text
+    assert not unused_ledger.exists()
+
+    # Verify XSS escaping for custom high_risk_keyword and pinned_role HTML output
+    xss_cfg = DownshiftConfig(
+        high_risk_keywords=("<script>alert(1)</script>",),
+        pinned_roles={"<img onerror=alert(2)>": "frontier"},
+    )
+    xss_trace = explain_subagent_call(
+        type_name="research",
+        role="Auditor <img onerror=alert(2)>",
+        prompt="Inspect <script>alert(1)</script> token",
+        host="antigravity",
+        config=xss_cfg,
+    )
+    xss_html = render_html_explain(xss_trace, host_filter="all")
+    assert "<img onerror=alert(2)>" not in xss_html
+    assert "&lt;img onerror=alert(2)&gt;" in xss_html
+    assert "<script>alert(1)</script>" not in xss_html

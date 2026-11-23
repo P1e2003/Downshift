@@ -26,6 +26,7 @@ from stats_cli import (
     load_events,
     render_ascii_audit,
     render_ascii_scoreboard,
+    render_html_audit,
     render_html_widget,
 )
 
@@ -1224,3 +1225,68 @@ def test_stats_cli_audit_ledger_hotspots_and_calibration_candidates(
     assert limited["total_route_events"] == 1
     assert limited["total_outcome_events"] == 1
     assert limited["circuit_breaker_hits"] == 1
+
+
+def test_stats_cli_audit_ledger_html_widget_escapes_xss_and_preserves_ledger(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "audit_xss_ledger.jsonl"
+    rows = [
+        {
+            "timestamp": "2026-11-23T04:00:01Z",
+            "event_type": "route",
+            "host": "antigravity",
+            "subagent_type": "research",
+            "role": "Slice Mapper <script>alert(1)</script> Long Unwrapped Role Name",
+            "tier": "frontier",
+            "reason": "safety_guardrail:security_or_auth",
+            "overwritten": False,
+        },
+        {
+            "timestamp": "2026-11-23T04:00:02Z",
+            "event_type": "route",
+            "host": "codex",
+            "subagent_type": "spawn_agent",
+            "role": "Surveyor",
+            "tier": "fast",
+            "reason": "read_only_research_survey",
+            "overwritten": True,
+        },
+    ]
+    ledger.write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n",
+        encoding="utf-8",
+    )
+    before_bytes = ledger.read_bytes()
+    html_out = tmp_path / "audit html dir" / "downshift_audit.html"
+
+    proc = subprocess.run(
+        _launcher_args(
+            "--ledger",
+            str(ledger),
+            "--audit-ledger",
+            "--html",
+            str(html_out),
+        ),
+        cwd=str(ROOT),
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        env={**os.environ, "DOWNSHIFT_LEDGER_PATH": str(tmp_path / "unused.jsonl")},
+        timeout=20,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert html_out.is_file()
+    html_text = html_out.read_text(encoding="utf-8")
+    assert "Downshift Ledger Audit" in html_text
+    assert "Long Unwrapped Role Name" in html_text
+    assert "safety_guardrail:security_or_auth" in html_text
+    assert "<script>alert(1)</script>" not in html_text
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html_text
+    assert ledger.read_bytes() == before_bytes
+
+    # Empty ledger HTML audit renders cleanly
+    empty_html = render_html_audit(compute_ledger_audit([]), tmp_path / "empty.jsonl")
+    assert "0 routing events recorded yet." in empty_html
+    assert "No read-only calibration candidates detected." in empty_html

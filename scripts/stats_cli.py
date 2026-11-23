@@ -678,6 +678,353 @@ def render_ascii_audit(audit: dict[str, Any], ledger_path: Path) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _tier_badge_classes(tier: str) -> str:
+    if tier == "lite":
+        return "bg-emerald-500/15 text-emerald-400"
+    if tier == "fast":
+        return "bg-sky-500/15 text-sky-400"
+    return "bg-amber-500/15 text-amber-400"
+
+
+def _tier_label(tier: str) -> str:
+    if tier == "lite":
+        return "Tier 1 · Lite"
+    if tier == "fast":
+        return "Tier 2 · Fast"
+    return "Tier 3 · Frontier"
+
+
+def render_html_explain(trace: RoutingTrace, host_filter: str = "all") -> str:
+    """Render a compact, theme-aware Antigravity HTML card for a dry-run explain trace."""
+    d = trace.decision
+    selected_hosts = (
+        ("antigravity", "claude", "codex")
+        if host_filter == "all"
+        else (host_filter if host_filter in trace.hosts else "antigravity",)
+    )
+    tier_cls = _tier_badge_classes(d.tier)
+    tier_text = _tier_label(d.tier)
+
+    esc_cfg = html.escape(trace.config_source, quote=True)
+    esc_mode = html.escape(trace.effective_mode, quote=True)
+    esc_stage = html.escape(trace.winning_stage_name, quote=True)
+    esc_reason = html.escape(d.reason, quote=True)
+
+    def _chips(items: list[str], chip_cls: str) -> str:
+        if not items:
+            return '<span class="text-xs text-[var(--muted-foreground)] font-mono">none</span>'
+        return " ".join(
+            f'<span class="inline-flex items-center px-2 py-0.5 rounded-md text-xs font-mono {chip_cls}">{html.escape(item, quote=True)}</span>'
+            for item in items
+        )
+
+    tags_html = _chips(list(trace.matched_tags), "bg-sky-500/15 text-sky-400")
+    masked_html = _chips(
+        list(trace.masked_tokens),
+        "bg-[var(--background)] border border-[var(--border)] text-[var(--foreground)]",
+    )
+    if trace.matched_guardrail_label:
+        guard_text = (
+            f"{trace.matched_guardrail_label} ({trace.matched_guardrail_text!r})"
+        )
+        guardrail_html = _chips([guard_text], "bg-amber-500/15 text-amber-400")
+    else:
+        guardrail_html = (
+            '<span class="text-xs text-[var(--muted-foreground)] font-mono">none</span>'
+        )
+
+    pinned_row_html = ""
+    if trace.matched_pinned_role:
+        pinned_chip = _chips([trace.matched_pinned_role], "bg-sky-500/15 text-sky-400")
+        pinned_row_html = (
+            '\n      <div class="flex items-start justify-between gap-3 py-1.5 border-t border-[var(--border)]">\n'
+            '        <span class="text-xs text-[var(--muted-foreground)] shrink-0">Pinned role</span>\n'
+            f'        <div class="flex flex-wrap justify-end gap-1.5">{pinned_chip}</div>\n'
+            "      </div>"
+        )
+
+    flags_active = [
+        name
+        for name, enabled in (
+            ("readonly_subagent", trace.is_readonly_subagent),
+            ("readonly_role", trace.is_readonly_role),
+            ("simple_lookup", trace.is_simple_lookup),
+            ("verification", trace.is_verification_runner),
+            ("code_mutation", trace.is_code_mutation),
+            ("write_capable", trace.is_write_capable),
+        )
+        if enabled
+    ]
+    flags_html = _chips(
+        flags_active,
+        "bg-[var(--background)] border border-[var(--border)] text-[var(--muted-foreground)]",
+    )
+
+    complexity_extras = [
+        lbl
+        for lbl, active in (
+            ("code fence", trace.has_code_fence),
+            ("stack trace", trace.has_stack_trace),
+        )
+        if active
+    ]
+    complexity_sub = (
+        " · ".join(complexity_extras) if complexity_extras else "plain prompt"
+    )
+
+    host_rows: list[str] = []
+    for h in selected_hosts:
+        entry = trace.hosts[h]
+        h_tier = str(entry.get("tier") or "frontier")
+        h_cls = _tier_badge_classes(h_tier)
+        esc_h = html.escape(h, quote=True)
+        esc_model = html.escape(str(entry.get("target_model") or "inherit"), quote=True)
+        effort_val = entry.get("reasoning_effort")
+        esc_effort = html.escape(str(effort_val), quote=True) if effort_val else "—"
+        action = "overwrite" if entry.get("should_overwrite") else "keep"
+        action_cls = (
+            "bg-emerald-500/15 text-emerald-400"
+            if action == "overwrite"
+            else "bg-[var(--background)] border border-[var(--border)] text-[var(--muted-foreground)]"
+        )
+        host_rows.append(
+            '        <tr class="border-t border-[var(--border)]">\n'
+            f'          <td class="py-1.5 pr-3 font-medium">{esc_h}</td>\n'
+            f'          <td class="py-1.5 pr-3"><span class="inline-flex px-2 py-0.5 rounded-full text-xs font-semibold {h_cls}">{html.escape(h_tier, quote=True)}</span></td>\n'
+            f'          <td class="py-1.5 pr-3 font-mono">{esc_model}</td>\n'
+            f'          <td class="py-1.5 pr-3 font-mono text-[var(--muted-foreground)]">{esc_effort}</td>\n'
+            f'          <td class="py-1.5 text-right"><span class="inline-flex px-2 py-0.5 rounded-md text-xs font-mono {action_cls}">{action}</span></td>\n'
+            "        </tr>"
+        )
+    host_rows_html = "\n".join(host_rows)
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+</head>
+<body class="bg-transparent text-[var(--foreground)] antialiased p-3">
+  <div class="bg-[var(--card)] text-[var(--foreground)] border border-[var(--border)] rounded-xl p-4 shadow-sm space-y-3">
+    <div class="flex items-center justify-between gap-3 border-b border-[var(--border)] pb-2.5">
+      <div class="flex items-center gap-2 min-w-0">
+        <span class="inline-flex items-center justify-center w-6 h-6 rounded-md bg-sky-500/15 text-sky-400 font-bold text-xs shrink-0">⚡</span>
+        <div class="min-w-0">
+          <h2 class="text-sm font-semibold tracking-tight">Downshift Explain Trace</h2>
+          <p class="text-xs text-[var(--muted-foreground)] font-mono truncate" title="{esc_cfg}">dry-run · zero ledger I/O · config: {esc_cfg}</p>
+        </div>
+      </div>
+      <span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold shrink-0 {tier_cls}">
+        {tier_text}
+      </span>
+    </div>
+
+    <div class="grid grid-cols-3 gap-2.5">
+      <div class="rounded-lg border border-[var(--border)] bg-[var(--background)] p-2.5">
+        <div class="text-xs text-[var(--muted-foreground)]">Winning Stage</div>
+        <div class="text-base font-bold mt-0.5">Stage {trace.winning_stage}</div>
+        <div class="text-xs text-[var(--muted-foreground)] font-mono break-all">{esc_stage}</div>
+      </div>
+      <div class="rounded-lg border border-[var(--border)] bg-[var(--background)] p-2.5">
+        <div class="text-xs text-[var(--muted-foreground)]">Routing Reason</div>
+        <div class="text-xs font-mono font-semibold mt-1 break-all">{esc_reason}</div>
+        <div class="text-xs text-[var(--muted-foreground)] mt-0.5">mode: {esc_mode} · burst: {trace.max_burst_subagents}</div>
+      </div>
+      <div class="rounded-lg border border-[var(--border)] bg-[var(--background)] p-2.5">
+        <div class="text-xs text-[var(--muted-foreground)]">Prompt Complexity</div>
+        <div class="text-base font-bold mt-0.5">{trace.prompt_chars:,} <span class="text-xs font-normal text-[var(--muted-foreground)]">chars</span></div>
+        <div class="text-xs text-[var(--muted-foreground)]">{trace.path_count} paths · {trace.line_count} lines · {complexity_sub}</div>
+      </div>
+    </div>
+
+    <div class="rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-1">
+      <div class="flex items-start justify-between gap-3 py-1.5">
+        <span class="text-xs text-[var(--muted-foreground)] shrink-0">Inline @tags</span>
+        <div class="flex flex-wrap justify-end gap-1.5">{tags_html}</div>
+      </div>
+      <div class="flex items-start justify-between gap-3 py-1.5 border-t border-[var(--border)]">
+        <span class="text-xs text-[var(--muted-foreground)] shrink-0">Guardrail match</span>
+        <div class="flex flex-wrap justify-end gap-1.5">{guardrail_html}</div>
+      </div>{pinned_row_html}
+      <div class="flex items-start justify-between gap-3 py-1.5 border-t border-[var(--border)]">
+        <span class="text-xs text-[var(--muted-foreground)] shrink-0">Masked tokens</span>
+        <div class="flex flex-wrap justify-end gap-1.5">{masked_html}</div>
+      </div>
+      <div class="flex items-start justify-between gap-3 py-1.5 border-t border-[var(--border)]">
+        <span class="text-xs text-[var(--muted-foreground)] shrink-0">Classifier flags</span>
+        <div class="flex flex-wrap justify-end gap-1.5">{flags_html}</div>
+      </div>
+    </div>
+
+    <div class="rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2">
+      <div class="text-xs font-medium text-[var(--muted-foreground)] mb-1.5">Host Routing Matrix</div>
+      <table class="w-full text-xs">
+        <thead>
+          <tr class="text-left text-[var(--muted-foreground)]">
+            <th class="pb-1 pr-3 font-medium">Host</th>
+            <th class="pb-1 pr-3 font-medium">Tier</th>
+            <th class="pb-1 pr-3 font-medium">Target Model</th>
+            <th class="pb-1 pr-3 font-medium">Effort</th>
+            <th class="pb-1 text-right font-medium">Action</th>
+          </tr>
+        </thead>
+        <tbody>
+{host_rows_html}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+
+def render_html_audit(audit: dict[str, Any], ledger_path: Path) -> str:
+    """Render a compact, theme-aware Antigravity HTML card for a read-only ledger audit."""
+    total_routes = int(audit["total_route_events"])
+    total_outcomes = int(audit["total_outcome_events"])
+    burst_hits = int(audit["burst_cap_hits"])
+    upshift_hits = int(audit["upshift_hits"])
+    breaker_hits = int(audit["circuit_breaker_hits"])
+    isolated_hits = int(audit["workspace_isolated_hits"])
+    hotspots = audit.get("guardrail_hotspots") or []
+    candidates = audit.get("calibration_candidates") or []
+    host_balance = audit.get("host_tier_balance") or {}
+    esc_path = html.escape(str(ledger_path), quote=True)
+
+    host_bars: list[str] = []
+    for h, b in host_balance.items():
+        esc_h = html.escape(str(h), quote=True)
+        lite_pct = float(b["lite_pct"])
+        fast_pct = float(b["fast_pct"])
+        frontier_pct = float(b["frontier_pct"])
+        host_bars.append(
+            '      <div class="space-y-1">\n'
+            '        <div class="flex items-center justify-between text-xs gap-2">\n'
+            f'          <span class="font-medium">{esc_h} <span class="text-[var(--muted-foreground)] font-mono">({int(b["total"])})</span></span>\n'
+            f'          <span class="font-mono text-[var(--muted-foreground)]">Lite {int(b["lite"])} ({lite_pct:.1f}%) · Fast {int(b["fast"])} ({fast_pct:.1f}%) · Frontier {int(b["frontier"])} ({frontier_pct:.1f}%)</span>\n'
+            "        </div>\n"
+            '        <div class="w-full h-2 rounded-full bg-[var(--background)] overflow-hidden border border-[var(--border)] flex">\n'
+            f'          <div class="h-full bg-emerald-400" style="width: {lite_pct:.1f}%"></div>\n'
+            f'          <div class="h-full bg-sky-400" style="width: {fast_pct:.1f}%"></div>\n'
+            f'          <div class="h-full bg-amber-400" style="width: {frontier_pct:.1f}%"></div>\n'
+            "        </div>\n"
+            "      </div>"
+        )
+    host_bars_html = (
+        "\n".join(host_bars)
+        if host_bars
+        else '      <div class="text-xs text-[var(--muted-foreground)]">0 routing events recorded yet.</div>'
+    )
+
+    if hotspots:
+        hotspot_chips = " ".join(
+            f'<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-xs font-mono bg-amber-500/15 text-amber-400">'
+            f'{html.escape(str(item["reason"]), quote=True)} <span class="font-semibold">×{int(item["count"])}</span></span>'
+            for item in hotspots[:8]
+        )
+    else:
+        hotspot_chips = (
+            '<span class="text-xs text-[var(--muted-foreground)] font-mono">none</span>'
+        )
+
+    if candidates:
+        cand_rows: list[str] = []
+        for cand in candidates[:10]:
+            esc_host = html.escape(str(cand["host"]), quote=True)
+            esc_role = html.escape(str(cand["role"]), quote=True)
+            esc_reason = html.escape(str(cand["reason"]), quote=True)
+            cand_rows.append(
+                '        <tr class="border-t border-[var(--border)]">\n'
+                f'          <td class="py-1.5 pr-2 font-mono font-semibold text-amber-400">{int(cand["count"])}×</td>\n'
+                f'          <td class="py-1.5 pr-2 font-mono text-[var(--muted-foreground)]">{esc_host}</td>\n'
+                f'          <td class="py-1.5 pr-2 break-words">{esc_role}</td>\n'
+                f'          <td class="py-1.5 font-mono text-[var(--muted-foreground)] break-all">{esc_reason}</td>\n'
+                "        </tr>"
+            )
+        extra_note = (
+            f'<div class="text-xs text-[var(--muted-foreground)] pt-1.5 border-t border-[var(--border)]">Showing top 10 of {len(candidates)} candidate groups (run with --json for full list).</div>'
+            if len(candidates) > 10
+            else ""
+        )
+        candidates_html = (
+            '      <table class="w-full text-xs">\n'
+            "        <thead>\n"
+            '          <tr class="text-left text-[var(--muted-foreground)]">\n'
+            '            <th class="pb-1 pr-2 font-medium">Hits</th>\n'
+            '            <th class="pb-1 pr-2 font-medium">Host</th>\n'
+            '            <th class="pb-1 pr-2 font-medium">Read-Only Role</th>\n'
+            '            <th class="pb-1 font-medium">Guardrail / Reason</th>\n'
+            "          </tr>\n"
+            "        </thead>\n"
+            "        <tbody>\n"
+            + "\n".join(cand_rows)
+            + "\n        </tbody>\n      </table>"
+            + extra_note
+        )
+    else:
+        candidates_html = '<div class="text-xs text-[var(--muted-foreground)]">No read-only calibration candidates detected.</div>'
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+</head>
+<body class="bg-transparent text-[var(--foreground)] antialiased p-3">
+  <div class="bg-[var(--card)] text-[var(--foreground)] border border-[var(--border)] rounded-xl p-4 shadow-sm space-y-3">
+    <div class="flex items-center justify-between gap-3 border-b border-[var(--border)] pb-2.5">
+      <div class="flex items-center gap-2 min-w-0">
+        <span class="inline-flex items-center justify-center w-6 h-6 rounded-md bg-amber-500/15 text-amber-400 font-bold text-xs shrink-0">⚡</span>
+        <div class="min-w-0">
+          <h2 class="text-sm font-semibold tracking-tight">Downshift Ledger Audit</h2>
+          <p class="text-xs text-[var(--muted-foreground)] font-mono truncate" title="{esc_path}">read-only · {esc_path}</p>
+        </div>
+      </div>
+      <span class="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-semibold shrink-0 bg-sky-500/15 text-sky-400">
+        {total_routes} route · {total_outcomes} outcome
+      </span>
+    </div>
+
+    <div class="grid grid-cols-4 gap-2">
+      <div class="rounded-lg border border-[var(--border)] bg-[var(--background)] p-2.5">
+        <div class="text-xs text-[var(--muted-foreground)]">Burst Cap Hits</div>
+        <div class="text-lg font-bold mt-0.5">{burst_hits}</div>
+      </div>
+      <div class="rounded-lg border border-[var(--border)] bg-[var(--background)] p-2.5">
+        <div class="text-xs text-[var(--muted-foreground)]">Auto-Upshifts</div>
+        <div class="text-lg font-bold mt-0.5">{upshift_hits} <span class="text-xs font-normal text-[var(--muted-foreground)]">({breaker_hits} breaker)</span></div>
+      </div>
+      <div class="rounded-lg border border-[var(--border)] bg-[var(--background)] p-2.5">
+        <div class="text-xs text-[var(--muted-foreground)]">Worktree Isolated</div>
+        <div class="text-lg font-bold mt-0.5">{isolated_hits}</div>
+      </div>
+      <div class="rounded-lg border border-[var(--border)] bg-[var(--background)] p-2.5">
+        <div class="text-xs text-[var(--muted-foreground)]">Calibration Targets</div>
+        <div class="text-lg font-bold text-amber-400 mt-0.5">{len(candidates)}</div>
+      </div>
+    </div>
+
+    <div class="space-y-2">
+      <div class="text-xs font-medium text-[var(--muted-foreground)]">Per-Host Tier Balance</div>
+{host_bars_html}
+    </div>
+
+    <div class="rounded-lg border border-[var(--border)] bg-[var(--background)] p-3 space-y-1.5">
+      <div class="text-xs font-medium text-[var(--muted-foreground)]">Guardrail Hotspots</div>
+      <div class="flex flex-wrap gap-1.5">{hotspot_chips}</div>
+    </div>
+
+    <div class="rounded-lg border border-[var(--border)] bg-[var(--background)] p-3 space-y-1.5">
+      <div class="text-xs font-medium text-[var(--muted-foreground)]">Calibration Candidates (Read-Only Roles on Frontier)</div>
+{candidates_html}
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+
 def _main_explain(explain_argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="stats_cli.py explain",
@@ -713,6 +1060,12 @@ def _main_explain(explain_argv: list[str]) -> int:
         help="Target host matrix to display (default: all)",
     )
     parser.add_argument(
+        "--html",
+        type=str,
+        default=None,
+        help="Write an interactive Antigravity HTML explain trace card to the given path",
+    )
+    parser.add_argument(
         "--json", action="store_true", help="Output diagnostic trace as JSON"
     )
     args = parser.parse_args(explain_argv)
@@ -726,6 +1079,12 @@ def _main_explain(explain_argv: list[str]) -> int:
         host=primary_host,
         workspace_dir=args.workspace,
     )
+    if args.html:
+        out_path = Path(args.html).expanduser()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            render_html_explain(trace, host_filter=args.host), encoding="utf-8"
+        )
     with contextlib.suppress(AttributeError, OSError, ValueError):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
     if args.json:
@@ -779,6 +1138,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.audit_ledger:
         events = load_events(ledger_path, limit=args.limit)
         audit = compute_ledger_audit(events)
+        if args.html:
+            out_path = Path(args.html).expanduser()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(render_html_audit(audit, ledger_path), encoding="utf-8")
         with contextlib.suppress(AttributeError, OSError, ValueError):
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
         if args.json:
