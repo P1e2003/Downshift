@@ -181,8 +181,8 @@ Flags:
 - `python ./scripts/stats_cli.py --clean` — Non-destructively remove corrupted lines and synthetic empty routing entries while preserving valid `PostToolUse` outcome events under an exclusive OS file lock
 - `python ./scripts/stats_cli.py --reset` — Truncate/reset the local ledger under an exclusive OS file lock
 - `python ./scripts/stats_cli.py --limit 50` — Aggregate the most recent `N` events
-- `python ./scripts/stats_cli.py explain --type research --role "Slice 1 Mapper @medium" --prompt "Inspect src/migrations/ and PATCH /api/users" --workspace "." --host all [--json]` — Pure dry-run routing trace (config provenance, masked tokens, complexity metrics, winning precedence stage, guardrail match, and 3-host output matrix with zero ledger I/O)
-- `python ./scripts/stats_cli.py --audit-ledger [--limit N] [--json]` — Strictly read-only guardrail hotspot summary and read-only-role `frontier` calibration candidates (also available via `/downshift-explain`)
+- `python ./scripts/stats_cli.py explain --type research --role "Slice 1 Mapper @medium" --prompt "Inspect src/migrations/ and PATCH /api/users" --workspace "." --host all [--html <path.html>] [--json]` — Pure dry-run routing trace (config provenance, masked tokens, complexity metrics, winning precedence stage, guardrail match, and 3-host output matrix; emits interactive HTML card on Antigravity with `--html` and `<= 88`-col ASCII on terminal hosts, with zero ledger I/O)
+- `python ./scripts/stats_cli.py --audit-ledger [--limit N] [--html <path.html>] [--json]` — Strictly read-only guardrail hotspot summary and read-only-role `frontier` calibration candidates (interactive HTML card on Antigravity via `/downshift-explain`, `<= 88`-col ASCII on terminal hosts)
 
 ---
 
