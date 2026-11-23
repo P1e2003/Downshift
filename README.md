@@ -48,7 +48,7 @@ Even if a subagent is spawned as `research` or `Explore`, Downshift **never** do
 
 ## 7-Stage v2 Subagent Orchestration & Effort Hand-Out Workflow
 
-When a first-turn user prompt asks to draft an issue/spec, plan a feature, break down tasks across modules, map out an issue, compare against `main` / `develop`, or audit a repository/plugin (in English or Vietnamese, accented or unaccented), Downshift's `PreInvocation` / `UserPromptSubmit` hook (`PARALLEL_MAP_NUDGE_RE`, `reason="parallel_issue_map_or_comparison"`) guides the agent through a deterministic **7-stage v2 workflow**:
+When a user prompt (on Turn 1 or any later turn once cooldown elapses) asks to draft an issue/spec, plan a feature, break down tasks across modules, map out an issue, compare against `main` / `develop`, audit a repository/plugin, or sweep `5+` homogeneous files/controllers/endpoints (in English or Vietnamese, accented or unaccented), Downshift's multi-turn `PreInvocation` / `UserPromptSubmit` hook classifies the work shape (`direct <= 2 files` suppressed, `5+` homogeneous batch → `run_workflow` on Antigravity / chunked `2–4` slices on Claude & Codex via `reason="batch_workflow_recommended"`, or heterogeneous multi-layer → `PARALLEL_MAP_NUDGE_RE` `reason="parallel_issue_map_or_comparison"`), emits Antigravity's canonical `injectSteps: [{"systemMessage": {"systemMessage": ...}}]`, and enforces a locked per-conversation cooldown (`advisory_cooldown_turns: 4`, `advisory_cooldown_seconds: 120`, plus prompt-fingerprint dedup) to guide the agent through a deterministic **7-stage v2 workflow**:
 
 1. **Stage 1 — Triage & Fast-Path Gate (`<= 2` Known Files):** If `1–2` exact file paths are already known in context, allocate **`0` subagents** and read, edit, and verify directly on the main agent.
 2. **Stage 2 — Single-Turn Slice Decomposition:** Partition `3+`-file or multi-layer work into **`2–4` disjoint slices** in one turn (e.g., Backend Models/Migrations, API Routes/Services, Frontend UI/Hooks).
@@ -107,6 +107,8 @@ Example `.downshift.json` at the workspace root:
   "retry_window_seconds": 120,
   "max_auto_retries": 2,
   "isolate_parallel_writes": "share",
+  "advisory_cooldown_turns": 4,
+  "advisory_cooldown_seconds": 120,
   "swarm_models": {
     "lite": "<exact lite model name from swarm(action='models')>",
     "fast": "<exact fast model name from swarm(action='models')>"
