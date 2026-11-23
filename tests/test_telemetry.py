@@ -21,8 +21,10 @@ from downshift_core import (
 )
 from stats_cli import (
     TIER_COST_WEIGHT,
+    compute_ledger_audit,
     compute_summary,
     load_events,
+    render_ascii_audit,
     render_ascii_scoreboard,
     render_html_widget,
 )
@@ -1108,3 +1110,117 @@ def test_stats_cli_counts_parallel_worktree_isolation_in_guardrails(
     for line in board.splitlines():
         if not line.startswith("  ╭─"):
             assert len(line) <= 88, f"Line exceeded 88 cols ({len(line)}): {line!r}"
+
+
+def test_stats_cli_audit_ledger_hotspots_and_calibration_candidates(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "audit_ledger.jsonl"
+    rows = [
+        # 2 read-only mappers hitting frontier -> calibration candidates
+        {
+            "timestamp": "2026-11-23T03:00:01Z",
+            "event_type": "route",
+            "host": "antigravity",
+            "subagent_type": "research",
+            "role": "Migrations Slice Mapper",
+            "tier": "frontier",
+            "reason": "safety_guardrail:alembic_or_migration",
+            "overwritten": False,
+        },
+        {
+            "timestamp": "2026-11-23T03:00:02Z",
+            "event_type": "route",
+            "host": "antigravity",
+            "subagent_type": "research",
+            "role": "Migrations Slice Mapper",
+            "tier": "frontier",
+            "reason": "safety_guardrail:alembic_or_migration",
+            "overwritten": False,
+        },
+        # Burst cap downgrade
+        {
+            "timestamp": "2026-11-23T03:00:03Z",
+            "event_type": "route",
+            "host": "antigravity",
+            "subagent_type": "research",
+            "role": "Surveyor",
+            "tier": "lite",
+            "reason": "burst_cap_downgraded_to_lite",
+            "overwritten": True,
+        },
+        # Circuit breaker upshift on Codex
+        {
+            "timestamp": "2026-11-23T03:00:04Z",
+            "event_type": "route",
+            "host": "codex",
+            "subagent_type": "spawn_agent",
+            "role": "Backend Author",
+            "tier": "frontier",
+            "reason": "circuit_breaker_frontier_lock",
+            "upshifted_from": "fast",
+            "overwritten": True,
+            "workspace_isolated": True,
+            "workspace_guardrail_reason": "parallel_write_warning_non_antigravity",
+        },
+        # Outcome event (counted separately from route events)
+        {
+            "timestamp": "2026-11-23T03:00:05Z",
+            "event_type": "outcome",
+            "host": "codex",
+            "routed_tier": "fast",
+            "failed": True,
+        },
+    ]
+    ledger.write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    audit = compute_ledger_audit(load_events(ledger))
+    assert audit["total_route_events"] == 4
+    assert audit["total_outcome_events"] == 1
+    assert audit["burst_cap_hits"] == 1
+    assert audit["upshift_hits"] == 1
+    assert audit["circuit_breaker_hits"] == 1
+    assert audit["workspace_isolated_hits"] == 1
+    assert audit["host_tier_balance"]["antigravity"]["total"] == 3
+    assert audit["host_tier_balance"]["codex"]["frontier"] == 1
+    assert audit["guardrail_hotspots"][0] == {
+        "reason": "safety_guardrail:alembic_or_migration",
+        "count": 2,
+    }
+    assert audit["calibration_candidates"] == [
+        {
+            "role": "Migrations Slice Mapper",
+            "reason": "safety_guardrail:alembic_or_migration",
+            "host": "antigravity",
+            "count": 2,
+        }
+    ]
+
+    ascii_audit = render_ascii_audit(audit, ledger)
+    assert "downshift audit" in ascii_audit
+    assert "Migrations Slice Mapper" in ascii_audit
+    for line in ascii_audit.splitlines():
+        if not line.startswith("  ╭─"):
+            assert len(line) <= 88, f"Line exceeded 88 cols ({len(line)}): {line!r}"
+
+    # Verify CLI --audit-ledger --limit 2 --json through launcher
+    proc = subprocess.run(
+        _launcher_args(
+            "--ledger", str(ledger), "--audit-ledger", "--limit", "2", "--json"
+        ),
+        cwd=str(ROOT),
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        env={**os.environ, "DOWNSHIFT_LEDGER_PATH": str(tmp_path / "unused.jsonl")},
+        timeout=20,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    limited = json.loads(proc.stdout)
+    assert limited["total_route_events"] == 1
+    assert limited["total_outcome_events"] == 1
+    assert limited["circuit_breaker_hits"] == 1

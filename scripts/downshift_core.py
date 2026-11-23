@@ -400,6 +400,41 @@ class RoutingDecision:
 
 
 @dataclass(frozen=True)
+class RoutingTrace:
+    """Pure dry-run diagnostic trace of a single subagent routing decision."""
+
+    decision: RoutingDecision
+    config_source: str
+    effective_mode: str
+    max_burst_subagents: int
+    winning_stage: int
+    winning_stage_name: str
+    matched_tags: tuple[str, ...]
+    matched_guardrail_label: str
+    matched_guardrail_text: str
+    matched_pinned_role: str
+    masked_tokens: tuple[str, ...]
+    prompt_chars: int
+    path_count: int
+    line_count: int
+    has_code_fence: bool
+    has_stack_trace: bool
+    is_readonly_subagent: bool
+    is_readonly_role: bool
+    is_simple_lookup: bool
+    is_verification_runner: bool
+    is_code_mutation: bool
+    is_write_capable: bool
+    hosts: dict[str, dict[str, Any]]
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["matched_tags"] = list(self.matched_tags)
+        data["masked_tokens"] = list(self.masked_tokens)
+        return data
+
+
+@dataclass(frozen=True)
 class PromptAdvisory:
     host: str
     should_inject: bool
@@ -685,14 +720,31 @@ def load_config(
     )
 
 
-def _match_pinned_role(role: str, pinned_roles: Mapping[str, str]) -> str | None:
+def resolve_config_source(
+    workspace_dir: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> str:
+    """Return the resolved .downshift.json path string, or 'defaults' if none found."""
+    env_map: Mapping[str, str] = env if env is not None else os.environ
+    cfg_path = _find_config_file(workspace_dir, env_map)
+    return str(cfg_path) if cfg_path is not None else "defaults"
+
+
+def _match_pinned_role_detail(
+    role: str, pinned_roles: Mapping[str, str]
+) -> tuple[str, str] | None:
     norm_role = (role or "").strip().lower()
     if not norm_role or not pinned_roles:
         return None
     for pattern, tier in pinned_roles.items():
         if pattern.lower() in norm_role and tier in VALID_TIERS:
-            return tier
+            return pattern, tier
     return None
+
+
+def _match_pinned_role(role: str, pinned_roles: Mapping[str, str]) -> str | None:
+    match = _match_pinned_role_detail(role, pinned_roles)
+    return match[1] if match is not None else None
 
 
 def _match_custom_high_risk(
@@ -713,21 +765,31 @@ def _resolve_target_model(host: str, tier: str) -> str:
     return HOST_MODEL_MAP[normalized_host].get(tier, "inherit")
 
 
-def _match_high_risk(combined_text: str) -> str | None:
+def _match_high_risk_detail(combined_text: str) -> tuple[str, str] | None:
     for label, pattern in HIGH_RISK_PATTERNS:
-        if pattern.search(combined_text):
-            return label
+        m = pattern.search(combined_text)
+        if m is not None:
+            return label, m.group(0)
+    return None
+
+
+def _match_high_risk(combined_text: str) -> str | None:
+    match = _match_high_risk_detail(combined_text)
+    return match[0] if match is not None else None
+
+
+def _match_strict_readonly_risk_detail(text: str) -> tuple[str, str] | None:
+    for label, pattern in HIGH_RISK_PATTERNS:
+        if label in ("concurrency_or_locking", "production_incident"):
+            m = pattern.search(text)
+            if m is not None:
+                return label, m.group(0)
     return None
 
 
 def _match_strict_readonly_risk(text: str) -> str | None:
-    for label, pattern in HIGH_RISK_PATTERNS:
-        if label in (
-            "concurrency_or_locking",
-            "production_incident",
-        ) and pattern.search(text):
-            return label
-    return None
+    match = _match_strict_readonly_risk_detail(text)
+    return match[0] if match is not None else None
 
 
 def strip_benign_code_identifiers(text: str) -> str:
@@ -737,6 +799,55 @@ def strip_benign_code_identifiers(text: str) -> str:
     masked = FILE_PATH_TOKEN_RE.sub(" <path> ", text)
     masked = DIR_OR_ROUTE_PATH_RE.sub(" <path> ", masked)
     return CODE_IDENTIFIER_RE.sub(" <id> ", masked)
+
+
+def _extract_masked_tokens(
+    text: str, include_benign_identifiers: bool
+) -> tuple[str, ...]:
+    """Return deduplicated tokens masked by route and/or benign identifier sanitizers."""
+    if not text:
+        return ()
+    tokens: list[str] = []
+    seen: set[str] = set()
+
+    def _add(tok: str) -> None:
+        cleaned = tok.strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            tokens.append(cleaned)
+
+    working = text
+    if "/" in working:
+        for m in HTTP_ROUTE_METHOD_RE.finditer(working):
+            _add(m.group(0))
+        working = HTTP_ROUTE_METHOD_RE.sub(" <route> ", working)
+
+    if include_benign_identifiers:
+        for m in FILE_PATH_TOKEN_RE.finditer(working):
+            _add(m.group(0))
+        working = FILE_PATH_TOKEN_RE.sub(" <path> ", working)
+        for m in DIR_OR_ROUTE_PATH_RE.finditer(working):
+            _add(m.group(0))
+        working = DIR_OR_ROUTE_PATH_RE.sub(" <path> ", working)
+        for m in CODE_IDENTIFIER_RE.finditer(working):
+            _add(m.group(0))
+    return tuple(tokens)
+
+
+def _extract_inline_tags(text: str) -> tuple[str, ...]:
+    """Return deduplicated inline @tag overrides detected in text in tier-precedence order."""
+    if not text:
+        return ()
+    tags: list[str] = []
+    seen: set[str] = set()
+    for pattern in (FRONTIER_TAG_RE, FAST_TAG_RE, LITE_TAG_RE):
+        for m in pattern.finditer(text):
+            tok = m.group(0).strip()
+            key = tok.lower()
+            if tok and key not in seen:
+                seen.add(key)
+                tags.append(tok)
+    return tuple(tags)
 
 
 def normalize_workspace(workspace: str | None) -> str:
@@ -808,15 +919,16 @@ def score_prompt_complexity(prompt: str) -> dict[str, int | bool]:
     }
 
 
-def classify_subagent_call(
+def _classify_subagent_internal(
     type_name: str,
     role: str,
     prompt: str,
     current_model: str = "inherit",
     host: str = "antigravity",
     config: DownshiftConfig | None = None,
+    trace_out: dict[str, Any] | None = None,
 ) -> RoutingDecision:
-    """Classify a subagent tool call into lite, fast, or frontier with safety guardrails."""
+    """Shared single-source-of-truth classifier for both hot-path routing and dry-run explain traces."""
     combined = f"{role or ''}\n{prompt or ''}".strip()
     norm_type = (type_name or "").strip().lower()
     norm_model = (current_model or "").strip()
@@ -832,48 +944,89 @@ def classify_subagent_call(
     )
     is_explicit_lower_tier = explicit_lower_tier is not None
 
+    def _finish(
+        decision: RoutingDecision,
+        stage: int,
+        stage_name: str,
+        *,
+        guardrail_label: str = "",
+        guardrail_text: str = "",
+        pinned_detail: str = "",
+    ) -> RoutingDecision:
+        if trace_out is not None:
+            trace_out["winning_stage"] = stage
+            trace_out["winning_stage_name"] = stage_name
+            trace_out["matched_guardrail_label"] = guardrail_label
+            trace_out["matched_guardrail_text"] = guardrail_text
+            trace_out["matched_pinned_role"] = pinned_detail
+        return decision
+
     # 1. Explicit frontier inline @tag overrides take highest precedence
     if FRONTIER_TAG_RE.search(combined):
-        return RoutingDecision(
-            host=host,
-            tier="frontier",
-            target_model="inherit",
-            should_overwrite=is_explicit_lower_tier,
-            reason="inline_override:frontier",
+        return _finish(
+            RoutingDecision(
+                host=host,
+                tier="frontier",
+                target_model="inherit",
+                should_overwrite=is_explicit_lower_tier,
+                reason="inline_override:frontier",
+            ),
+            1,
+            "frontier_inline_tag",
         )
 
     # 2. Preserve caller's explicit non-default model unless a safety guardrail upgrades a lower-tier model
     if is_explicit_non_default and not is_explicit_lower_tier:
-        return RoutingDecision(
-            host=host,
-            tier="frontier",
-            target_model=norm_model,
-            should_overwrite=False,
-            reason="caller_explicit_model_preserved",
+        return _finish(
+            RoutingDecision(
+                host=host,
+                tier="frontier",
+                target_model=norm_model,
+                should_overwrite=False,
+                reason="caller_explicit_model_preserved",
+            ),
+            2,
+            "caller_explicit_frontier_model",
         )
 
-    # 3. Workspace pinned_roles pinned to frontier (FR-010)
-    pinned_tier = _match_pinned_role(role, cfg.pinned_roles)
+    # 3. Workspace pinned_roles pinned to frontier (FR-010) & custom high_risk_keywords (FR-003)
+    pinned_match = _match_pinned_role_detail(role, cfg.pinned_roles)
+    pinned_tier = pinned_match[1] if pinned_match is not None else None
+    pinned_str = f"{pinned_match[0]} -> {pinned_match[1]}" if pinned_match else ""
     if pinned_tier == "frontier":
-        return RoutingDecision(
-            host=host,
-            tier="frontier",
-            target_model="inherit",
-            should_overwrite=is_explicit_lower_tier,
-            reason="workspace_config:pinned_role",
+        return _finish(
+            RoutingDecision(
+                host=host,
+                tier="frontier",
+                target_model="inherit",
+                should_overwrite=is_explicit_lower_tier,
+                reason="workspace_config:pinned_role",
+            ),
+            3,
+            "workspace_config_guardrail",
+            guardrail_label="pinned_role:frontier",
+            guardrail_text=pinned_match[0] if pinned_match else "",
+            pinned_detail=pinned_str,
         )
 
-    # 4. Workspace custom high_risk_keywords blocklist — always evaluated on unmasked text (FR-003)
-    if _match_custom_high_risk(combined, cfg.high_risk_keywords) is not None:
-        return RoutingDecision(
-            host=host,
-            tier="frontier",
-            target_model="inherit",
-            should_overwrite=is_explicit_lower_tier,
-            reason="workspace_config:high_risk_keyword",
+    custom_kw = _match_custom_high_risk(combined, cfg.high_risk_keywords)
+    if custom_kw is not None:
+        return _finish(
+            RoutingDecision(
+                host=host,
+                tier="frontier",
+                target_model="inherit",
+                should_overwrite=is_explicit_lower_tier,
+                reason="workspace_config:high_risk_keyword",
+            ),
+            3,
+            "workspace_config_guardrail",
+            guardrail_label="custom_high_risk_keyword",
+            guardrail_text=custom_kw,
+            pinned_detail=pinned_str,
         )
 
-    # 5. Hard safety guardrail blocklist (with benign identifier & effort-tagged read-only slice disambiguation)
+    # 4. Hard safety guardrail blocklist (with benign identifier & effort-tagged read-only slice disambiguation)
     intent_text = (
         HTTP_ROUTE_METHOD_RE.sub(" <route> ", combined) if "/" in combined else combined
     )
@@ -896,8 +1049,8 @@ def classify_subagent_call(
     )
     simple_lookup_checked = False
     is_simple_lookup = False
-    risk_match = _match_high_risk(combined)
-    if risk_match is not None and is_readonly:
+    risk_detail = _match_high_risk_detail(combined)
+    if risk_detail is not None and is_readonly:
         simple_lookup_checked = True
         is_simple_lookup = bool(SIMPLE_LOOKUP_RE.search(combined)) and not bool(
             COMPLEX_RESEARCH_RE.search(combined)
@@ -907,66 +1060,94 @@ def classify_subagent_call(
             and not has_audit_or_mutation_intent
             and not has_mutation_intent
         ):
-            risk_match = _match_high_risk(strip_benign_code_identifiers(intent_text))
+            risk_detail = _match_high_risk_detail(
+                strip_benign_code_identifiers(intent_text)
+            )
         if (
-            risk_match is not None
+            risk_detail is not None
             and is_sandboxed_readonly
             and has_lower_effort_tag
             and not has_mutation_intent
             and not READONLY_AUDIT_RISK_RE.search(intent_text)
         ):
-            risk_match = _match_strict_readonly_risk(intent_text)
-    if risk_match is not None:
-        return RoutingDecision(
-            host=host,
-            tier="frontier",
-            target_model="inherit",
-            should_overwrite=is_explicit_lower_tier,
-            reason=f"safety_guardrail:{risk_match}",
+            risk_detail = _match_strict_readonly_risk_detail(intent_text)
+    if risk_detail is not None:
+        return _finish(
+            RoutingDecision(
+                host=host,
+                tier="frontier",
+                target_model="inherit",
+                should_overwrite=is_explicit_lower_tier,
+                reason=f"safety_guardrail:{risk_detail[0]}",
+            ),
+            4,
+            "safety_guardrail",
+            guardrail_label=risk_detail[0],
+            guardrail_text=risk_detail[1],
+            pinned_detail=pinned_str,
         )
 
-    # 6. Lower-tier inline @tag overrides on safe prompts (@high > @medium > @low, FR-001/FR-002)
+    # 5. Lower-tier inline @tag overrides & explicit lower-tier models on safe prompts
     if FAST_TAG_RE.search(combined):
         target = _resolve_target_model(host, "fast")
-        return RoutingDecision(
-            host=host,
-            tier="fast",
-            target_model=target,
-            should_overwrite=(norm_model.lower() != target.lower()),
-            reason="inline_override:fast",
+        return _finish(
+            RoutingDecision(
+                host=host,
+                tier="fast",
+                target_model=target,
+                should_overwrite=(norm_model.lower() != target.lower()),
+                reason="inline_override:fast",
+            ),
+            5,
+            "lower_inline_tag",
+            pinned_detail=pinned_str,
         )
     if LITE_TAG_RE.search(combined):
         target = _resolve_target_model(host, "lite")
-        return RoutingDecision(
-            host=host,
-            tier="lite",
-            target_model=target,
-            should_overwrite=(norm_model.lower() != target.lower()),
-            reason="inline_override:lite",
+        return _finish(
+            RoutingDecision(
+                host=host,
+                tier="lite",
+                target_model=target,
+                should_overwrite=(norm_model.lower() != target.lower()),
+                reason="inline_override:lite",
+            ),
+            5,
+            "lower_inline_tag",
+            pinned_detail=pinned_str,
         )
 
-    # 7. Preserve caller's explicit lower-tier model under its native tier on safe untagged tasks (FR-004)
     if explicit_lower_tier is not None:
-        return RoutingDecision(
-            host=host,
-            tier=explicit_lower_tier,
-            target_model=norm_model,
-            should_overwrite=False,
-            reason="caller_explicit_model_preserved",
+        return _finish(
+            RoutingDecision(
+                host=host,
+                tier=explicit_lower_tier,
+                target_model=norm_model,
+                should_overwrite=False,
+                reason="caller_explicit_model_preserved",
+            ),
+            5,
+            "caller_explicit_lower_model",
+            pinned_detail=pinned_str,
         )
 
     # 6. Lower-tier (lite / fast) workspace pinned_roles when prompt is safe (FR-010)
     if pinned_tier in ("lite", "fast"):
         target = _resolve_target_model(host, pinned_tier)
-        return RoutingDecision(
-            host=host,
-            tier=pinned_tier,
-            target_model=target,
-            should_overwrite=True,
-            reason="workspace_config:pinned_role",
+        return _finish(
+            RoutingDecision(
+                host=host,
+                tier=pinned_tier,
+                target_model=target,
+                should_overwrite=True,
+                reason="workspace_config:pinned_role",
+            ),
+            6,
+            "workspace_pinned_lower_role",
+            pinned_detail=pinned_str,
         )
 
-    # 7. Read-only subagents (research / Explore) with structural complexity promotion (FR-004, FR-005)
+    # 7. Read-only subagents & pure verification runners (FR-004, FR-005)
     if is_readonly:
         if not simple_lookup_checked:
             is_simple_lookup = bool(SIMPLE_LOOKUP_RE.search(combined)) and not bool(
@@ -981,52 +1162,216 @@ def classify_subagent_call(
                 or bool(complexity["has_stack_trace"])
             ):
                 target = _resolve_target_model(host, "fast")
-                return RoutingDecision(
-                    host=host,
-                    tier="fast",
-                    target_model=target,
-                    should_overwrite=True,
-                    reason="promoted_to_fast:multi_file_or_long_prompt",
+                return _finish(
+                    RoutingDecision(
+                        host=host,
+                        tier="fast",
+                        target_model=target,
+                        should_overwrite=True,
+                        reason="promoted_to_fast:multi_file_or_long_prompt",
+                    ),
+                    7,
+                    "readonly_complexity_promotion",
                 )
             target = _resolve_target_model(host, "lite")
-            return RoutingDecision(
-                host=host,
-                tier="lite",
-                target_model=target,
-                should_overwrite=True,
-                reason="read_only_simple_lookup",
+            return _finish(
+                RoutingDecision(
+                    host=host,
+                    tier="lite",
+                    target_model=target,
+                    should_overwrite=True,
+                    reason="read_only_simple_lookup",
+                ),
+                7,
+                "readonly_simple_lookup",
             )
         target = _resolve_target_model(host, "fast")
-        return RoutingDecision(
-            host=host,
-            tier="fast",
-            target_model=target,
-            should_overwrite=True,
-            reason="read_only_research_survey",
+        return _finish(
+            RoutingDecision(
+                host=host,
+                tier="fast",
+                target_model=target,
+                should_overwrite=True,
+                reason="read_only_research_survey",
+            ),
+            7,
+            "readonly_research_survey",
         )
 
-    # 5. General / self subagents running pure test/lint/build verification without code mutation
     if (
         norm_type in GENERAL_SUBAGENTS
         and VERIFICATION_RUNNER_RE.search(combined)
         and not has_mutation_intent
     ):
         target = _resolve_target_model(host, "fast")
-        return RoutingDecision(
-            host=host,
-            tier="fast",
-            target_model=target,
-            should_overwrite=True,
-            reason="verification_test_or_lint_runner",
+        return _finish(
+            RoutingDecision(
+                host=host,
+                tier="fast",
+                target_model=target,
+                should_overwrite=True,
+                reason="verification_test_or_lint_runner",
+            ),
+            7,
+            "verification_runner",
         )
 
-    # 6. Default: keep frontier model for stateful code mutation & general engineering
-    return RoutingDecision(
+    # 8. Default: keep frontier model for stateful code mutation & general engineering
+    return _finish(
+        RoutingDecision(
+            host=host,
+            tier="frontier",
+            target_model="inherit",
+            should_overwrite=False,
+            reason="frontier_default_stateful_work",
+        ),
+        8,
+        "frontier_default",
+    )
+
+
+def classify_subagent_call(
+    type_name: str,
+    role: str,
+    prompt: str,
+    current_model: str = "inherit",
+    host: str = "antigravity",
+    config: DownshiftConfig | None = None,
+) -> RoutingDecision:
+    """Classify a subagent tool call into lite, fast, or frontier with safety guardrails."""
+    return _classify_subagent_internal(
+        type_name=type_name,
+        role=role,
+        prompt=prompt,
+        current_model=current_model,
         host=host,
-        tier="frontier",
-        target_model="inherit",
-        should_overwrite=False,
-        reason="frontier_default_stateful_work",
+        config=config,
+        trace_out=None,
+    )
+
+
+def explain_subagent_call(
+    type_name: str,
+    role: str,
+    prompt: str,
+    current_model: str = "inherit",
+    host: str = "antigravity",
+    workspace_dir: str | Path | None = None,
+    config: DownshiftConfig | None = None,
+    env: Mapping[str, str] | None = None,
+) -> RoutingTrace:
+    """Produce a 100%-faithful pure dry-run diagnostic trace across all 3 hosts (zero ledger I/O)."""
+    if config is not None:
+        cfg = config
+        cfg_source = (
+            resolve_config_source(workspace_dir=workspace_dir, env=env)
+            if workspace_dir is not None
+            else "explicit_config"
+        )
+    else:
+        cfg_source = resolve_config_source(workspace_dir=workspace_dir, env=env)
+        cfg = load_config(workspace_dir=workspace_dir, env=env)
+
+    trace_meta: dict[str, Any] = {}
+    decision = _classify_subagent_internal(
+        type_name=type_name,
+        role=role,
+        prompt=prompt,
+        current_model=current_model,
+        host=host,
+        config=cfg,
+        trace_out=trace_meta,
+    )
+
+    combined = f"{role or ''}\n{prompt or ''}".strip()
+    norm_type = (type_name or "").strip().lower()
+    intent_text = (
+        HTTP_ROUTE_METHOD_RE.sub(" <route> ", combined) if "/" in combined else combined
+    )
+    has_mutation_intent = bool(CODE_MUTATION_RE.search(intent_text))
+    has_audit_or_mutation_intent = bool(AUDIT_OR_MUTATION_INTENT_RE.search(intent_text))
+    is_readonly_subagent = norm_type in READ_ONLY_SUBAGENTS
+    is_readonly_role = bool(READ_ONLY_ROLE_RE.search(role or ""))
+    is_verification_runner = bool(VERIFICATION_RUNNER_RE.search(combined))
+    is_readonly = is_readonly_subagent or (
+        norm_type in GENERAL_SUBAGENTS
+        and not has_mutation_intent
+        and not has_audit_or_mutation_intent
+        and not is_verification_runner
+        and bool(
+            SIMPLE_LOOKUP_RE.search(combined)
+            or COMPLEX_RESEARCH_RE.search(combined)
+            or is_readonly_role
+        )
+    )
+    is_simple_lookup = bool(SIMPLE_LOOKUP_RE.search(combined)) and not bool(
+        COMPLEX_RESEARCH_RE.search(combined)
+    )
+    complexity = score_prompt_complexity(prompt)
+    masked_tokens = _extract_masked_tokens(
+        combined, include_benign_identifiers=is_readonly
+    )
+    matched_tags = _extract_inline_tags(combined)
+    write_capable = is_write_capable(
+        type_name=type_name,
+        role=role,
+        prompt=prompt,
+        decision=decision,
+    )
+
+    hosts_matrix: dict[str, dict[str, Any]] = {}
+    for target_host in ("antigravity", "claude", "codex"):
+        host_decision = (
+            decision
+            if target_host == host
+            else _classify_subagent_internal(
+                type_name=type_name,
+                role=role,
+                prompt=prompt,
+                current_model=current_model,
+                host=target_host,
+                config=cfg,
+                trace_out=None,
+            )
+        )
+        hosts_matrix[target_host] = {
+            "tier": host_decision.tier,
+            "target_model": host_decision.target_model,
+            "should_overwrite": host_decision.should_overwrite,
+            "reason": host_decision.reason,
+            "reasoning_effort": (
+                CODEX_TIER_REASONING_EFFORT.get(host_decision.tier, "high")
+                if target_host == "codex"
+                else None
+            ),
+        }
+
+    return RoutingTrace(
+        decision=decision,
+        config_source=cfg_source,
+        effective_mode=cfg.mode,
+        max_burst_subagents=cfg.max_burst_subagents,
+        winning_stage=int(trace_meta.get("winning_stage", 8)),
+        winning_stage_name=str(
+            trace_meta.get("winning_stage_name", "frontier_default")
+        ),
+        matched_tags=matched_tags,
+        matched_guardrail_label=str(trace_meta.get("matched_guardrail_label", "")),
+        matched_guardrail_text=str(trace_meta.get("matched_guardrail_text", "")),
+        matched_pinned_role=str(trace_meta.get("matched_pinned_role", "")),
+        masked_tokens=masked_tokens,
+        prompt_chars=int(complexity["char_len"]),
+        path_count=int(complexity["path_count"]),
+        line_count=int(complexity["line_count"]),
+        has_code_fence=bool(complexity["has_code_fence"]),
+        has_stack_trace=bool(complexity["has_stack_trace"]),
+        is_readonly_subagent=is_readonly_subagent,
+        is_readonly_role=is_readonly_role,
+        is_simple_lookup=is_simple_lookup,
+        is_verification_runner=is_verification_runner,
+        is_code_mutation=has_mutation_intent,
+        is_write_capable=write_capable,
+        hosts=hosts_matrix,
     )
 
 
