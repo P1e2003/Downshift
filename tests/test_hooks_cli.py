@@ -8,10 +8,19 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 PRE_TOOL_USE = ROOT / "scripts" / "pre_tool_use.py"
 POST_TOOL_USE = ROOT / "scripts" / "post_tool_use.py"
 PRE_INVOCATION = ROOT / "scripts" / "pre_invocation.py"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_advisory_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "DOWNSHIFT_ADVISORY_STATE_PATH", str(tmp_path / "advisory_state.json")
+    )
 
 
 def _run_hook(
@@ -174,7 +183,8 @@ def test_pre_invocation_cli_supports_antigravity_and_claude_codex() -> None:
     code_agy, data_agy = _run_hook(PRE_INVOCATION, agy_payload)
     assert code_agy == 0
     assert "injectSteps" in data_agy
-    assert "[Downshift]" in data_agy["injectSteps"][0]["ephemeralMessage"]
+    assert "ephemeralMessage" not in data_agy["injectSteps"][0]
+    assert "[Downshift]" in data_agy["injectSteps"][0]["systemMessage"]["systemMessage"]
 
     # Turn 2 must emit {}
     agy_turn2 = {
@@ -734,7 +744,8 @@ def test_pre_invocation_cli_parallel_fan_out_advisory(tmp_path: Path) -> None:
         },
     )
     assert code_agy == 0
-    msg_agy = data_agy["injectSteps"][0]["ephemeralMessage"]
+    assert "ephemeralMessage" not in data_agy["injectSteps"][0]
+    msg_agy = data_agy["injectSteps"][0]["systemMessage"]["systemMessage"]
     assert "7-stage v2" in msg_agy
     assert "invoke_subagent" in msg_agy
     assert "flash_lite/flash" in msg_agy
@@ -1478,7 +1489,8 @@ def test_pre_invocation_cli_7_stage_v2_orchestration_advisory(tmp_path: Path) ->
     )
     assert rc_agy == 0
     assert "systemMessage" not in out_agy
-    msg_agy = out_agy["injectSteps"][0]["ephemeralMessage"]
+    assert "ephemeralMessage" not in out_agy["injectSteps"][0]
+    msg_agy = out_agy["injectSteps"][0]["systemMessage"]["systemMessage"]
     for sub in (*common_substrings, "invoke_subagent", "flash_lite/flash"):
         assert sub in msg_agy
 
@@ -1525,7 +1537,7 @@ def test_pre_invocation_cli_7_stage_v2_orchestration_advisory(tmp_path: Path) ->
             "lastUserInput": "draft an issue for alembic migration",
         },
         {
-            "conversationId": "conv-turn2",
+            "conversationId": "conv-7stage-agy",
             "invocationNum": 2,
             "lastUserInput": "plan out this feature",
         },
@@ -2520,3 +2532,160 @@ def test_claude_and_codex_never_receive_invalid_workspace_arg(tmp_path: Path) ->
     assert cx_rows[1]["is_write_capable"] is True
     assert cx_rows[1]["workspace_isolated"] is False
     assert cx_rows[1]["workspace_guardrail_reason"] == "parallel_write_race_warning"
+
+
+def test_pre_invocation_emits_canonical_system_message_on_antigravity(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "canonical_state.json"
+    rc, out = _run_hook(
+        PRE_INVOCATION,
+        {
+            "conversationId": "conv-canon",
+            "invocationNum": 1,
+            "lastUserInput": "Audit all 18 API controllers for pagination bugs",
+        },
+        extra_env={"DOWNSHIFT_ADVISORY_STATE_PATH": str(state_path)},
+    )
+    assert rc == 0
+    assert "injectSteps" in out
+    step = out["injectSteps"][0]
+    assert "ephemeralMessage" not in step
+    assert isinstance(step.get("systemMessage"), dict)
+    msg = step["systemMessage"]["systemMessage"]
+    assert "run_workflow" in msg
+    assert "parallel()" in msg
+    assert 'model="flash"' in msg
+
+
+def test_pre_invocation_triggers_on_later_turn_after_cooldown(tmp_path: Path) -> None:
+    state_path = tmp_path / "cooldown_state.json"
+    env = {
+        "DOWNSHIFT_ADVISORY_STATE_PATH": str(state_path),
+        "DOWNSHIFT_ADVISORY_COOLDOWN_TURNS": "4",
+        "DOWNSHIFT_ADVISORY_COOLDOWN_SECONDS": "0",
+    }
+
+    # Turn 1 injects
+    rc1, out1 = _run_hook(
+        PRE_INVOCATION,
+        {
+            "conversationId": "conv-mt",
+            "invocationNum": 1,
+            "lastUserInput": "Map out this issue across backend and frontend",
+        },
+        extra_env=env,
+    )
+    assert rc1 == 0
+    assert "7-stage v2" in out1["injectSteps"][0]["systemMessage"]["systemMessage"]
+
+    # Turn 2 & Turn 4 immediate follow-ups suppressed by 4-turn cooldown
+    for inv_num in (2, 4):
+        rc_sup, out_sup = _run_hook(
+            PRE_INVOCATION,
+            {
+                "conversationId": "conv-mt",
+                "invocationNum": inv_num,
+                "lastUserInput": "Audit all 18 API controllers for pagination bugs",
+            },
+            extra_env=env,
+        )
+        assert rc_sup == 0
+        assert out_sup == {}
+
+    # Turn 6 (delta=5 >= 4) with a new batch prompt triggers cleanly!
+    rc6, out6 = _run_hook(
+        PRE_INVOCATION,
+        {
+            "conversationId": "conv-mt",
+            "invocationNum": 6,
+            "lastUserInput": "Audit all 18 API controllers for pagination bugs",
+        },
+        extra_env=env,
+    )
+    assert rc6 == 0
+    assert "run_workflow" in out6["injectSteps"][0]["systemMessage"]["systemMessage"]
+
+    # Turn 7 & Turn 8 suppressed again by cooldown
+    for inv_num in (7, 8):
+        rc_next, out_next = _run_hook(
+            PRE_INVOCATION,
+            {
+                "conversationId": "conv-mt",
+                "invocationNum": inv_num,
+                "lastUserInput": "Plan out the new analytics module",
+            },
+            extra_env=env,
+        )
+        assert rc_next == 0
+        assert out_next == {}
+
+    # Turn 12 repeating Turn 6's identical prompt stays suppressed (tool-loop dedup)
+    rc12, out12 = _run_hook(
+        PRE_INVOCATION,
+        {
+            "conversationId": "conv-mt",
+            "invocationNum": 12,
+            "lastUserInput": "Audit all 18 API controllers for pagination bugs",
+        },
+        extra_env=env,
+    )
+    assert rc12 == 0
+    assert out12 == {}
+
+
+def test_short_followup_or_high_risk_prompt_stays_suppressed(tmp_path: Path) -> None:
+    state_path = tmp_path / "suppress_state.json"
+    env = {"DOWNSHIFT_ADVISORY_STATE_PATH": str(state_path)}
+
+    for idx, prompt in enumerate(
+        (
+            "continue",
+            "yes",
+            "ok",
+            "fix all of them",
+            "Audit all 18 API controllers for security auth bypass",
+            "Migrate all 12 tables with alembic migration",
+            "Plan out this feature @high",
+            "Search the codebase in backend/routes.py and backend/models.py",
+        ),
+        start=1,
+    ):
+        rc, out = _run_hook(
+            PRE_INVOCATION,
+            {
+                "conversationId": f"conv-sup-{idx}",
+                "invocationNum": idx,
+                "lastUserInput": prompt,
+            },
+            extra_env=env,
+        )
+        assert rc == 0
+        assert out == {}, f"Expected suppression for {prompt!r}, got {out!r}"
+
+    # Verify Claude & Codex batch sweep prompts emit chunked-slice advice without systemMessage
+    rc_cl, out_cl = _run_hook(
+        PRE_INVOCATION,
+        {
+            "session_id": "sess-batch-cl",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "Audit all 18 API controllers for pagination bugs",
+        },
+        extra_env=env,
+    )
+    assert rc_cl == 0
+    assert "Task/Explore" in out_cl["hookSpecificOutput"]["additionalContext"]
+    assert "2-4" in out_cl["hookSpecificOutput"]["additionalContext"]
+
+    rc_cx, out_cx = _run_hook(
+        PRE_INVOCATION,
+        {
+            "session_id": "sess-batch-cx",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "Audit all 18 API controllers for pagination bugs",
+        },
+        extra_env={**env, "PLUGIN_DATA": str(tmp_path)},
+    )
+    assert rc_cx == 0
+    assert "spawn_agent" in out_cx["hookSpecificOutput"]["additionalContext"]
+    assert "2-4" in out_cx["hookSpecificOutput"]["additionalContext"]

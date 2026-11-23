@@ -21,7 +21,9 @@ from downshift_core import (
     compute_prompt_fingerprint,
     compute_role_fingerprint,
     detect_host,
+    evaluate_pre_invocation_with_cooldown,
     extract_workspace_dir,
+    get_advisory_state_path,
     has_explicit_retry_cue,
     inspect_workflow_script,
     is_write_capable,
@@ -252,11 +254,18 @@ def test_pre_invocation_nudges_only_on_first_turn_routine_task() -> None:
     assert msg is not None
     assert "[Downshift]" in msg
 
-    # Subsequent turns in the same prompt must never re-inject
+    # Multi-turn routine prompts remain eligible (cooldown gates repeat spam); invalid turn < 1 stays suppressed
     assert (
         should_nudge_pre_invocation(
             last_user_input="Search the logs and find all occurrences of timeout errors",
             invocation_num=2,
+        )
+        is not None
+    )
+    assert (
+        should_nudge_pre_invocation(
+            last_user_input="Search the logs and find all occurrences of timeout errors",
+            invocation_num=0,
         )
         is None
     )
@@ -814,8 +823,16 @@ def test_classify_user_prompt_parallel_map_en() -> None:
         invocation_num=2,
         host="antigravity",
     )
-    assert turn2.should_inject is False
-    assert turn2.reason == "not_first_turn_or_empty"
+    assert turn2.should_inject is True
+    assert turn2.reason == "parallel_issue_map_or_comparison"
+
+    invalid_turn = classify_user_prompt(
+        "Map out the issue across backend and frontend",
+        invocation_num=0,
+        host="antigravity",
+    )
+    assert invalid_turn.should_inject is False
+    assert invalid_turn.reason == "not_first_turn_or_empty"
 
 
 def test_classify_user_prompt_parallel_map_vi() -> None:
@@ -1598,6 +1615,10 @@ def test_classify_user_prompt_7_stage_v2_draft_plan_and_allocate_en_vi() -> None
 
     assert (
         classify_user_prompt("Plan out this feature", invocation_num=2).reason
+        == "parallel_issue_map_or_comparison"
+    )
+    assert (
+        classify_user_prompt("Plan out this feature", invocation_num=0).reason
         == "not_first_turn_or_empty"
     )
     assert (
@@ -2598,3 +2619,237 @@ def test_parallel_worktree_isolation_core_locked_window(tmp_path: Path) -> None:
     )
     assert d_later.target_workspace == ""
     assert d_later.workspace_guardrail_reason == ""
+
+
+def test_load_config_advisory_cooldown_and_env_overrides(tmp_path: Path) -> None:
+    default_cfg = load_config(workspace_dir=tmp_path, env={})
+    assert default_cfg.advisory_cooldown_turns == 4
+    assert default_cfg.advisory_cooldown_seconds == 120
+
+    cfg_file = tmp_path / ".downshift.json"
+    cfg_file.write_text(
+        json.dumps(
+            {
+                "advisory_cooldown_turns": 6,
+                "advisory_cooldown_seconds": 300,
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = load_config(workspace_dir=tmp_path, env={})
+    assert loaded.advisory_cooldown_turns == 6
+    assert loaded.advisory_cooldown_seconds == 300
+
+    # Invalid / boolean values ignored safely
+    cfg_file.write_text(
+        json.dumps(
+            {
+                "advisory_cooldown_turns": True,
+                "advisory_cooldown_seconds": -5,
+            }
+        ),
+        encoding="utf-8",
+    )
+    safe = load_config(workspace_dir=tmp_path, env={})
+    assert safe.advisory_cooldown_turns == 4
+    assert safe.advisory_cooldown_seconds == 120
+
+    # Env overrides take precedence
+    over = load_config(
+        workspace_dir=tmp_path,
+        env={
+            "DOWNSHIFT_ADVISORY_COOLDOWN_TURNS": "2",
+            "DOWNSHIFT_ADVISORY_COOLDOWN_SECONDS": "45",
+        },
+    )
+    assert over.advisory_cooldown_turns == 2
+    assert over.advisory_cooldown_seconds == 45
+
+
+def test_batch_sweep_prompt_recommends_run_workflow_on_antigravity() -> None:
+    prompt = "Audit all 18 API controllers for pagination bugs"
+
+    agy = classify_user_prompt(prompt, invocation_num=6, host="antigravity")
+    assert agy.should_inject is True
+    assert agy.reason == "batch_workflow_recommended"
+    assert "run_workflow" in agy.message
+    assert "parallel()" in agy.message
+    assert 'model="flash"' in agy.message
+
+    claude = classify_user_prompt(prompt, invocation_num=1, host="claude")
+    assert claude.should_inject is True
+    assert claude.reason == "batch_workflow_recommended"
+    assert "Task/Explore" in claude.message
+    assert "2-4" in claude.message
+
+    codex = classify_user_prompt(prompt, invocation_num=1, host="codex")
+    assert codex.should_inject is True
+    assert codex.reason == "batch_workflow_recommended"
+    assert "spawn_agent" in codex.message
+    assert "2-4" in codex.message
+
+    # Vietnamese 5+ batch sweep also triggers batch_workflow_recommended
+    vi_batch = classify_user_prompt(
+        "Rà soát tất cả 12 file service tìm lỗi timeout",
+        invocation_num=4,
+        host="antigravity",
+    )
+    assert vi_batch.should_inject is True
+    assert vi_batch.reason == "batch_workflow_recommended"
+    assert "run_workflow" in vi_batch.message
+
+    # High-risk batch sweep is suppressed by safety guardrail
+    risky_batch = classify_user_prompt(
+        "Audit all 18 API controllers for security vulnerabilities and auth bypass",
+        invocation_num=1,
+        host="antigravity",
+    )
+    assert risky_batch.should_inject is False
+    assert risky_batch.reason == "high_risk_or_frontier_tag"
+
+    # Direct <=2-file routine prompt is suppressed as direct_small_task
+    direct = classify_user_prompt(
+        "Search the codebase in backend/routes.py and backend/models.py",
+        invocation_num=1,
+        host="antigravity",
+    )
+    assert direct.should_inject is False
+    assert direct.reason == "direct_small_task"
+
+
+def test_evaluate_pre_invocation_cooldown_turns_time_dedup_pruning_and_fail_open(
+    tmp_path: Path,
+) -> None:
+    state_file = tmp_path / "advisory_state.json"
+    t0 = datetime(2026, 11, 23, 3, 0, 0, tzinfo=UTC)
+    cfg = DownshiftConfig(advisory_cooldown_turns=4, advisory_cooldown_seconds=120)
+
+    # 1. Turn 1 injects and writes privacy-safe sidecar (no raw prompt text)
+    a1 = evaluate_pre_invocation_with_cooldown(
+        "Map out this feature across backend and frontend",
+        conversation_id="conv-cd",
+        invocation_num=1,
+        host="antigravity",
+        config=cfg,
+        state_path=state_file,
+        now_utc=t0,
+    )
+    assert a1.should_inject is True
+    assert a1.reason == "parallel_issue_map_or_comparison"
+    raw_state = state_file.read_text(encoding="utf-8")
+    assert "Map out this feature" not in raw_state
+
+    # 2. Turn 2 (within turn & time cooldown) -> suppressed
+    a2 = evaluate_pre_invocation_with_cooldown(
+        "Audit all 18 API controllers for pagination bugs",
+        conversation_id="conv-cd",
+        invocation_num=2,
+        host="antigravity",
+        config=cfg,
+        state_path=state_file,
+        now_utc=t0 + timedelta(seconds=30),
+    )
+    assert a2.should_inject is False
+    assert a2.reason == "advisory_cooldown"
+
+    # 3. Turn 3 after 150s (time passed, but turns < 4) -> still suppressed
+    a3 = evaluate_pre_invocation_with_cooldown(
+        "Audit all 18 API controllers for pagination bugs",
+        conversation_id="conv-cd",
+        invocation_num=3,
+        host="antigravity",
+        config=cfg,
+        state_path=state_file,
+        now_utc=t0 + timedelta(seconds=150),
+    )
+    assert a3.should_inject is False
+    assert a3.reason == "advisory_cooldown"
+
+    # 4. Turn 6 after 150s with IDENTICAL prompt -> STILL suppressed (tool-loop dedup!)
+    a4_dup = evaluate_pre_invocation_with_cooldown(
+        "Map out this feature across backend and frontend",
+        conversation_id="conv-cd",
+        invocation_num=6,
+        host="antigravity",
+        config=cfg,
+        state_path=state_file,
+        now_utc=t0 + timedelta(seconds=150),
+    )
+    assert a4_dup.should_inject is False
+    assert a4_dup.reason == "advisory_cooldown"
+
+    # 5. Turn 6 after 150s with NEW batch prompt -> ALLOWED!
+    a5 = evaluate_pre_invocation_with_cooldown(
+        "Audit all 18 API controllers for pagination bugs",
+        conversation_id="conv-cd",
+        invocation_num=6,
+        host="antigravity",
+        config=cfg,
+        state_path=state_file,
+        now_utc=t0 + timedelta(seconds=150),
+    )
+    assert a5.should_inject is True
+    assert a5.reason == "batch_workflow_recommended"
+
+    # 6. Claude/Codex (invocation_num=None): gated by time & prompt_fp
+    cl1 = evaluate_pre_invocation_with_cooldown(
+        "Plan out this feature across modules",
+        conversation_id="sess-cl",
+        invocation_num=None,
+        host="claude",
+        config=cfg,
+        state_path=state_file,
+        now_utc=t0,
+    )
+    assert cl1.should_inject is True
+    cl2 = evaluate_pre_invocation_with_cooldown(
+        "Audit all 18 API controllers for pagination bugs",
+        conversation_id="sess-cl",
+        invocation_num=None,
+        host="claude",
+        config=cfg,
+        state_path=state_file,
+        now_utc=t0 + timedelta(seconds=60),
+    )
+    assert cl2.should_inject is False
+    assert cl2.reason == "advisory_cooldown"
+    cl3 = evaluate_pre_invocation_with_cooldown(
+        "Audit all 18 API controllers for pagination bugs",
+        conversation_id="sess-cl",
+        invocation_num=None,
+        host="claude",
+        config=cfg,
+        state_path=state_file,
+        now_utc=t0 + timedelta(seconds=125),
+    )
+    assert cl3.should_inject is True
+    assert cl3.reason == "batch_workflow_recommended"
+
+    # 7. Corrupt sidecar & unwritable directory fail open cleanly
+    state_file.write_text("{corrupt json!!!", encoding="utf-8")
+    recovered = evaluate_pre_invocation_with_cooldown(
+        "Plan out this feature",
+        conversation_id="conv-corrupt",
+        invocation_num=1,
+        host="antigravity",
+        config=cfg,
+        state_path=state_file,
+        now_utc=t0,
+    )
+    assert recovered.should_inject is True
+
+    blocker = tmp_path / "blocker_file"
+    blocker.write_text("x", encoding="utf-8")
+    fail_open = evaluate_pre_invocation_with_cooldown(
+        "Plan out this feature",
+        conversation_id="conv-unwritable",
+        invocation_num=1,
+        host="antigravity",
+        config=cfg,
+        state_path=blocker / "state.json",
+        now_utc=t0,
+    )
+    assert fail_open.should_inject is True
+    assert str(get_advisory_state_path(ledger_path=tmp_path / "x.jsonl")).endswith(
+        "x.jsonl.advisory_state.json"
+    )

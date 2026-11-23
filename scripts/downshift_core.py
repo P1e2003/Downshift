@@ -186,6 +186,36 @@ ROUTINE_PROMPT_NUDGE_RE = re.compile(
     re.IGNORECASE,
 )
 
+BATCH_WORKFLOW_COUNT_RE = re.compile(
+    r"\b(?:[5-9]|[1-9]\d+)\+?\s*(?:api\s+|backend\s+|frontend\s+|file\s+)?"
+    r"(?:files?|endpoints?|controllers?|routes?|services?|modules?|components?|tests?|"
+    r"pages?|handlers?|models?|repositories|views?|scripts?|tables?|schemas?)\b",
+    re.IGNORECASE,
+)
+BATCH_WORKFLOW_NUDGE_RE = re.compile(
+    r"(?:"
+    r"\b(?:audit|migrate|refactor|update|check|review|lint|convert|rename|scan|inspect|fix|"
+    r"sweep|process|validate|analyze)\s+"
+    r"(?:(?:across\s+)?all\s+(?:the\s+)?(?:(?:[5-9]|[1-9]\d+)\+?\s+)?|"
+    r"every\s+|"
+    r"across\s+(?:(?:[5-9]|[1-9]\d+)\+?\s+))"
+    r"(?:api\s+|backend\s+|frontend\s+)?"
+    r"(?:controllers?|endpoints?|routes?|services?|modules?|components?|handlers?|models?|"
+    r"repositories|views?|pages?|tests?|files?|scripts?)\b"
+    r"|"
+    r"\b(?:kiểm\s+tra|kiem\s+tra|rà\s+soát|ra\s+soat|cập\s+nhật|cap\s+nhat|"
+    r"chuyển\s+đổi|chuyen\s+doi|sửa|sua|quét|quet)\s+"
+    r"(?:tất\s+cả|tat\s+ca|toàn\s+bộ|toan\s+bo)\s+(?:các\s+|cac\s+)?"
+    r"(?:(?:[5-9]|[1-9]\d+)\+?\s+)?"
+    r"(?:file\s+)?(?:controllers?|endpoints?|routes?|services?|modules?|components?|handlers?|models?|pages?)\b"
+    r"|"
+    r"\b(?:across|over)\s+(?:all\s+)?(?:[5-9]|[1-9]\d+)\+?\s+"
+    r"(?:api\s+|backend\s+|frontend\s+)?"
+    r"(?:files?|endpoints?|controllers?|routes?|services?|modules?|components?|tests?|handlers?)\b"
+    r")",
+    re.IGNORECASE,
+)
+
 FILE_PATH_TOKEN_RE = re.compile(
     r"\b[\w./\\-]+?\.(?:py|ts|tsx|js|jsx|json|sql|md|yml|yaml|sh|cmd|toml|ini|cfg|env|lock)\b",
     re.IGNORECASE,
@@ -250,6 +280,11 @@ BURST_TAIL_READ_BYTES = 65_536
 DEFAULT_AUTO_UPSHIFT = True
 DEFAULT_RETRY_WINDOW_SECONDS = 120
 DEFAULT_MAX_AUTO_RETRIES = 2
+
+DEFAULT_ADVISORY_COOLDOWN_TURNS = 4
+DEFAULT_ADVISORY_COOLDOWN_SECONDS = 120
+ADVISORY_STATE_MAX_CONVERSATIONS = 128
+ADVISORY_STATE_TTL_SECONDS = 86_400
 
 TIER_RANK: dict[str, int] = {"lite": 0, "fast": 1, "frontier": 2}
 HIGH_RISK_SAFETY_REASONS_PREFIX = (
@@ -346,6 +381,8 @@ class DownshiftConfig:
     retry_window_seconds: int = DEFAULT_RETRY_WINDOW_SECONDS
     max_auto_retries: int = DEFAULT_MAX_AUTO_RETRIES
     isolate_parallel_writes: str = DEFAULT_ISOLATE_PARALLEL_WRITES
+    advisory_cooldown_turns: int = DEFAULT_ADVISORY_COOLDOWN_TURNS
+    advisory_cooldown_seconds: int = DEFAULT_ADVISORY_COOLDOWN_SECONDS
 
 
 @dataclass(frozen=True)
@@ -465,6 +502,8 @@ def load_config(
     retry_window_seconds = DEFAULT_RETRY_WINDOW_SECONDS
     max_auto_retries = DEFAULT_MAX_AUTO_RETRIES
     isolate_parallel_writes = DEFAULT_ISOLATE_PARALLEL_WRITES
+    advisory_cooldown_turns = DEFAULT_ADVISORY_COOLDOWN_TURNS
+    advisory_cooldown_seconds = DEFAULT_ADVISORY_COOLDOWN_SECONDS
 
     cfg_path = _find_config_file(workspace_dir, env_map)
     if cfg_path is not None:
@@ -543,6 +582,20 @@ def load_config(
                     in VALID_ISOLATE_PARALLEL_WRITES
                 ):
                     isolate_parallel_writes = raw_isolate_writes.strip().lower()
+                raw_cd_turns = raw_data.get("advisory_cooldown_turns")
+                if (
+                    isinstance(raw_cd_turns, int)
+                    and not isinstance(raw_cd_turns, bool)
+                    and raw_cd_turns >= 0
+                ):
+                    advisory_cooldown_turns = raw_cd_turns
+                raw_cd_secs = raw_data.get("advisory_cooldown_seconds")
+                if (
+                    isinstance(raw_cd_secs, int)
+                    and not isinstance(raw_cd_secs, bool)
+                    and raw_cd_secs >= 0
+                ):
+                    advisory_cooldown_seconds = raw_cd_secs
 
     env_mode = (env_map.get("DOWNSHIFT_MODE") or "").strip().lower()
     if env_mode in VALID_MODES:
@@ -601,6 +654,20 @@ def load_config(
     elif env_isolate_writes in VALID_ISOLATE_PARALLEL_WRITES:
         isolate_parallel_writes = env_isolate_writes
 
+    env_cd_turns = (env_map.get("DOWNSHIFT_ADVISORY_COOLDOWN_TURNS") or "").strip()
+    if env_cd_turns:
+        with contextlib.suppress(ValueError):
+            parsed_ct = int(env_cd_turns)
+            if parsed_ct >= 0:
+                advisory_cooldown_turns = parsed_ct
+
+    env_cd_secs = (env_map.get("DOWNSHIFT_ADVISORY_COOLDOWN_SECONDS") or "").strip()
+    if env_cd_secs:
+        with contextlib.suppress(ValueError):
+            parsed_cs = int(env_cd_secs)
+            if parsed_cs >= 0:
+                advisory_cooldown_seconds = parsed_cs
+
     return DownshiftConfig(
         mode=mode,
         hints=hints,
@@ -613,6 +680,8 @@ def load_config(
         retry_window_seconds=retry_window_seconds,
         max_auto_retries=max_auto_retries,
         isolate_parallel_writes=isolate_parallel_writes,
+        advisory_cooldown_turns=advisory_cooldown_turns,
+        advisory_cooldown_seconds=advisory_cooldown_seconds,
     )
 
 
@@ -967,9 +1036,9 @@ def classify_user_prompt(
     host: str = "antigravity",
     config: DownshiftConfig | None = None,
 ) -> PromptAdvisory:
-    """Return an ephemeral delegation reminder on the first turn of routine search/log prompts."""
+    """Classify a user prompt's work shape into direct, 2-4 slice fan-out, homogeneous batch, or routine delegation."""
     text = (last_user_input or "").strip()
-    if invocation_num > 1 or not text:
+    if invocation_num < 1 or not text:
         return PromptAdvisory(
             host=host, should_inject=False, message="", reason="not_first_turn_or_empty"
         )
@@ -987,6 +1056,40 @@ def classify_user_prompt(
             reason="high_risk_or_frontier_tag",
         )
 
+    # Work shape 1: Homogeneous batch sweep (5+ items or plural-all sweep verbs)
+    has_batch_count = bool(BATCH_WORKFLOW_COUNT_RE.search(text))
+    if (has_batch_count or len(text) >= 25) and (
+        BATCH_WORKFLOW_NUDGE_RE.search(text) or has_batch_count
+    ):
+        if host == "codex":
+            msg = (
+                "[Downshift] Homogeneous batch sweep detected. Chunk items into 2-4 bounded "
+                "spawn_agent slices tagged @medium/@low (gpt-6.1-sol/gpt-6-luna) rather than "
+                "spawning one subagent per item (avoiding the 4-subagent burst cap), require "
+                "compact <=15-line hand-backs, and aggregate results on the frontier main agent."
+            )
+        elif host == "claude":
+            msg = (
+                "[Downshift] Homogeneous batch sweep detected. Chunk items into 2-4 bounded "
+                "Task/Explore slices tagged @medium/@low (Sonnet/Haiku) rather than spawning "
+                "one subagent per item (avoiding the 4-subagent burst cap), require compact "
+                "<=15-line hand-backs, and aggregate results on the frontier main agent."
+            )
+        else:
+            msg = (
+                "[Downshift] Homogeneous batch sweep detected. Prefer Antigravity's native "
+                'run_workflow tool (parallel() / pipeline() with JSON schema and model="flash" '
+                'or "flash_lite") over manual invoke_subagent fan-out to avoid hitting the '
+                "4-subagent burst cap and keep aggregation deterministic."
+            )
+        return PromptAdvisory(
+            host=host,
+            should_inject=True,
+            message=msg,
+            reason="batch_workflow_recommended",
+        )
+
+    # Work shape 2: Heterogeneous multi-layer drafting, planning, mapping, or comparison
     if PARALLEL_MAP_NUDGE_RE.search(text):
         if host == "codex":
             delegation = "spawn_agent calls in 1 turn (Downshift routes bounded slices to gpt-6-luna/gpt-6.1-sol)"
@@ -1011,7 +1114,24 @@ def classify_user_prompt(
             reason="parallel_issue_map_or_comparison",
         )
 
+    # Work shape 3: Routine multi-step search/log/caller delegation (skipping direct <=2-file tasks & short follow-ups)
     if ROUTINE_PROMPT_NUDGE_RE.search(text):
+        complexity = score_prompt_complexity(text)
+        path_count = int(complexity["path_count"])
+        if 1 <= path_count <= 2:
+            return PromptAdvisory(
+                host=host,
+                should_inject=False,
+                message="",
+                reason="direct_small_task",
+            )
+        if invocation_num > 1 and len(text) < 25:
+            return PromptAdvisory(
+                host=host,
+                should_inject=False,
+                message="",
+                reason="short_followup_suppressed",
+            )
         if host == "codex":
             msg = (
                 "[Downshift] Routine multi-step search/log/verification task detected. "
@@ -1056,6 +1176,183 @@ def should_nudge_pre_invocation(
         config=config,
     )
     return advisory.message if advisory.should_inject else None
+
+
+def get_advisory_state_path(
+    override: str | Path | None = None,
+    ledger_path: str | Path | None = None,
+) -> Path:
+    """Resolve the sidecar JSON state path used for multi-turn PreInvocation cooldowns."""
+    if override is not None:
+        return Path(override).expanduser()
+    env_path = os.environ.get("DOWNSHIFT_ADVISORY_STATE_PATH", "").strip()
+    if env_path:
+        return Path(env_path).expanduser()
+    base = get_ledger_path(ledger_path)
+    return Path(f"{base}.advisory_state.json")
+
+
+def evaluate_pre_invocation_with_cooldown(
+    last_user_input: str,
+    *,
+    conversation_id: str = "",
+    invocation_num: int | None = 1,
+    host: str = "antigravity",
+    config: DownshiftConfig | None = None,
+    state_path: str | Path | None = None,
+    ledger_path: str | Path | None = None,
+    now_utc: datetime | None = None,
+) -> PromptAdvisory:
+    """Classify a user prompt and enforce locked per-conversation multi-turn cooldown & prompt dedup."""
+    cfg = config if config is not None else load_config()
+    eff_inv = invocation_num if invocation_num is not None else 1
+    advisory = classify_user_prompt(
+        last_user_input=last_user_input,
+        invocation_num=eff_inv,
+        host=host,
+        config=cfg,
+    )
+    if not advisory.should_inject:
+        return advisory
+
+    norm_conv = str(conversation_id or "").strip()
+    if not norm_conv:
+        return advisory
+
+    now_ts = now_utc if now_utc is not None else datetime.now(UTC)
+    if now_ts.tzinfo is None:
+        now_ts = now_ts.replace(tzinfo=UTC)
+    now_epoch = now_ts.timestamp()
+    prompt_fp = compute_prompt_fingerprint(last_user_input)
+
+    try:
+        path = get_advisory_state_path(override=state_path, ledger_path=ledger_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
+        locked = False
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                for _ in range(250):
+                    try:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                        locked = True
+                        break
+                    except OSError:
+                        time.sleep(0.002)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                locked = True
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            raw_chunks: list[bytes] = []
+            while True:
+                chunk = os.read(fd, 16_384)
+                if not chunk:
+                    break
+                raw_chunks.append(chunk)
+            raw_bytes = b"".join(raw_chunks)
+            state: dict[str, dict[str, Any]] = {}
+            if raw_bytes.strip():
+                with contextlib.suppress(ValueError, UnicodeDecodeError):
+                    parsed = json.loads(raw_bytes.decode("utf-8", errors="replace"))
+                    if isinstance(parsed, dict):
+                        for k, v in parsed.items():
+                            if isinstance(k, str) and isinstance(v, dict):
+                                state[k] = v
+
+            # Prune stale entries beyond 24h TTL
+            cutoff = now_epoch - float(ADVISORY_STATE_TTL_SECONDS)
+            pruned: dict[str, dict[str, Any]] = {}
+            for k, v in state.items():
+                try:
+                    ts_val = float(v.get("ts") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if ts_val >= cutoff:
+                    pruned[k] = v
+            state = pruned
+
+            prev = state.get(norm_conv)
+            if isinstance(prev, dict):
+                prev_fp = str(prev.get("prompt_fp") or "")
+                try:
+                    prev_ts = float(prev.get("ts") or 0.0)
+                except (TypeError, ValueError):
+                    prev_ts = 0.0
+                prev_inv = prev.get("invocation_num")
+
+                # Always suppress duplicate prompt re-injections during tool loops
+                if prev_fp and prev_fp == prompt_fp:
+                    return PromptAdvisory(
+                        host=host,
+                        should_inject=False,
+                        message="",
+                        reason="advisory_cooldown",
+                    )
+
+                elapsed = now_epoch - prev_ts
+                if 0.0 <= elapsed < float(cfg.advisory_cooldown_seconds):
+                    return PromptAdvisory(
+                        host=host,
+                        should_inject=False,
+                        message="",
+                        reason="advisory_cooldown",
+                    )
+
+                if (
+                    invocation_num is not None
+                    and isinstance(prev_inv, int)
+                    and not isinstance(prev_inv, bool)
+                    and (invocation_num - prev_inv) < cfg.advisory_cooldown_turns
+                ):
+                    return PromptAdvisory(
+                        host=host,
+                        should_inject=False,
+                        message="",
+                        reason="advisory_cooldown",
+                    )
+
+            state[norm_conv] = {
+                "ts": round(now_epoch, 3),
+                "invocation_num": invocation_num,
+                "prompt_fp": prompt_fp,
+            }
+            if len(state) > ADVISORY_STATE_MAX_CONVERSATIONS:
+                ordered = sorted(
+                    state.items(),
+                    key=lambda item: float(item[1].get("ts") or 0.0),
+                    reverse=True,
+                )
+                state = dict(ordered[:ADVISORY_STATE_MAX_CONVERSATIONS])
+
+            out_bytes = (json.dumps(state, separators=(",", ":")) + "\n").encode(
+                "utf-8"
+            )
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, out_bytes)
+        finally:
+            if locked:
+                with contextlib.suppress(OSError):
+                    if os.name == "nt":
+                        import msvcrt
+
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        return advisory
+    except OSError:
+        # Non-blocking fail-open if sidecar directory is unwritable
+        return advisory
 
 
 def classify_swarm_add(

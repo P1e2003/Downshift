@@ -19,7 +19,7 @@ Always follow these model-tier delegation rules when spawning subagents (`invoke
 
 When drafting an issue, planning a feature/spec, mapping an issue against `main` / `develop`, or executing multi-module work, follow this deterministic 7-stage lifecycle instead of running 10–15 sequential tool calls on the frontier model or spawning an oversized subagent:
 
-1. **Stage 1 — Triage & Fast-Path Gate (`<= 2` Known Files):** Read the issue or spec first. If `1–2` exact file paths are **already known** in context, allocate **`0` subagents** and read, edit, and verify directly on the main agent to avoid subagent startup overhead.
+1. **Stage 1 — Triage & Fast-Path Gate (`<= 2` Known Files):** Read the issue or spec first. If `1–2` exact file paths are **already known** in context, allocate **`0` subagents** and read, edit, and verify directly on the main agent to avoid subagent startup overhead. For **homogeneous `5+`-item batch sweeps** (e.g., auditing all 18 controllers or migrating 12 services), prefer Antigravity's native `run_workflow` (`parallel()` / `pipeline()` with JSON `schema` and `model="flash"` / `"flash_lite"`) or chunked `2–4`-slice delegation on Claude Code / OpenAI Codex instead of spawning one subagent per item.
 2. **Stage 2 — Plan & Decompose Slices (`Main Agent, 1 Turn`):** For `3+`-file or multi-layer tasks, partition the work into **`2–4` disjoint slices** in a single turn (for example: Slice 1 = Backend Models/Migrations, Slice 2 = API Routes/Services, Slice 3 = Frontend UI/Hooks).
 3. **Stage 3 — Deterministic Effort Hand-Out (`@low` / `@medium` / `@high`):** Assign an explicit effort tag to each slice based on scope and risk:
 

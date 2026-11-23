@@ -7,8 +7,8 @@ import sys
 from typing import Any
 
 from downshift_core import (
-    classify_user_prompt,
     detect_host,
+    evaluate_pre_invocation_with_cooldown,
     extract_workspace_dir,
     load_config,
 )
@@ -28,10 +28,12 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
         return {}
 
     if host == "antigravity":
+        conversation_id = str(payload.get("conversationId") or "")
         invocation_num = _safe_int(payload.get("invocationNum"), default=1)
         last_user_input = str(payload.get("lastUserInput") or "")
-        advisory = classify_user_prompt(
+        advisory = evaluate_pre_invocation_with_cooldown(
             last_user_input=last_user_input,
+            conversation_id=conversation_id,
             invocation_num=invocation_num,
             host="antigravity",
             config=config,
@@ -40,17 +42,21 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
             return {
                 "injectSteps": [
                     {
-                        "ephemeralMessage": advisory.message,
+                        "systemMessage": {
+                            "systemMessage": advisory.message,
+                        }
                     }
                 ]
             }
         return {}
 
     # Claude Code / OpenAI Codex UserPromptSubmit contract
+    session_id = str(payload.get("session_id") or "")
     prompt = str(payload.get("prompt") or "")
-    advisory = classify_user_prompt(
+    advisory = evaluate_pre_invocation_with_cooldown(
         last_user_input=prompt,
-        invocation_num=1,
+        conversation_id=session_id,
+        invocation_num=None,
         host=host,
         config=config,
     )
