@@ -23,7 +23,7 @@ def test_all_manifests_parse_and_share_name_and_version() -> None:
         assert path.exists(), f"Missing manifest: {path}"
         data = json.loads(path.read_text(encoding="utf-8"))
         assert data["name"] == "downshift"
-        assert data["version"] == "0.3.3"
+        assert data["version"] == "0.4.0"
         assert data.get("description")
         loaded.append(data)
 
@@ -120,7 +120,7 @@ def test_hooks_json_references_existing_scripts() -> None:
 
 def test_skills_have_valid_frontmatter() -> None:
     skill_files = sorted((ROOT / "skills").glob("*/SKILL.md"))
-    assert len(skill_files) >= 2
+    assert len(skill_files) >= 3
     for skill_md in skill_files:
         text = skill_md.read_text(encoding="utf-8")
         assert text.startswith("---\n"), f"Missing YAML frontmatter in {skill_md}"
@@ -137,6 +137,16 @@ def test_skills_have_valid_frontmatter() -> None:
     assert "userfacing: true" in stats_skill.lower()
     assert "by default" in stats_skill.lower()
     assert "only if the user explicitly" not in stats_skill.lower()
+
+    explain_skill = (ROOT / "skills" / "downshift-explain" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    assert "python ./scripts/stats_cli.py" not in explain_skill
+    assert '"./scripts/run_hook.cmd" ./scripts/stats_cli.py explain' in explain_skill
+    assert (
+        '"./scripts/run_hook.cmd" ./scripts/stats_cli.py --audit-ledger'
+        in explain_skill
+    )
 
 
 def test_benchmark_suite_passes_100_percent_accuracy_and_zero_false_downgrades() -> (

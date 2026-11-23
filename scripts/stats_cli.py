@@ -10,7 +10,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from downshift_core import clean_ledger_file, get_ledger_path, reset_ledger_file
+from downshift_core import (
+    READ_ONLY_ROLE_RE,
+    READ_ONLY_SUBAGENTS,
+    RoutingTrace,
+    clean_ledger_file,
+    explain_subagent_call,
+    get_ledger_path,
+    reset_ledger_file,
+)
 
 TIER_COST_WEIGHT: dict[str, float] = {
     "frontier": 1.00,
@@ -427,9 +435,316 @@ def render_html_widget(summary: dict[str, Any], ledger_path: Path) -> str:
 """
 
 
-def main(argv: list[str] | None = None) -> int:
+def compute_ledger_audit(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute a strictly read-only guardrail hotspot and calibration candidate summary."""
+    route_events = [
+        ev
+        for ev in events
+        if str(ev.get("event_type") or "route").strip().lower() != "outcome"
+    ]
+    outcome_events = [
+        ev
+        for ev in events
+        if str(ev.get("event_type") or "route").strip().lower() == "outcome"
+    ]
+    host_tiers: dict[str, dict[str, int]] = {}
+    guardrail_counts: dict[str, int] = {}
+    candidate_counts: dict[tuple[str, str, str], int] = {}
+    burst_cap_hits = 0
+    upshift_hits = 0
+    circuit_breaker_hits = 0
+    workspace_isolated_hits = 0
+
+    for ev in route_events:
+        host = str(ev.get("host") or "antigravity").strip().lower() or "antigravity"
+        tier = str(ev.get("tier") or "frontier").strip().lower()
+        if tier not in ("lite", "fast", "frontier"):
+            tier = "frontier"
+        bucket = host_tiers.setdefault(
+            host, {"total": 0, "lite": 0, "fast": 0, "frontier": 0}
+        )
+        bucket["total"] += 1
+        bucket[tier] += 1
+
+        reason = str(ev.get("reason") or "unknown").strip() or "unknown"
+        if reason == "burst_cap_downgraded_to_lite":
+            burst_cap_hits += 1
+            guardrail_counts[reason] = guardrail_counts.get(reason, 0) + 1
+        if reason in ("auto_upshift_on_retry", "circuit_breaker_frontier_lock"):
+            upshift_hits += 1
+            if reason == "circuit_breaker_frontier_lock":
+                circuit_breaker_hits += 1
+            guardrail_counts[reason] = guardrail_counts.get(reason, 0) + 1
+        if (
+            reason.startswith("safety_guardrail:")
+            or reason == "workspace_config:high_risk_keyword"
+            or (reason == "workspace_config:pinned_role" and tier == "frontier")
+        ):
+            guardrail_counts[reason] = guardrail_counts.get(reason, 0) + 1
+        if ev.get("workspace_isolated") is True:
+            workspace_isolated_hits += 1
+            ws_reason = (
+                str(ev.get("workspace_guardrail_reason") or "").strip()
+                or "parallel_write_isolated"
+            )
+            guardrail_counts[ws_reason] = guardrail_counts.get(ws_reason, 0) + 1
+
+        if tier == "frontier":
+            sub_type = str(ev.get("subagent_type") or "").strip().lower()
+            role_text = str(ev.get("role") or "").strip()
+            is_readonly_like = sub_type in READ_ONLY_SUBAGENTS or bool(
+                READ_ONLY_ROLE_RE.search(role_text)
+            )
+            if is_readonly_like and reason != "inline_override:frontier":
+                key = (role_text or sub_type or "(unnamed)", reason, host)
+                candidate_counts[key] = candidate_counts.get(key, 0) + 1
+
+    host_balance: dict[str, dict[str, Any]] = {}
+    for host, counts in sorted(host_tiers.items()):
+        total_h = counts["total"]
+        host_balance[host] = {
+            **counts,
+            "lite_pct": round((counts["lite"] / total_h) * 100.0, 1)
+            if total_h > 0
+            else 0.0,
+            "fast_pct": round((counts["fast"] / total_h) * 100.0, 1)
+            if total_h > 0
+            else 0.0,
+            "frontier_pct": round((counts["frontier"] / total_h) * 100.0, 1)
+            if total_h > 0
+            else 0.0,
+        }
+
+    guardrail_hotspots = [
+        {"reason": r, "count": c}
+        for r, c in sorted(guardrail_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    calibration_candidates = [
+        {"role": role, "reason": reason, "host": host, "count": c}
+        for (role, reason, host), c in sorted(
+            candidate_counts.items(),
+            key=lambda kv: (-kv[1], kv[0][0], kv[0][1], kv[0][2]),
+        )
+    ]
+
+    return {
+        "total_route_events": len(route_events),
+        "total_outcome_events": len(outcome_events),
+        "burst_cap_hits": burst_cap_hits,
+        "upshift_hits": upshift_hits,
+        "circuit_breaker_hits": circuit_breaker_hits,
+        "workspace_isolated_hits": workspace_isolated_hits,
+        "host_tier_balance": host_balance,
+        "guardrail_hotspots": guardrail_hotspots,
+        "calibration_candidates": calibration_candidates,
+    }
+
+
+def render_ascii_explain(trace: RoutingTrace, host_filter: str = "all") -> str:
+    """Render a compact <=88-col dry-run routing trace card."""
+    d = trace.decision
+    selected_hosts = (
+        ("antigravity", "claude", "codex")
+        if host_filter == "all"
+        else (host_filter if host_filter in trace.hosts else "antigravity",)
+    )
+    tags_str = ", ".join(trace.matched_tags) if trace.matched_tags else "none"
+    masked_str = ", ".join(trace.masked_tokens) if trace.masked_tokens else "none"
+    guardrail_str = (
+        f"{trace.matched_guardrail_label} ({trace.matched_guardrail_text!r})"
+        if trace.matched_guardrail_label
+        else "none"
+    )
+    flags_active = [
+        name
+        for name, enabled in (
+            ("readonly_subagent", trace.is_readonly_subagent),
+            ("readonly_role", trace.is_readonly_role),
+            ("simple_lookup", trace.is_simple_lookup),
+            ("verification", trace.is_verification_runner),
+            ("code_mutation", trace.is_code_mutation),
+            ("write_capable", trace.is_write_capable),
+        )
+        if enabled
+    ]
+    flags_str = ", ".join(flags_active) if flags_active else "none"
+    complexity_str = (
+        f"{trace.prompt_chars} chars · {trace.path_count} paths · {trace.line_count} lines"
+        f"{' · fence' if trace.has_code_fence else ''}"
+        f"{' · trace' if trace.has_stack_trace else ''}"
+    )
+
+    lines = [
+        "  ╭─ ⚡ downshift explain ─────────────── dry-run trace · zero ledger I/O",
+        "  │",
+        f"  │  Config source               : {_truncate_cell(trace.config_source)}",
+        f"  │  Effective mode & burst      : {_truncate_cell(f'{trace.effective_mode} · max_burst={trace.max_burst_subagents}')}",
+        f"  │  Winning stage               : {_truncate_cell(f'Stage {trace.winning_stage} ({trace.winning_stage_name})')}",
+        f"  │  Routing reason              : {_truncate_cell(d.reason)}",
+        f"  │  Inline @tags                : {_truncate_cell(tags_str)}",
+        f"  │  Guardrail match             : {_truncate_cell(guardrail_str)}",
+    ]
+    if trace.matched_pinned_role:
+        lines.append(
+            f"  │  Pinned role                 : {_truncate_cell(trace.matched_pinned_role)}"
+        )
+    lines.extend(
+        [
+            f"  │  Masked tokens               : {_truncate_cell(masked_str)}",
+            f"  │  Complexity                  : {_truncate_cell(complexity_str)}",
+            f"  │  Classifier flags            : {_truncate_cell(flags_str)}",
+            "  │",
+        ]
+    )
+    for idx, h in enumerate(selected_hosts):
+        entry = trace.hosts[h]
+        branch = "└──" if idx == len(selected_hosts) - 1 else "├──"
+        effort_part = (
+            f" · effort={entry['reasoning_effort']}"
+            if entry.get("reasoning_effort")
+            else ""
+        )
+        action = "overwrite" if entry.get("should_overwrite") else "keep"
+        val = f"{entry['tier']} -> {entry['target_model']}{effort_part} ({action})"
+        lines.append(f"  │  {branch} {h:<24}: {_truncate_cell(val)}")
+    lines.append(
+        "  ╰─────────────────────────────────────────────────────────────────────────────────────"
+    )
+    return "\n".join(lines) + "\n"
+
+
+def render_ascii_audit(audit: dict[str, Any], ledger_path: Path) -> str:
+    """Render a compact <=88-col read-only ledger guardrail & calibration audit card."""
+    total = int(audit["total_route_events"])
+    if total == 0:
+        return (
+            f"  ╭─ ⚡ downshift audit ──────────────── read-only · {ledger_path}\n"
+            "  │  0 routing events recorded yet.\n"
+            "  ╰─────────────────────────────────────────────────────────────────────────────────────\n"
+        )
+
+    outcome_total = int(audit["total_outcome_events"])
+    burst_hits = int(audit["burst_cap_hits"])
+    upshift_hits = int(audit["upshift_hits"])
+    breaker_hits = int(audit["circuit_breaker_hits"])
+    isolated_hits = int(audit["workspace_isolated_hits"])
+    events_val = f"{total} route · {outcome_total} outcome"
+    guardrail_val = (
+        f"burst={burst_hits} · upshift={upshift_hits} "
+        f"(breaker={breaker_hits}) · isolated={isolated_hits}"
+    )
+
+    lines = [
+        f"  ╭─ ⚡ downshift audit ──────────────── read-only · {ledger_path}",
+        "  │",
+        f"  │  Events audited              : {_truncate_cell(events_val)}",
+        f"  │  Guardrail counters          : {_truncate_cell(guardrail_val)}",
+        "  │",
+    ]
+    host_balance = audit.get("host_tier_balance") or {}
+    host_items = list(host_balance.items())
+    for idx, (h, b) in enumerate(host_items):
+        branch = "└──" if idx == len(host_items) - 1 else "├──"
+        val = (
+            f"{b['total']} · L:{b['lite']} ({b['lite_pct']:.1f}%) "
+            f"F:{b['fast']} ({b['fast_pct']:.1f}%) T3:{b['frontier']} ({b['frontier_pct']:.1f}%)"
+        )
+        lines.append(f"  │  {branch} {h:<24}: {_truncate_cell(val)}")
+
+    hotspots = audit.get("guardrail_hotspots") or []
+    hotspot_str = (
+        ", ".join(f"{item['reason']}: {item['count']}" for item in hotspots[:4])
+        or "none"
+    )
+    lines.extend(
+        [
+            "  │",
+            f"  │  Top guardrail hotspots      : {_truncate_cell(hotspot_str)}",
+        ]
+    )
+    candidates = audit.get("calibration_candidates") or []
+    if not candidates:
+        lines.append("  │  Calibration candidates      : none")
+    else:
+        for idx, cand in enumerate(candidates[:5]):
+            label = "Calibration candidates" if idx == 0 else ""
+            val = (
+                f"[{cand['count']}x {cand['host']}] {cand['role']} -> {cand['reason']}"
+            )
+            lines.append(f"  │  {label:<27} : {_truncate_cell(val)}")
+    lines.append(
+        "  ╰─────────────────────────────────────────────────────────────────────────────────────"
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _main_explain(explain_argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        description="Downshift routing telemetry scoreboard"
+        prog="stats_cli.py explain",
+        description="Pure dry-run diagnostic trace of Downshift subagent routing (zero ledger I/O)",
+    )
+    parser.add_argument(
+        "--type",
+        dest="type_name",
+        type=str,
+        default="research",
+        help="Subagent type (e.g., research, self, Explore, Task, spawn_agent)",
+    )
+    parser.add_argument(
+        "--role", type=str, default="", help="Subagent role or description"
+    )
+    parser.add_argument("--prompt", type=str, default="", help="Subagent prompt text")
+    parser.add_argument(
+        "--current-model",
+        type=str,
+        default="inherit",
+        help="Caller's requested model before routing",
+    )
+    parser.add_argument(
+        "--workspace",
+        type=str,
+        default=None,
+        help="Workspace directory for .downshift.json config discovery",
+    )
+    parser.add_argument(
+        "--host",
+        choices=("antigravity", "claude", "codex", "all"),
+        default="all",
+        help="Target host matrix to display (default: all)",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Output diagnostic trace as JSON"
+    )
+    args = parser.parse_args(explain_argv)
+
+    primary_host = "antigravity" if args.host == "all" else args.host
+    trace = explain_subagent_call(
+        type_name=args.type_name,
+        role=args.role,
+        prompt=args.prompt,
+        current_model=args.current_model,
+        host=primary_host,
+        workspace_dir=args.workspace,
+    )
+    with contextlib.suppress(AttributeError, OSError, ValueError):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    if args.json:
+        payload = trace.to_dict()
+        if args.host != "all":
+            payload["hosts"] = {args.host: payload["hosts"][args.host]}
+        sys.stdout.write(json.dumps(payload, indent=2) + "\n")
+    else:
+        sys.stdout.write(render_ascii_explain(trace, host_filter=args.host))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv and raw_argv[0] == "explain":
+        return _main_explain(raw_argv[1:])
+
+    parser = argparse.ArgumentParser(
+        description="Downshift routing telemetry scoreboard & read-only diagnostics"
     )
     parser.add_argument(
         "--ledger", type=str, default=None, help="Path to downshift_ledger.jsonl"
@@ -442,6 +757,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Write an interactive Antigravity HTML scoreboard widget to the given path",
     )
     parser.add_argument(
+        "--audit-ledger",
+        action="store_true",
+        help="Show read-only guardrail hotspots and calibration candidates from the ledger",
+    )
+    parser.add_argument(
         "--reset", action="store_true", help="Truncate/reset the ledger file"
     )
     parser.add_argument(
@@ -452,9 +772,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--limit", type=int, default=None, help="Only aggregate the last N events"
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
 
     ledger_path = get_ledger_path(args.ledger)
+
+    if args.audit_ledger:
+        events = load_events(ledger_path, limit=args.limit)
+        audit = compute_ledger_audit(events)
+        with contextlib.suppress(AttributeError, OSError, ValueError):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        if args.json:
+            sys.stdout.write(json.dumps(audit, indent=2) + "\n")
+        else:
+            sys.stdout.write(render_ascii_audit(audit, ledger_path))
+        return 0
 
     if args.reset:
         try:

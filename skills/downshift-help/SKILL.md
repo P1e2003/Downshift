@@ -50,6 +50,7 @@ Display this compact reference card in a fenced `text` block:
 
   Commands
     /downshift-stats   Show live routing scoreboard (gross + net credit cost saved & Quality & rework) from ~/.gemini/downshift_ledger.jsonl
+    /downshift-explain Dry-run trace of subagent routing rules (stats_cli.py explain) & read-only guardrail hotspot audit (--audit-ledger)
     /downshift-help    Show this reference card
 ```
 
