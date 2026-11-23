@@ -88,6 +88,7 @@ def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
     active_count = 0
     shadow_count = 0
     guardrail_count = 0
+    workspace_isolated_count = 0
     upshift_count = 0
     circuit_breaker_count = 0
     total_prompt_chars = 0
@@ -139,10 +140,14 @@ def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
 
         reason = str(ev.get("reason") or "unknown").strip() or "unknown"
         reasons[reason] = reasons.get(reason, 0) + 1
+        is_ws_isolated = ev.get("workspace_isolated") is True
+        if is_ws_isolated:
+            workspace_isolated_count += 1
         if (
             reason.startswith("safety_guardrail:")
             or reason == "workspace_config:high_risk_keyword"
             or (reason == "workspace_config:pinned_role" and tier == "frontier")
+            or is_ws_isolated
         ):
             guardrail_count += 1
         if reason in ("auto_upshift_on_retry", "circuit_breaker_frontier_lock"):
@@ -224,6 +229,7 @@ def compute_summary(events: list[dict[str, Any]]) -> dict[str, Any]:
         "tools": tools,
         "reasons": reasons,
         "guardrail_count": guardrail_count,
+        "workspace_isolated_count": workspace_isolated_count,
     }
 
 

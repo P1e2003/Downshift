@@ -16,8 +16,11 @@ from typing import Any
 
 VALID_MODES = frozenset({"active", "shadow", "off"})
 VALID_TIERS = frozenset({"lite", "fast", "frontier"})
+VALID_ISOLATE_PARALLEL_WRITES = frozenset({"share", "branch", "warn", "off"})
+DEFAULT_ISOLATE_PARALLEL_WRITES = "share"
 
 READ_ONLY_SUBAGENTS = frozenset({"research", "explore"})
+NON_WRITING_SUBAGENTS = frozenset({"research", "explore", "browser", "image-generator"})
 LOWER_TIER_MODEL_TIERS: dict[str, str] = {
     "flash_lite": "lite",
     "haiku": "lite",
@@ -130,6 +133,22 @@ CODE_MUTATION_RE = re.compile(
     r"chỉnh\s+sửa|chinh\s+sua|thêm\s+mới|them\s+moi|"
     r"triển\s+khai|trien\s+khai|tái\s+cấu\s+trúc|tai\s+cau\s+truc)\b",
     re.IGNORECASE,
+)
+WRITE_INTENT_EXTRA_RE = re.compile(
+    r"\b(create\s+(?:a\s+)?(?:new\s+)?file|write\s+(?:unit\s+)?tests?|"
+    r"fix\s+(?:the\s+)?(?:lint|errors?|types?|bugs?)|"
+    r"edit\s+[a-zA-Z0-9_./\\-]+\.[a-zA-Z0-9]+|save\s+changes)\b",
+    re.IGNORECASE,
+)
+READ_ONLY_ROUTING_REASONS: frozenset[str] = frozenset(
+    {
+        "read_only_simple_lookup",
+        "read_only_research_survey",
+        "read_only_role_survey",
+        "promoted_to_fast:multi_file_or_long_prompt",
+        "verification_test_or_lint_runner",
+        "burst_cap_downgraded_to_lite",
+    }
 )
 
 PARALLEL_MAP_NUDGE_RE = re.compile(
@@ -326,6 +345,7 @@ class DownshiftConfig:
     auto_upshift: bool = DEFAULT_AUTO_UPSHIFT
     retry_window_seconds: int = DEFAULT_RETRY_WINDOW_SECONDS
     max_auto_retries: int = DEFAULT_MAX_AUTO_RETRIES
+    isolate_parallel_writes: str = DEFAULT_ISOLATE_PARALLEL_WRITES
 
 
 @dataclass(frozen=True)
@@ -335,6 +355,8 @@ class RoutingDecision:
     target_model: str
     should_overwrite: bool
     reason: str
+    target_workspace: str = ""
+    workspace_guardrail_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -442,6 +464,7 @@ def load_config(
     auto_upshift = DEFAULT_AUTO_UPSHIFT
     retry_window_seconds = DEFAULT_RETRY_WINDOW_SECONDS
     max_auto_retries = DEFAULT_MAX_AUTO_RETRIES
+    isolate_parallel_writes = DEFAULT_ISOLATE_PARALLEL_WRITES
 
     cfg_path = _find_config_file(workspace_dir, env_map)
     if cfg_path is not None:
@@ -511,6 +534,15 @@ def load_config(
                     and raw_max_retries >= 1
                 ):
                     max_auto_retries = raw_max_retries
+                raw_isolate_writes = raw_data.get("isolate_parallel_writes")
+                if isinstance(raw_isolate_writes, bool):
+                    isolate_parallel_writes = "share" if raw_isolate_writes else "off"
+                elif (
+                    isinstance(raw_isolate_writes, str)
+                    and raw_isolate_writes.strip().lower()
+                    in VALID_ISOLATE_PARALLEL_WRITES
+                ):
+                    isolate_parallel_writes = raw_isolate_writes.strip().lower()
 
     env_mode = (env_map.get("DOWNSHIFT_MODE") or "").strip().lower()
     if env_mode in VALID_MODES:
@@ -559,6 +591,16 @@ def load_config(
             if parsed_mr >= 1:
                 max_auto_retries = parsed_mr
 
+    env_isolate_writes = (
+        (env_map.get("DOWNSHIFT_ISOLATE_PARALLEL_WRITES") or "").strip().lower()
+    )
+    if env_isolate_writes in ("0", "false", "no", "off"):
+        isolate_parallel_writes = "off"
+    elif env_isolate_writes in ("1", "true", "yes", "share"):
+        isolate_parallel_writes = "share"
+    elif env_isolate_writes in VALID_ISOLATE_PARALLEL_WRITES:
+        isolate_parallel_writes = env_isolate_writes
+
     return DownshiftConfig(
         mode=mode,
         hints=hints,
@@ -570,6 +612,7 @@ def load_config(
         auto_upshift=auto_upshift,
         retry_window_seconds=retry_window_seconds,
         max_auto_retries=max_auto_retries,
+        isolate_parallel_writes=isolate_parallel_writes,
     )
 
 
@@ -625,6 +668,58 @@ def strip_benign_code_identifiers(text: str) -> str:
     masked = FILE_PATH_TOKEN_RE.sub(" <path> ", text)
     masked = DIR_OR_ROUTE_PATH_RE.sub(" <path> ", masked)
     return CODE_IDENTIFIER_RE.sub(" <id> ", masked)
+
+
+def normalize_workspace(workspace: str | None) -> str:
+    """Normalize a workspace mode string into 'inherit', 'share', or 'branch'."""
+    norm = str(workspace or "").strip().lower()
+    if norm in ("share", "branch"):
+        return norm
+    return "inherit"
+
+
+def is_write_capable(
+    type_name: str,
+    role: str,
+    prompt: str,
+    decision: RoutingDecision | None = None,
+    tool: str = "",
+) -> bool:
+    """Classify whether a subagent/swarm worker may mutate repository files on disk."""
+    if (tool or "").strip().lower() == "run_workflow":
+        return False
+    norm_type = (type_name or "").strip().lower()
+    if norm_type in NON_WRITING_SUBAGENTS:
+        return False
+
+    raw_combined = f"{role or ''}\n{prompt or ''}"
+    route_masked = HTTP_ROUTE_METHOD_RE.sub(" <route> ", raw_combined)
+    cleaned = strip_benign_code_identifiers(route_masked)
+    has_mutation = bool(
+        CODE_MUTATION_RE.search(cleaned) or WRITE_INTENT_EXTRA_RE.search(route_masked)
+    )
+    if VERIFICATION_RUNNER_RE.search(cleaned) and not has_mutation:
+        return False
+
+    has_frontier_tag = bool(FRONTIER_TAG_RE.search(raw_combined))
+    if not has_mutation:
+        if decision is not None and (
+            decision.reason in READ_ONLY_ROUTING_REASONS
+            or decision.reason.startswith("swarm_models_unconfigured:")
+        ):
+            return False
+        if READ_ONLY_ROLE_RE.search(role or "") and not has_frontier_tag:
+            return False
+        if (
+            SIMPLE_LOOKUP_RE.search(cleaned) or COMPLEX_RESEARCH_RE.search(cleaned)
+        ) and not has_frontier_tag:
+            return False
+
+    if has_mutation:
+        return True
+    if decision is not None and decision.tier == "frontier":
+        return True
+    return has_frontier_tag
 
 
 def score_prompt_complexity(prompt: str) -> dict[str, int | bool]:
@@ -1344,14 +1439,19 @@ def _scan_recent_session_history_in_locked_fd(
     burst_window_seconds: int,
     retry_window_seconds: int,
     role_fp: str = "",
+    parallel_write_window_seconds: int = 0,
 ) -> tuple[
-    int, list[tuple[datetime, dict[str, Any]]], list[tuple[datetime, dict[str, Any]]]
+    int,
+    list[tuple[datetime, dict[str, Any]]],
+    list[tuple[datetime, dict[str, Any]]],
+    int,
 ]:
-    """Single-pass locked tail scan returning (recent_burst_count, matching_routes, matching_outcomes)."""
+    """Single-pass locked tail scan returning (recent_burst_count, matching_routes, matching_outcomes, recent_inherit_writes)."""
     if st_size <= 0 or not conversation_id:
-        return 0, [], []
+        return 0, [], [], 0
     tail_rows = _read_tail_dicts_in_locked_fd(fd, st_size)
     burst_count = 0
+    recent_inherit_writes = 0
     matching_routes: list[tuple[datetime, dict[str, Any]]] = []
     matching_outcomes: list[tuple[datetime, dict[str, Any]]] = []
     matched_call_ids: set[str] = set()
@@ -1371,6 +1471,14 @@ def _scan_recent_session_history_in_locked_fd(
                 except (ValueError, TypeError):
                     spawn_weight = 1
                 burst_count += spawn_weight
+            if (
+                parallel_write_window_seconds > 0
+                and delta <= float(parallel_write_window_seconds)
+                and str(obj.get("mode") or "active").strip().lower() != "off"
+                and obj.get("is_write_capable") is True
+                and str(obj.get("workspace") or "inherit").strip().lower() == "inherit"
+            ):
+                recent_inherit_writes += 1
             if (
                 role_fp
                 and retry_window_seconds > 0
@@ -1394,7 +1502,7 @@ def _scan_recent_session_history_in_locked_fd(
             ):
                 matching_outcomes.append((entry_ts, obj))
 
-    return burst_count, matching_routes, matching_outcomes
+    return burst_count, matching_routes, matching_outcomes, recent_inherit_writes
 
 
 def _count_recent_burst_in_locked_fd(
@@ -1405,7 +1513,7 @@ def _count_recent_burst_in_locked_fd(
     window_seconds: int,
 ) -> int:
     """Count recent routing events (excluding outcomes) for conversation_id within window_seconds."""
-    burst_count, _, _ = _scan_recent_session_history_in_locked_fd(
+    burst_count, _, _, _ = _scan_recent_session_history_in_locked_fd(
         fd=fd,
         st_size=st_size,
         conversation_id=conversation_id,
@@ -1637,8 +1745,10 @@ def _record_event_locked(
     role_fp: str = "",
     prompt_fp: str = "",
     has_retry_cue: bool = False,
+    workspace: str | None = None,
+    write_capable: bool | None = None,
 ) -> tuple[RoutingDecision, bool]:
-    """Atomically evaluate retry auto-upshift, 2-retry circuit breaker, and burst cap inside the OS file lock."""
+    """Atomically evaluate retry auto-upshift, 2-retry circuit breaker, burst cap, and parallel-write isolation inside the OS file lock."""
     cfg = config if config is not None else load_config()
     now_ts = now_utc if now_utc is not None else datetime.now(UTC)
     if now_ts.tzinfo is None:
@@ -1653,6 +1763,13 @@ def _record_event_locked(
         subagent_type, role
     )
     norm_prompt_fp = str(prompt_fp or "").strip()
+    norm_mode = str(mode or "active").strip().lower() or "active"
+    track_workspace = workspace is not None or write_capable is not None
+    norm_ws: str | None = (
+        normalize_workspace(workspace) if workspace is not None else None
+    )
+    is_writer = bool(write_capable)
+    is_inherit_ws = norm_ws is None or norm_ws == "inherit"
     try:
         path = get_ledger_path(ledger_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1660,6 +1777,9 @@ def _record_event_locked(
         locked = False
         effective_decision = decision
         upshifted_from = ""
+        workspace_isolated = False
+        recorded_ws = norm_ws
+        ws_reason = ""
         try:
             if os.name == "nt":
                 import msvcrt
@@ -1693,21 +1813,32 @@ def _record_event_locked(
                 and norm_tool != "run_workflow"
                 and not _is_frontier_safety_decision(decision)
             )
-            if need_burst or need_retry:
-                recent_count, matching_routes, matching_outcomes = (
-                    _scan_recent_session_history_in_locked_fd(
-                        fd=fd,
-                        st_size=st_size,
-                        conversation_id=norm_conv,
-                        now_ts=now_ts,
-                        burst_window_seconds=cfg.burst_window_seconds
-                        if need_burst
-                        else 0,
-                        retry_window_seconds=cfg.retry_window_seconds
-                        if need_retry
-                        else 0,
-                        role_fp=norm_role_fp if need_retry else "",
-                    )
+            isolate_policy = cfg.isolate_parallel_writes
+            need_parallel_write = (
+                isolate_policy != "off"
+                and is_writer
+                and is_inherit_ws
+                and norm_tool != "run_workflow"
+                and (bool(norm_conv) or norm_spawn > 1)
+            )
+            recent_inherit_writes = 0
+            if need_burst or need_retry or (need_parallel_write and bool(norm_conv)):
+                (
+                    recent_count,
+                    matching_routes,
+                    matching_outcomes,
+                    recent_inherit_writes,
+                ) = _scan_recent_session_history_in_locked_fd(
+                    fd=fd,
+                    st_size=st_size,
+                    conversation_id=norm_conv,
+                    now_ts=now_ts,
+                    burst_window_seconds=cfg.burst_window_seconds if need_burst else 0,
+                    retry_window_seconds=cfg.retry_window_seconds if need_retry else 0,
+                    role_fp=norm_role_fp if need_retry else "",
+                    parallel_write_window_seconds=cfg.burst_window_seconds
+                    if (need_parallel_write and bool(norm_conv))
+                    else 0,
                 )
                 if need_retry:
                     effective_decision, upshifted_from = _evaluate_retry_guard(
@@ -1750,12 +1881,41 @@ def _record_event_locked(
                             reason="burst_cap_downgraded_to_lite",
                         )
 
+            if need_parallel_write and (recent_inherit_writes >= 1 or norm_spawn > 1):
+                supports_ws_rewrite = (
+                    effective_decision.host == "antigravity"
+                    and norm_tool in ("invoke_subagent", "swarm")
+                )
+                if (
+                    supports_ws_rewrite
+                    and isolate_policy in ("share", "branch")
+                    and norm_mode == "active"
+                ):
+                    target_ws = isolate_policy
+                    ws_reason = f"parallel_write_isolated_to_{target_ws}"
+                    workspace_isolated = True
+                    recorded_ws = target_ws
+                else:
+                    target_ws = ""
+                    ws_reason = "parallel_write_race_warning"
+                    workspace_isolated = False
+                    recorded_ws = norm_ws
+                effective_decision = RoutingDecision(
+                    host=effective_decision.host,
+                    tier=effective_decision.tier,
+                    target_model=effective_decision.target_model,
+                    should_overwrite=effective_decision.should_overwrite,
+                    reason=effective_decision.reason,
+                    target_workspace=target_ws,
+                    workspace_guardrail_reason=ws_reason,
+                )
+
             entry: dict[str, Any] = {
                 "timestamp": now_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "event_type": "route",
                 "conversation_id": str(conversation_id or ""),
                 "host": effective_decision.host,
-                "mode": str(mode or "active"),
+                "mode": norm_mode,
                 "subagent_type": str(subagent_type or ""),
                 "role": str(role or "")[:80],
                 "prompt_chars": max(0, int(prompt_chars or 0)),
@@ -1777,6 +1937,12 @@ def _record_event_locked(
                 entry["prompt_fp"] = norm_prompt_fp
             if upshifted_from:
                 entry["upshifted_from"] = upshifted_from
+            if track_workspace:
+                entry["workspace"] = recorded_ws
+                entry["is_write_capable"] = is_writer
+                entry["workspace_isolated"] = workspace_isolated
+                if ws_reason:
+                    entry["workspace_guardrail_reason"] = ws_reason
             line_bytes = (json.dumps(entry, separators=(",", ":")) + "\n").encode(
                 "utf-8"
             )
@@ -1817,8 +1983,10 @@ def record_and_evaluate_session_guards(
     role_fp: str = "",
     prompt_fp: str = "",
     has_retry_cue: bool = False,
+    workspace: str | None = None,
+    write_capable: bool | None = None,
 ) -> RoutingDecision:
-    """Atomically evaluate closed-loop auto-upshift, 2-retry circuit breaker, and burst cap and append the event."""
+    """Atomically evaluate closed-loop auto-upshift, 2-retry circuit breaker, burst cap, and parallel-write isolation."""
     effective_decision, _ = _record_event_locked(
         decision=decision,
         conversation_id=conversation_id,
@@ -1836,6 +2004,8 @@ def record_and_evaluate_session_guards(
         role_fp=role_fp,
         prompt_fp=prompt_fp,
         has_retry_cue=has_retry_cue,
+        workspace=workspace,
+        write_capable=write_capable,
     )
     return effective_decision
 
@@ -1857,6 +2027,8 @@ def record_and_apply_burst_cap(
     role_fp: str = "",
     prompt_fp: str = "",
     has_retry_cue: bool = False,
+    workspace: str | None = None,
+    write_capable: bool | None = None,
 ) -> RoutingDecision:
     """Backward-compatible alias for record_and_evaluate_session_guards()."""
     return record_and_evaluate_session_guards(
@@ -1876,6 +2048,8 @@ def record_and_apply_burst_cap(
         role_fp=role_fp,
         prompt_fp=prompt_fp,
         has_retry_cue=has_retry_cue,
+        workspace=workspace,
+        write_capable=write_capable,
     )
 
 

@@ -1025,3 +1025,86 @@ def test_stats_cli_computes_net_cost_saved_rework_rate_and_preserves_outcomes_on
         failed=False,
         ledger_path=mixed,
     )
+
+
+def test_stats_cli_counts_parallel_worktree_isolation_in_guardrails(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "worktree_stats.jsonl"
+    rows = [
+        # Legacy route row without workspace fields -> backward compatible
+        {
+            "timestamp": "2026-11-23T02:00:00Z",
+            "event_type": "route",
+            "conversation_id": "conv-s1",
+            "host": "antigravity",
+            "mode": "active",
+            "subagent_type": "research",
+            "role": "Mapper",
+            "prompt_chars": 80,
+            "original_model": "inherit",
+            "target_model": "flash",
+            "tier": "fast",
+            "reason": "read_only_research_survey",
+            "overwritten": True,
+        },
+        # Parallel-write isolated frontier worker (non-safety reason) -> increments guardrail_count & workspace_isolated_count
+        {
+            "timestamp": "2026-11-23T02:00:02Z",
+            "event_type": "route",
+            "conversation_id": "conv-s1",
+            "host": "antigravity",
+            "mode": "active",
+            "subagent_type": "self",
+            "role": "Frontend Author",
+            "prompt_chars": 120,
+            "original_model": "inherit",
+            "target_model": "inherit",
+            "tier": "frontier",
+            "reason": "stateful_or_architecture_task",
+            "overwritten": False,
+            "workspace": "share",
+            "is_write_capable": True,
+            "workspace_isolated": True,
+            "workspace_guardrail_reason": "parallel_write_isolated_to_share",
+        },
+        # Safety guardrail + workspace_isolated on same event -> counted ONCE in guardrail_count (no double count)
+        {
+            "timestamp": "2026-11-23T02:00:03Z",
+            "event_type": "route",
+            "conversation_id": "conv-s1",
+            "host": "antigravity",
+            "mode": "active",
+            "subagent_type": "self",
+            "role": "Migration Author",
+            "prompt_chars": 140,
+            "original_model": "flash_lite",
+            "target_model": "inherit",
+            "tier": "frontier",
+            "reason": "safety_guardrail:alembic_or_migration",
+            "overwritten": True,
+            "workspace": "share",
+            "is_write_capable": True,
+            "workspace_isolated": True,
+            "workspace_guardrail_reason": "parallel_write_isolated_to_share",
+        },
+    ]
+    ledger.write_text(
+        "\n".join(json.dumps(r) for r in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    removed, retained = clean_ledger_file(ledger)
+    assert removed == 0
+    assert retained == 3
+
+    summary = compute_summary(load_events(ledger))
+    assert summary["total"] == 3
+    assert summary["guardrail_count"] == 2
+    assert summary["workspace_isolated_count"] == 2
+
+    board = render_ascii_scoreboard(summary, ledger)
+    assert "2 guardrail(s)" in board
+    for line in board.splitlines():
+        if not line.startswith("  ╭─"):
+            assert len(line) <= 88, f"Line exceeded 88 cols ({len(line)}): {line!r}"

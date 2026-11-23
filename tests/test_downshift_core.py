@@ -24,8 +24,10 @@ from downshift_core import (
     extract_workspace_dir,
     has_explicit_retry_cue,
     inspect_workflow_script,
+    is_write_capable,
     load_config,
     normalize_role,
+    normalize_workspace,
     record_and_apply_burst_cap,
     record_and_evaluate_session_guards,
     record_outcome_event,
@@ -2344,3 +2346,255 @@ def test_parallel_fanout_and_reused_generic_roles_never_false_upshift_or_inflate
     )
     assert eff_retry.tier == "frontier"
     assert eff_retry.reason == "auto_upshift_on_retry"
+
+
+def test_load_config_isolate_parallel_writes_and_env_override(
+    tmp_path: Path,
+) -> None:
+    # Default is "share"
+    assert (
+        load_config(workspace_dir=tmp_path, env={}).isolate_parallel_writes == "share"
+    )
+
+    # Explicit boolean false -> "off", true -> "share"
+    cfg_file = tmp_path / ".downshift.json"
+    cfg_file.write_text(
+        json.dumps({"isolate_parallel_writes": False}), encoding="utf-8"
+    )
+    assert load_config(workspace_dir=tmp_path, env={}).isolate_parallel_writes == "off"
+
+    cfg_file.write_text(json.dumps({"isolate_parallel_writes": True}), encoding="utf-8")
+    assert (
+        load_config(workspace_dir=tmp_path, env={}).isolate_parallel_writes == "share"
+    )
+
+    # Valid strings ("branch", "warn", "off") & invalid fallback
+    for val in ("branch", "warn", "off"):
+        cfg_file.write_text(
+            json.dumps({"isolate_parallel_writes": val}), encoding="utf-8"
+        )
+        assert (
+            load_config(workspace_dir=tmp_path, env={}).isolate_parallel_writes == val
+        )
+
+    cfg_file.write_text(
+        json.dumps({"isolate_parallel_writes": "invalid_mode"}), encoding="utf-8"
+    )
+    assert (
+        load_config(workspace_dir=tmp_path, env={}).isolate_parallel_writes == "share"
+    )
+
+    # Env override takes precedence over file config
+    cfg_file.write_text(
+        json.dumps({"isolate_parallel_writes": "branch"}), encoding="utf-8"
+    )
+    assert (
+        load_config(
+            workspace_dir=tmp_path,
+            env={"DOWNSHIFT_ISOLATE_PARALLEL_WRITES": "off"},
+        ).isolate_parallel_writes
+        == "off"
+    )
+    assert (
+        load_config(
+            workspace_dir=tmp_path,
+            env={"DOWNSHIFT_ISOLATE_PARALLEL_WRITES": "warn"},
+        ).isolate_parallel_writes
+        == "warn"
+    )
+
+
+def test_is_write_capable_classification_and_exemptions() -> None:
+    assert normalize_workspace(None) == "inherit"
+    assert normalize_workspace("  SHARE ") == "share"
+    assert normalize_workspace("branch") == "branch"
+    assert normalize_workspace("unknown") == "inherit"
+
+    # 1. Sandboxed non-writing subagent types -> always False
+    for ro_type in ("research", "explore", "browser", "image-generator"):
+        assert (
+            is_write_capable(
+                ro_type,
+                "Implementer @high",
+                "Refactor auth.py and modify routes.py",
+                decision=RoutingDecision(
+                    "antigravity",
+                    "frontier",
+                    "inherit",
+                    False,
+                    "inline_override:frontier",
+                ),
+            )
+            is False
+        )
+
+    # 2. Pure verification runners -> False (unless combined with mutation)
+    ver_dec = classify_subagent_call(
+        "self", "Verification Runner", "Run pytest tests/ and ruff check scripts/"
+    )
+    assert (
+        is_write_capable(
+            "self",
+            "Verification Runner",
+            "Run pytest tests/ and ruff check scripts/",
+            decision=ver_dec,
+        )
+        is False
+    )
+
+    # 3. Read-only HTTP PATCH route inspection & unconfigured read-only swarm -> False
+    ro_route = classify_subagent_call(
+        "self",
+        "Route Extractor",
+        "Inspect PATCH /api/v1/users contract fields",
+    )
+    assert (
+        is_write_capable(
+            "self",
+            "Route Extractor",
+            "Inspect PATCH /api/v1/users contract fields",
+            decision=ro_route,
+        )
+        is False
+    )
+    swarm_ro_dec, _ = classify_swarm_add(
+        name="slice-reader",
+        brief="Survey routes across backend modules",
+        tasks=["a", "b"],
+    )
+    assert (
+        is_write_capable(
+            "self",
+            "slice-reader",
+            "Survey routes across backend modules\na\nb",
+            decision=swarm_ro_dec,
+            tool="swarm",
+        )
+        is False
+    )
+
+    # 4. Write-capable mutations & Frontier authors -> True
+    mut_dec = classify_subagent_call(
+        "self", "Backend Author", "Implement user invite service in backend/invites.py"
+    )
+    assert (
+        is_write_capable(
+            "self",
+            "Backend Author",
+            "Implement user invite service in backend/invites.py",
+            decision=mut_dec,
+        )
+        is True
+    )
+    assert (
+        is_write_capable(
+            "self",
+            "Test Writer",
+            "Write unit tests and create file tests/test_invites.py",
+            decision=RoutingDecision(
+                "antigravity", "fast", "flash", True, "read_only_research_survey"
+            ),
+        )
+        is True
+    )
+    assert (
+        is_write_capable(
+            "self",
+            "Workflow Runner",
+            "Implement batch edits",
+            tool="run_workflow",
+        )
+        is False
+    )
+
+
+def test_parallel_worktree_isolation_core_locked_window(tmp_path: Path) -> None:
+    ledger = tmp_path / "core_worktree_lock.jsonl"
+    t0 = datetime(2026, 11, 23, 2, 0, 0, tzinfo=UTC)
+    frontier_dec = RoutingDecision(
+        host="antigravity",
+        tier="frontier",
+        target_model="inherit",
+        should_overwrite=False,
+        reason="stateful_or_architecture_task",
+    )
+
+    # 1. First write-capable worker keeps inherit
+    d1 = record_and_evaluate_session_guards(
+        frontier_dec,
+        conversation_id="conv-wt",
+        subagent_type="self",
+        role="Backend Author",
+        ledger_path=ledger,
+        config=DownshiftConfig(isolate_parallel_writes="share"),
+        now_utc=t0,
+        tool="invoke_subagent",
+        workspace="inherit",
+        write_capable=True,
+    )
+    assert d1.target_workspace == ""
+    assert d1.workspace_guardrail_reason == ""
+
+    # 2. Second write-capable worker 1s later isolates to "share"
+    d2 = record_and_evaluate_session_guards(
+        frontier_dec,
+        conversation_id="conv-wt",
+        subagent_type="self",
+        role="Frontend Author",
+        ledger_path=ledger,
+        config=DownshiftConfig(isolate_parallel_writes="share"),
+        now_utc=t0 + timedelta(seconds=1),
+        tool="invoke_subagent",
+        workspace="inherit",
+        write_capable=True,
+    )
+    assert d2.target_workspace == "share"
+    assert d2.workspace_guardrail_reason == "parallel_write_isolated_to_share"
+
+    # 3. Third write-capable worker 2s later STILL sees worker #1 on inherit -> isolates to "share"
+    d3 = record_and_evaluate_session_guards(
+        frontier_dec,
+        conversation_id="conv-wt",
+        subagent_type="self",
+        role="Docs Author",
+        ledger_path=ledger,
+        config=DownshiftConfig(isolate_parallel_writes="share"),
+        now_utc=t0 + timedelta(seconds=2),
+        tool="invoke_subagent",
+        workspace="inherit",
+        write_capable=True,
+    )
+    assert d3.target_workspace == "share"
+    assert d3.workspace_guardrail_reason == "parallel_write_isolated_to_share"
+
+    # 4. Warn mode stays non-mutating
+    d_warn = record_and_evaluate_session_guards(
+        frontier_dec,
+        conversation_id="conv-wt",
+        subagent_type="self",
+        role="Warn Author",
+        ledger_path=ledger,
+        config=DownshiftConfig(isolate_parallel_writes="warn"),
+        now_utc=t0 + timedelta(seconds=3),
+        tool="invoke_subagent",
+        workspace="inherit",
+        write_capable=True,
+    )
+    assert d_warn.target_workspace == ""
+    assert d_warn.workspace_guardrail_reason == "parallel_write_race_warning"
+
+    # 5. After burst_window_seconds (5s) expires -> new sequential writer keeps inherit
+    d_later = record_and_evaluate_session_guards(
+        frontier_dec,
+        conversation_id="conv-wt",
+        subagent_type="self",
+        role="Sequential Author",
+        ledger_path=ledger,
+        config=DownshiftConfig(isolate_parallel_writes="share"),
+        now_utc=t0 + timedelta(seconds=10),
+        tool="invoke_subagent",
+        workspace="inherit",
+        write_capable=True,
+    )
+    assert d_later.target_workspace == ""
+    assert d_later.workspace_guardrail_reason == ""

@@ -18,12 +18,19 @@ from downshift_core import (
     extract_workspace_dir,
     has_explicit_retry_cue,
     inspect_workflow_script,
+    is_write_capable,
     load_config,
+    normalize_workspace,
     record_and_evaluate_session_guards,
 )
 
 CLAUDE_SUBAGENT_TOOLS = frozenset(
     {"task", "agent", "spawn_agent", "multi_agent_v1__spawn_agent"}
+)
+PARALLEL_WRITE_WARNING_MSG = (
+    "[Downshift] Parallel write-capable workers detected on a shared working tree "
+    "within the burst window. Use isolated git worktrees to avoid concurrent file-edit "
+    "or git index.lock races."
 )
 
 
@@ -88,6 +95,14 @@ def _handle_antigravity_swarm(
         config=config,
     )
     prompt_body = f"{brief}\n" + "\n".join(str(t) for t in tasks) if tasks else brief
+    norm_ws = normalize_workspace(workspace)
+    write_capable = is_write_capable(
+        type_name="self",
+        role=name,
+        prompt=prompt_body,
+        decision=decision,
+        tool="swarm",
+    )
     decision = record_and_evaluate_session_guards(
         decision=decision,
         conversation_id=str(payload.get("conversationId") or ""),
@@ -103,14 +118,20 @@ def _handle_antigravity_swarm(
         role_fp=compute_role_fingerprint("swarm", name),
         prompt_fp=compute_prompt_fingerprint(prompt_body),
         has_retry_cue=has_explicit_retry_cue(name, prompt_body),
+        workspace=norm_ws,
+        write_capable=write_capable,
     )
-    if config.mode == "active" and decision.should_overwrite:
-        return {
-            "decision": "allow",
-            "overwrite": {
-                "model": decision.target_model,
-            },
-        }
+    if config.mode == "active":
+        overwrite: dict[str, Any] = {}
+        if decision.should_overwrite:
+            overwrite["model"] = decision.target_model
+        if decision.target_workspace:
+            overwrite["workspace"] = decision.target_workspace
+        if overwrite:
+            return {
+                "decision": "allow",
+                "overwrite": overwrite,
+            }
     return {"decision": "allow"}
 
 
@@ -174,6 +195,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         if not role.strip() and not prompt_text.strip():
             return {"decision": "allow"}
         orig_model = str(args.get("Model") or "inherit")
+        orig_ws = normalize_workspace(str(args.get("Workspace") or "inherit"))
         decision = classify_subagent_call(
             type_name=type_name,
             role=role,
@@ -181,6 +203,13 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
             current_model=orig_model,
             host="antigravity",
             config=config,
+        )
+        write_capable = is_write_capable(
+            type_name=type_name,
+            role=role,
+            prompt=prompt_text,
+            decision=decision,
+            tool="invoke_subagent",
         )
         decision = record_and_evaluate_session_guards(
             decision=decision,
@@ -196,14 +225,20 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
             role_fp=compute_role_fingerprint(type_name, role),
             prompt_fp=compute_prompt_fingerprint(prompt_text),
             has_retry_cue=has_explicit_retry_cue(role, prompt_text),
+            workspace=orig_ws,
+            write_capable=write_capable,
         )
-        if config.mode == "active" and decision.should_overwrite:
-            return {
-                "decision": "allow",
-                "overwrite": {
-                    "Model": decision.target_model,
-                },
-            }
+        if config.mode == "active":
+            overwrite: dict[str, Any] = {}
+            if decision.should_overwrite:
+                overwrite["Model"] = decision.target_model
+            if decision.target_workspace:
+                overwrite["Workspace"] = decision.target_workspace
+            if overwrite:
+                return {
+                    "decision": "allow",
+                    "overwrite": overwrite,
+                }
         return {"decision": "allow"}
 
     # Claude Code / OpenAI Codex PreToolUse contract
@@ -238,6 +273,13 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         host=host,
         config=config,
     )
+    write_capable = is_write_capable(
+        type_name=type_name,
+        role=role,
+        prompt=prompt_text,
+        decision=decision,
+        tool=tool_name,
+    )
     decision = record_and_evaluate_session_guards(
         decision=decision,
         conversation_id=str(payload.get("session_id") or ""),
@@ -252,6 +294,8 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         role_fp=compute_role_fingerprint(type_name, role),
         prompt_fp=compute_prompt_fingerprint(prompt_text),
         has_retry_cue=has_explicit_retry_cue(role, prompt_text),
+        workspace=None,
+        write_capable=write_capable,
     )
     if config.mode == "active":
         updated_input: dict[str, Any] | None = None
@@ -270,14 +314,20 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
                 if updated_input is None:
                     updated_input = dict(tool_input)
                 updated_input["reasoning_effort"] = target_effort
-        if updated_input is not None:
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "updatedInput": updated_input,
-                }
+        has_parallel_warn = (
+            decision.workspace_guardrail_reason == "parallel_write_race_warning"
+        )
+        if updated_input is not None or has_parallel_warn:
+            hook_out: dict[str, Any] = {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
             }
+            if updated_input is not None:
+                hook_out["updatedInput"] = updated_input
+            if has_parallel_warn:
+                hook_out["permissionDecisionReason"] = PARALLEL_WRITE_WARNING_MSG
+                hook_out["additionalContext"] = PARALLEL_WRITE_WARNING_MSG
+            return {"hookSpecificOutput": hook_out}
     return {}
 
 

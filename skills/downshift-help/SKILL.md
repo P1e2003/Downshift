@@ -43,9 +43,10 @@ Display this compact reference card in a fenced `text` block:
     active (default)   Enforce model routing + record telemetry
     shadow             Dry-run: record telemetry without overwriting models
     off                Disable routing, telemetry, and hints
-    .downshift.json    mode, hints, high_risk_keywords, pinned_roles, max_burst_subagents (4), burst_window_seconds (5), swarm_models ({lite, fast}), auto_upshift (true), retry_window_seconds (120), max_auto_retries (2)
-    Antigravity Hooks  PreToolUse: invoke_subagent, swarm(action="add") (safe-by-default unless swarm_models set + sharded burst cap), run_workflow (read-only telemetry) · PostToolUse: invoke_subagent|swarm (privacy-safe outcome capture)
+    .downshift.json    mode, hints, high_risk_keywords, pinned_roles, max_burst_subagents (4), burst_window_seconds (5), swarm_models ({lite, fast}), auto_upshift (true), retry_window_seconds (120), max_auto_retries (2), isolate_parallel_writes ("share"|"branch"|"warn"|"off")
+    Antigravity Hooks  PreToolUse: invoke_subagent, swarm(action="add") (safe-by-default unless swarm_models set + sharded burst cap + auto worktree isolation to share/branch on concurrent writers), run_workflow (read-only telemetry) · PostToolUse: invoke_subagent|swarm (privacy-safe outcome capture)
     Closed-Loop Retry  Confirmed PostToolUse error, same prompt fingerprint, or explicit retry cue -> auto-upshift (lite->fast->frontier) & 2-retry circuit breaker (overrides @low/@medium in active; log-only in shadow; beats burst cap)
+    Worktree Isolation 2nd+ concurrent write-capable workers (or sharded swarm writers) on inherit within burst_window -> auto-isolated to share/branch on Antigravity; schema-safe non-blocking warning on Claude/Codex (DOWNSHIFT_ISOLATE_PARALLEL_WRITES)
 
   Commands
     /downshift-stats   Show live routing scoreboard (gross + net credit cost saved & Quality & rework) from ~/.gemini/downshift_ledger.jsonl

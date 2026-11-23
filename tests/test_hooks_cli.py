@@ -2058,3 +2058,465 @@ def test_closed_loop_claude_codex_reasoning_effort_and_shadow_non_mutation(
     assert sh_routes[2]["reason"] == "circuit_breaker_frontier_lock"
     assert sh_routes[2]["mode"] == "shadow"
     assert sh_routes[2]["tier"] == "frontier"
+
+
+def test_single_mutating_worker_keeps_inherit_workspace(tmp_path: Path) -> None:
+    ledger = tmp_path / "ws_single.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+    code, data = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-ws-single",
+            "toolCall": {
+                "id": "ws-1",
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "self",
+                    "Role": "Backend Implementer",
+                    "Prompt": "Implement invoice export endpoint in backend/invoices.py",
+                    "Model": "inherit",
+                    "Workspace": "inherit",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert code == 0
+    assert data == {"decision": "allow"}
+    rows = [json.loads(ln) for ln in ledger.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["workspace"] == "inherit"
+    assert rows[0]["is_write_capable"] is True
+    assert rows[0]["workspace_isolated"] is False
+    assert "workspace_guardrail_reason" not in rows[0]
+
+
+def test_second_parallel_mutating_worker_rewrites_workspace_to_share(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "ws_parallel.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+
+    # 1st writer stays on inherit
+    c1, d1 = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-ws-par",
+            "toolCall": {
+                "id": "w-1",
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "self",
+                    "Role": "Backend Author",
+                    "Prompt": "Implement users API in backend/users.py",
+                    "Model": "inherit",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert c1 == 0
+    assert d1 == {"decision": "allow"}
+
+    # 2nd concurrent writer (already Frontier -> Model unchanged) gets Workspace="share"
+    c2, d2 = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-ws-par",
+            "toolCall": {
+                "id": "w-2",
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "self",
+                    "Role": "Frontend Author",
+                    "Prompt": "Implement users table component in frontend/Users.tsx",
+                    "Model": "inherit",
+                    "Workspace": "inherit",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert c2 == 0
+    assert d2 == {"decision": "allow", "overwrite": {"Workspace": "share"}}
+
+    # 3rd concurrent writer with explicit flash_lite on high-risk migration gets BOTH Model & Workspace overwritten!
+    c3, d3 = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-ws-par",
+            "toolCall": {
+                "id": "w-3",
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "self",
+                    "Role": "Migration Author",
+                    "Prompt": "Write Alembic migration and RBAC permission lock",
+                    "Model": "flash_lite",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert c3 == 0
+    assert d3 == {
+        "decision": "allow",
+        "overwrite": {"Model": "inherit", "Workspace": "share"},
+    }
+
+    rows = [json.loads(ln) for ln in ledger.read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["workspace"] == "inherit"
+    assert rows[0]["workspace_isolated"] is False
+    assert rows[1]["workspace"] == "share"
+    assert rows[1]["workspace_isolated"] is True
+    assert rows[1]["overwritten"] is False  # model was not overwritten
+    assert rows[1]["workspace_guardrail_reason"] == "parallel_write_isolated_to_share"
+    assert rows[2]["workspace"] == "share"
+    assert rows[2]["workspace_isolated"] is True
+    assert rows[2]["overwritten"] is True  # model WAS overwritten flash_lite -> inherit
+
+
+def test_parallel_readonly_and_verification_workers_keep_inherit(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "ws_readonly.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+
+    # 2 parallel research mappers + 2 parallel pure pytest/eslint self runners
+    payloads = [
+        (
+            "research",
+            "Backend Slice Mapper @medium",
+            "Survey routes across backend/api/ and auth/permissions.py",
+        ),
+        (
+            "research",
+            "Frontend Slice Mapper @medium",
+            "Survey components across frontend/src/components/",
+        ),
+        (
+            "self",
+            "Verification Runner @medium",
+            "Run pytest tests/ and ruff check scripts/",
+        ),
+        (
+            "self",
+            "Lint Runner @medium",
+            "Run npm run lint and eslint across frontend/",
+        ),
+    ]
+    for idx, (tname, role, prompt) in enumerate(payloads, start=1):
+        code, data = _run_hook(
+            PRE_TOOL_USE,
+            {
+                "conversationId": "conv-ws-ro",
+                "toolCall": {
+                    "id": f"ro-{idx}",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "TypeName": tname,
+                        "Role": role,
+                        "Prompt": prompt,
+                        "Model": "inherit",
+                        "Workspace": "inherit",
+                    },
+                },
+            },
+            extra_env=env,
+        )
+        assert code == 0
+        assert "Workspace" not in data.get("overwrite", {})
+
+    rows = [json.loads(ln) for ln in ledger.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 4
+    assert all(r["is_write_capable"] is False for r in rows)
+    assert all(r["workspace_isolated"] is False for r in rows)
+    assert all(r["workspace"] == "inherit" for r in rows)
+
+
+def test_sharded_mutating_swarm_add_on_inherit_rewrites_to_share(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "ws_swarm.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+
+    # 1. Sharded mutating swarm on workspace="inherit" -> rewrites workspace="share"
+    c1, d1 = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-ws-swarm",
+            "toolCall": {
+                "id": "sw-1",
+                "name": "swarm",
+                "args": {
+                    "action": "add",
+                    "name": "refactor-worker",
+                    "brief": "Refactor service modules and update unit tests",
+                    "tasks": ["modA", "modB"],
+                    "workspace": "inherit",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert c1 == 0
+    assert d1 == {"decision": "allow", "overwrite": {"workspace": "share"}}
+
+    # 2. Sharded read-only survey swarm on workspace="inherit" -> stays untouched!
+    c2, d2 = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-ws-swarm-ro",
+            "toolCall": {
+                "id": "sw-2",
+                "name": "swarm",
+                "args": {
+                    "action": "add",
+                    "name": "slice-surveyor",
+                    "brief": "Survey routes and compare contracts across slices",
+                    "tasks": ["sliceA", "sliceB"],
+                    "workspace": "inherit",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert c2 == 0
+    assert "workspace" not in d2.get("overwrite", {})
+
+    rows = [json.loads(ln) for ln in ledger.read_text(encoding="utf-8").splitlines()]
+    assert rows[0]["workspace"] == "share"
+    assert rows[0]["workspace_isolated"] is True
+    assert rows[0]["workspace_guardrail_reason"] == "parallel_write_isolated_to_share"
+    assert rows[1]["workspace"] == "inherit"
+    assert rows[1]["is_write_capable"] is False
+    assert rows[1]["workspace_isolated"] is False
+
+
+def test_explicit_branch_or_config_off_respected(tmp_path: Path) -> None:
+    # 1. Explicit Workspace="branch" is preserved untouched even after an inherit writer
+    ledger = tmp_path / "ws_branch.jsonl"
+    env = {"DOWNSHIFT_LEDGER_PATH": str(ledger)}
+    _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-ws-exp",
+            "toolCall": {
+                "id": "e-1",
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "self",
+                    "Role": "Author 1",
+                    "Prompt": "Implement module A",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    c_br, d_br = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-ws-exp",
+            "toolCall": {
+                "id": "e-2",
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "self",
+                    "Role": "Author 2",
+                    "Prompt": "Implement module B",
+                    "Workspace": "branch",
+                },
+            },
+        },
+        extra_env=env,
+    )
+    assert c_br == 0
+    assert d_br == {"decision": "allow"}
+
+    # 2. Workspace .downshift.json {"isolate_parallel_writes": "off"} disables isolation
+    off_ws = tmp_path / "repo_off"
+    off_ws.mkdir()
+    (off_ws / ".downshift.json").write_text(
+        json.dumps({"isolate_parallel_writes": "off"}), encoding="utf-8"
+    )
+    off_ledger = tmp_path / "ws_off.jsonl"
+    off_env = {"DOWNSHIFT_LEDGER_PATH": str(off_ledger)}
+    for idx in (1, 2):
+        c_off, d_off = _run_hook(
+            PRE_TOOL_USE,
+            {
+                "conversationId": "conv-ws-off",
+                "workspacePaths": [str(off_ws)],
+                "toolCall": {
+                    "id": f"off-{idx}",
+                    "name": "invoke_subagent",
+                    "args": {
+                        "TypeName": "self",
+                        "Role": f"Author {idx}",
+                        "Prompt": f"Implement module {idx}",
+                    },
+                },
+            },
+            extra_env=off_env,
+        )
+        assert c_off == 0
+        assert d_off == {"decision": "allow"}
+
+    # 3. Config "branch" rewrites 2nd parallel writer to "branch"; shadow mode stays log-only
+    br_ws = tmp_path / "repo_branch"
+    br_ws.mkdir()
+    (br_ws / ".downshift.json").write_text(
+        json.dumps({"isolate_parallel_writes": "branch"}), encoding="utf-8"
+    )
+    br_ledger = tmp_path / "ws_cfg_branch.jsonl"
+    br_env = {"DOWNSHIFT_LEDGER_PATH": str(br_ledger)}
+    _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-ws-br",
+            "workspacePaths": [str(br_ws)],
+            "toolCall": {
+                "id": "br-1",
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "self",
+                    "Role": "Author 1",
+                    "Prompt": "Implement module A",
+                },
+            },
+        },
+        extra_env=br_env,
+    )
+    c_cfg_br, d_cfg_br = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-ws-br",
+            "workspacePaths": [str(br_ws)],
+            "toolCall": {
+                "id": "br-2",
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "self",
+                    "Role": "Author 2",
+                    "Prompt": "Implement module B",
+                },
+            },
+        },
+        extra_env=br_env,
+    )
+    assert c_cfg_br == 0
+    assert d_cfg_br == {"decision": "allow", "overwrite": {"Workspace": "branch"}}
+
+    sh_code, sh_data = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "conversationId": "conv-ws-br",
+            "workspacePaths": [str(br_ws)],
+            "toolCall": {
+                "id": "br-3",
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "self",
+                    "Role": "Author 3",
+                    "Prompt": "Implement module C",
+                },
+            },
+        },
+        extra_env={**br_env, "DOWNSHIFT_MODE": "shadow"},
+    )
+    assert sh_code == 0
+    assert sh_data == {"decision": "allow"}
+    sh_rows = [
+        json.loads(ln) for ln in br_ledger.read_text(encoding="utf-8").splitlines()
+    ]
+    assert sh_rows[-1]["workspace_isolated"] is False
+    assert sh_rows[-1]["workspace_guardrail_reason"] == "parallel_write_race_warning"
+
+
+def test_claude_and_codex_never_receive_invalid_workspace_arg(tmp_path: Path) -> None:
+    # 1. Claude Code Task: 2nd concurrent writer gets non-blocking warning, NEVER Workspace in updatedInput
+    cl_ledger = tmp_path / "ws_claude.jsonl"
+    cl_env = {"DOWNSHIFT_LEDGER_PATH": str(cl_ledger)}
+    c1, d1 = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-cl-ws",
+            "tool_use_id": "cl-w1",
+            "tool_name": "Task",
+            "tool_input": {
+                "subagent_type": "general-purpose",
+                "description": "Backend Author",
+                "prompt": "Implement payments service in backend/payments.py",
+            },
+        },
+        extra_env=cl_env,
+    )
+    assert c1 == 0
+    assert d1 == {}
+
+    c2, d2 = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-cl-ws",
+            "tool_use_id": "cl-w2",
+            "tool_name": "Task",
+            "tool_input": {
+                "subagent_type": "general-purpose",
+                "description": "Frontend Author",
+                "prompt": "Implement checkout page in frontend/Checkout.tsx",
+            },
+        },
+        extra_env=cl_env,
+    )
+    assert c2 == 0
+    hso = d2["hookSpecificOutput"]
+    assert hso["hookEventName"] == "PreToolUse"
+    assert hso["permissionDecision"] == "allow"
+    assert "worktree" in hso["permissionDecisionReason"].lower()
+    assert "worktree" in hso["additionalContext"].lower()
+    assert "updatedInput" not in hso
+
+    # 2. OpenAI Codex spawn_agent: 2nd concurrent writer keeps reasoning_effort="high", NEVER injects Workspace
+    cx_ledger = tmp_path / "ws_codex.jsonl"
+    cx_env = {"DOWNSHIFT_LEDGER_PATH": str(cx_ledger)}
+    _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-cx-ws",
+            "tool_use_id": "cx-w1",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "role": "Backend Author",
+                "message": "Implement billing worker in backend/billing.py",
+            },
+        },
+        extra_env=cx_env,
+    )
+    cx2, dx2 = _run_hook(
+        PRE_TOOL_USE,
+        {
+            "session_id": "sess-cx-ws",
+            "tool_use_id": "cx-w2",
+            "tool_name": "spawn_agent",
+            "tool_input": {
+                "role": "Frontend Author",
+                "message": "Implement billing UI in frontend/Billing.tsx",
+            },
+        },
+        extra_env=cx_env,
+    )
+    assert cx2 == 0
+    cx_hso = dx2["hookSpecificOutput"]
+    assert cx_hso["permissionDecision"] == "allow"
+    assert cx_hso["updatedInput"]["reasoning_effort"] == "high"
+    assert "Workspace" not in cx_hso["updatedInput"]
+    assert "workspace" not in cx_hso["updatedInput"]
+    assert "worktree" in cx_hso["permissionDecisionReason"].lower()
+
+    cx_rows = [
+        json.loads(ln) for ln in cx_ledger.read_text(encoding="utf-8").splitlines()
+    ]
+    assert cx_rows[1]["workspace"] is None
+    assert cx_rows[1]["is_write_capable"] is True
+    assert cx_rows[1]["workspace_isolated"] is False
+    assert cx_rows[1]["workspace_guardrail_reason"] == "parallel_write_race_warning"
